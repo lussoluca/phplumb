@@ -2,6 +2,23 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-29, batch B stubs and enums
+
+Same machine. The Drupal reference project is now on another feature branch, so both projects were measured with this branch and with `main` on the same checkouts, alternating, twice each. The batch fixes issues #4, #5, #7, #8, #9 and #10.
+
+| Metric                    | Drupal reference                  | Symfony reference                 |
+| ------------------------- | --------------------------------- | --------------------------------- |
+| Member coverage           | 43,008 (42,929 on `main`)         | 13,097, the same as `main`        |
+| Cold index                | 2.4 s (2.6 to 2.7 s on `main`)    | 0.5 to 0.6 s (0.5 to 0.9 s)       |
+| Warm start from the cache | 1.35 to 1.47 s (1.26 to 1.40 s)   | 0.19 s, the same as `main`        |
+| Update of one file        | 98 to 107 ms (96 to 115 ms)       | 21 to 22 ms (19 to 20 ms)         |
+| Update of 1,000 files     | 0.23 to 0.29 s (0.23 to 0.24 s)   | 87 to 90 ms (77 to 80 ms)         |
+| Peak resident memory      | 679 to 729 MB (632 to 715 MB)     | 260 to 276 MB (251 MB)            |
+| All cases                 | 85 passed, 9 failed, as on `main` | 31 passed, 0 failed, as on `main` |
+| Diagnostics               | 94, the same entries as on `main` | 0, as on `main`                   |
+
+The 79 new accesses on the Drupal reference project are static calls through `$this::`, such as `$this::assertSame()` in tests, which now reach their inherited methods. Times and memory stay within the run-to-run noise over five alternated runs.
+
 ## 2026-10-29, batch A performance
 
 Same machine. The Drupal reference project is now on its `develop` branch, so both projects were measured with this branch and with `main` on the same checkouts, alternating, twice each. The batch fixes issues #1, #2, #3, #6, #24, #25, #26, #44 and #60.
