@@ -13,17 +13,21 @@ use crate::filter::SKIPPED_DIR_NAMES;
 const LOCK_DEPTH: usize = 4;
 
 /// A framework module's project: a directory, without the projects of other active
-/// modules inside it. Paths are canonical.
+/// modules inside it, with the directories symlinks inside it lead to elsewhere
+/// under the root, as a Composer path repository links a module. Paths are
+/// canonical.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Project {
     pub dir: PathBuf,
     pub excluded: Vec<PathBuf>,
+    pub linked: Vec<PathBuf>,
 }
 
 impl Project {
     /// Whether `path` is inside the project, comparing whole path components.
     pub fn contains(&self, path: &Path) -> bool {
-        path.starts_with(&self.dir) && !self.excluded.iter().any(|dir| path.starts_with(dir))
+        (path.starts_with(&self.dir) || self.linked.iter().any(|dir| path.starts_with(dir)))
+            && !self.excluded.iter().any(|dir| path.starts_with(dir))
     }
 }
 

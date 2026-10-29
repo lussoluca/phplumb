@@ -135,6 +135,7 @@ fn project_contains_compares_whole_components() {
     let project = Project {
         dir: PathBuf::from("/p/drupal"),
         excluded: vec![PathBuf::from("/p/drupal/sub")],
+        linked: Vec::new(),
     };
     assert!(project.contains(Path::new("/p/drupal/x.php")));
     assert!(!project.contains(Path::new("/p/drupal2/x.php")));
@@ -679,4 +680,61 @@ fn hook_invocations_stay_in_the_drupal_project() {
         targets,
         vec![drupal_dir.join("modules/custom/demo/src/Runner.php")]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_modules_belong_to_the_linking_project() {
+    let (_dir, root) = project();
+    lock(&root, ".", SYMFONY_LOCK);
+    lock(&root, "drupal", DRUPAL_LOCK);
+    let module = root.join("packages/foo");
+    fs::create_dir_all(module.join("src")).unwrap();
+    fs::write(module.join("foo.info.yml"), "name: Foo\ntype: module\n").unwrap();
+    fs::write(
+        module.join("foo.services.yml"),
+        "services:\n  foo.svc:\n    class: Foo\\Svc\n",
+    )
+    .unwrap();
+    fs::write(module.join("foo.module"), "<?php\nfunction foo_cron() {}\n").unwrap();
+    fs::write(
+        module.join("src/Svc.php"),
+        "<?php\nnamespace Foo;\nclass Svc {}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("drupal/web/modules/custom")).unwrap();
+    std::os::unix::fs::symlink(
+        "../../../../packages/foo",
+        root.join("drupal/web/modules/custom/foo"),
+    )
+    .unwrap();
+
+    let index = auto(&root);
+
+    assert_eq!(drupal(&index).services("foo.svc").len(), 1);
+    let hooks: Vec<String> = drupal(&index)
+        .hook_implementations("cron")
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    assert_eq!(hooks, vec!["foo_cron"]);
+    let (_, excluded) = scope(&index, "symfony");
+    assert!(excluded.contains(&module), "{excluded:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn links_outside_the_root_change_nothing() {
+    let (_dir, root) = project();
+    lock(&root, ".", SYMFONY_LOCK);
+    lock(&root, "drupal", DRUPAL_LOCK);
+    let outside = TempDir::new().unwrap();
+    fs::create_dir_all(root.join("drupal/web/modules/custom")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("drupal/web/modules/custom/out")).unwrap();
+    std::os::unix::fs::symlink("..", root.join("drupal/web/loop")).unwrap();
+
+    let index = auto(&root);
+
+    assert_eq!(scope(&index, "symfony").1, vec![root.join("drupal")]);
+    assert!(index.framework_project("drupal").unwrap().linked.is_empty());
 }

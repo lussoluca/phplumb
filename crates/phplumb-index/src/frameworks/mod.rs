@@ -303,6 +303,7 @@ impl Detection {
                 framework.set_project(Project {
                     dir: dir.clone(),
                     excluded,
+                    linked: Vec::new(),
                 });
                 Some(framework)
             })

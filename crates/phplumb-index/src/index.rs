@@ -139,6 +139,8 @@ impl Index {
             .unwrap_or_default();
         let walked = discover_with(&mut filter);
         let paths = walked.php;
+        let mut active = active;
+        link_projects(&mut active, &walked.links, filter.root());
 
         let stamps: Vec<Option<(u64, u64)>> = paths.par_iter().map(|p| stamp(p)).collect();
         let mut files: Vec<Option<CachedFile>> = Vec::with_capacity(paths.len());
@@ -2005,6 +2007,37 @@ impl Index {
             SymbolKind::Constant => &mut self.constants,
             _ => &mut self.classes,
         }
+    }
+}
+
+/// Gives each framework project the directories that symlinks inside it lead to
+/// elsewhere under the root, and leaves them out of the other projects.
+fn link_projects(frameworks: &mut [Box<dyn Framework>], links: &[(PathBuf, PathBuf)], root: &Path) {
+    let mut projects: Vec<Project> = frameworks.iter().map(|f| f.project().clone()).collect();
+    let mut taken: Vec<(usize, PathBuf)> = Vec::new();
+    for (i, project) in projects.iter_mut().enumerate() {
+        for (link, target) in links {
+            let inside = project.contains(link);
+            if inside
+                && target.starts_with(root)
+                && !target.starts_with(&project.dir)
+                && !project.linked.contains(target)
+            {
+                project.linked.push(target.clone());
+                taken.push((i, target.clone()));
+            }
+        }
+    }
+    for (owner, target) in taken {
+        for (i, project) in projects.iter_mut().enumerate() {
+            if i != owner && target.starts_with(&project.dir) && !project.excluded.contains(&target)
+            {
+                project.excluded.push(target.clone());
+            }
+        }
+    }
+    for (framework, project) in frameworks.iter_mut().zip(projects) {
+        framework.set_project(project);
     }
 }
 
