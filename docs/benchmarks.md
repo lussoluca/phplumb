@@ -17,7 +17,7 @@ Same machine. The Drupal reference project is now on another feature branch, so 
 | All cases                 | 85 passed, 9 failed, as on `main` | 31 passed, 0 failed, as on `main` |
 | Diagnostics               | 94, the same entries as on `main` | 0, as on `main`                   |
 
-The 79 new accesses on the Drupal reference project are static calls through `$this::`, such as `$this::assertSame()` in tests, which now reach their inherited methods. Times and memory stay within the run-to-run noise over five alternated runs.
+The 79 new accesses on the Drupal reference project are `self::` and `static::` accesses inside traits, such as `self::assertSame()` in test traits, which now reach the members of the classes using the trait. The project changed between runs, and every state gave the same 79 more than `main`. Times and memory stay within the run-to-run noise over five alternated runs.
 
 ## 2026-10-29, batch A performance
 
