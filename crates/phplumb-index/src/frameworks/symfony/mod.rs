@@ -1,6 +1,7 @@
 //! Symfony: the module that answers for a project built on the Symfony framework.
 
 mod broken;
+mod bundles;
 mod config;
 mod doctrine;
 mod files;
