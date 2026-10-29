@@ -807,7 +807,7 @@ fn names_a_class(ty: &TypeExpr) -> bool {
         | TypeExpr::ParentType => true,
         TypeExpr::ArrayOf(element) | TypeExpr::ClassString(element) => names_a_class(element),
         TypeExpr::Union(members) => members.iter().any(names_a_class),
-        TypeExpr::Other => false,
+        TypeExpr::Scalar(_) | TypeExpr::Other => false,
     }
 }
 

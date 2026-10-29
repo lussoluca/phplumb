@@ -2695,7 +2695,7 @@ fn is_plain_value(expression: &Expression<'_>) -> bool {
 /// Whether `ty` says nothing about classes: unknown, or an array of nothing known.
 pub(crate) fn names_no_class(ty: &TypeExpr) -> bool {
     match ty {
-        TypeExpr::Other => true,
+        TypeExpr::Other | TypeExpr::Scalar(_) => true,
         TypeExpr::ArrayOf(element) => names_no_class(element),
         TypeExpr::Union(members) => members.iter().all(names_no_class),
         _ => false,

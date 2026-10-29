@@ -21,6 +21,9 @@ pub enum TypeExpr {
         class: String,
         args: Vec<TypeExpr>,
     },
+    /// A scalar or pseudo-type written as a generic argument, such as the `int` of
+    /// `Collection<int, Item>`, kept for display; read like `Other` elsewhere.
+    Scalar(String),
     /// `class-string<T>`: the name of a class, not an object of it.
     ClassString(Box<TypeExpr>),
     /// Unions and intersections: navigation treats both as "any of these".
@@ -114,6 +117,7 @@ pub fn parse_type(text: &str, names: &dyn NameContext) -> TypeExpr {
         pos: 0,
         names,
         found: Vec::new(),
+        generic_depth: 0,
     };
     finish(parser.union())
 }
@@ -127,6 +131,7 @@ fn type_class_names(text: &str, names: &dyn NameContext) -> Vec<(usize, usize, S
         pos: 0,
         names,
         found: Vec::new(),
+        generic_depth: 0,
     };
     parser.union();
     parser
@@ -155,6 +160,8 @@ struct TypeParser<'a> {
     names: &'a dyn NameContext,
     /// The byte range and name of each class the type names.
     found: Vec<(usize, usize, String)>,
+    /// How many generic argument lists the parser is inside.
+    generic_depth: usize,
 }
 
 impl TypeParser<'_> {
@@ -307,6 +314,10 @@ impl TypeParser<'_> {
                 Some((1, Some(Parsed::Type(class)))) => TypeExpr::ClassString(Box::new(class)),
                 _ => TypeExpr::Other,
             },
+            // A generic argument keeps its scalar as written, for display.
+            _ if NON_CLASS.contains(&lower.as_str()) && self.generic_depth > 0 => {
+                TypeExpr::Scalar(word.clone())
+            }
             _ if NON_CLASS.contains(&lower.as_str()) => TypeExpr::Other,
             _ => {
                 let fqn = match word.strip_prefix('\\') {
@@ -340,11 +351,13 @@ impl TypeParser<'_> {
     }
 
     fn generic_args(&mut self) -> Vec<Parsed> {
+        self.generic_depth += 1;
         let mut args = vec![self.union()];
         while self.eat(b',') {
             args.push(self.union());
         }
         self.eat(b'>');
+        self.generic_depth -= 1;
         args
     }
 
@@ -917,7 +930,7 @@ mod tests {
             ty("\\Lib\\Map<string, Foo>"),
             TypeExpr::Generic {
                 class: "Lib\\Map".to_string(),
-                args: vec![TypeExpr::Other, named("App\\Foo")],
+                args: vec![TypeExpr::Scalar("string".to_string()), named("App\\Foo")],
             }
         );
     }
