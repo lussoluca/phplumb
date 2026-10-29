@@ -2359,11 +2359,48 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 .map(|(_, ty)| ty)
             });
         // A variadic parameter collects several elements into an array.
-        if param.hint.is_none() && doc_type.is_none() && param.ellipsis.is_none() {
-            return self.callback_param(scope, i, depth);
+        let own = if param.hint.is_none() && doc_type.is_none() && param.ellipsis.is_none() {
+            self.callback_param(scope, i, depth)
+        } else {
+            let declared = param.hint.as_ref().map(|hint| self.hint_type(hint));
+            pick_type(doc_type, declared).unwrap_or(TypeExpr::Other)
+        };
+        // Only a parameter without a type or with a container type can take a
+        // class from its ancestor: a scalar one cannot.
+        let open = param.hint.as_ref().is_none_or(|hint| {
+            let span = hint.span();
+            let text = self
+                .text(span.start.offset, span.end.offset)
+                .trim_start_matches('?')
+                .to_ascii_lowercase();
+            matches!(text.as_str(), "array" | "iterable" | "mixed" | "object")
+        });
+        if open
+            && names_no_class(&own)
+            && let Some(inherited) = self.inherited_param(scope, i)
+        {
+            return inherited;
         }
-        let declared = param.hint.as_ref().map(|hint| self.hint_type(hint));
-        pick_type(doc_type, declared).unwrap_or(TypeExpr::Other)
+        own
+    }
+
+    /// The type an ancestor's declaration of the method at `scope` gives its
+    /// parameter `i`, as an interface documents it for its implementations.
+    fn inherited_param(&self, scope: &ScopeFact<'_, '_>, i: usize) -> Option<TypeExpr> {
+        let fqn = self.summary.enclosing_class(scope.start)?.fqn.as_deref()?;
+        let method = self
+            .summary
+            .declarations
+            .iter()
+            .filter(|d| d.fqn == fqn)
+            .filter_map(|d| d.class.as_ref())
+            .flat_map(|shape| shape.members.iter())
+            .find(|member| {
+                member.kind == MemberKind::Method
+                    && member.range.0 <= scope.start
+                    && scope.start <= member.range.1
+            })?;
+        self.index.ancestor_param(fqn, &method.name, i)
     }
 
     /// The element type that PHP passes to parameter `i` of a callback written at
@@ -2554,6 +2591,16 @@ fn is_plain_value(expression: &Expression<'_>) -> bool {
         | Expression::Array(_)
         | Expression::LegacyArray(_) => true,
         Expression::Parenthesized(inner) => is_plain_value(inner.expression),
+        _ => false,
+    }
+}
+
+/// Whether `ty` says nothing about classes: unknown, or an array of nothing known.
+pub(crate) fn names_no_class(ty: &TypeExpr) -> bool {
+    match ty {
+        TypeExpr::Other => true,
+        TypeExpr::ArrayOf(element) => names_no_class(element),
+        TypeExpr::Union(members) => members.iter().all(names_no_class),
         _ => false,
     }
 }

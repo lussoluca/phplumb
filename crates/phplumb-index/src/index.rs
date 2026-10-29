@@ -1165,6 +1165,43 @@ impl Index {
 
     /// The nearest typed declaration of a member above `class`, for members with no
     /// type of their own.
+    /// The type of the parameter at `position` of the nearest declaration of
+    /// `method` among the parents and interfaces of `class`, when it names a class.
+    pub(crate) fn ancestor_param(
+        &self,
+        class: &str,
+        method: &str,
+        position: usize,
+    ) -> Option<TypeExpr> {
+        let mut seen: HashSet<String> = HashSet::from([class.to_ascii_lowercase()]);
+        let mut pending: Vec<String> = vec![class.to_string()];
+        let mut next = 0;
+        while next < pending.len() && seen.len() <= 32 {
+            let current = pending[next].clone();
+            next += 1;
+            for ancestor in self.supertypes(&current) {
+                let fqn = &ancestor.declaration.fqn;
+                if !seen.insert(fqn.to_ascii_lowercase()) {
+                    continue;
+                }
+                let declared = ancestor
+                    .declaration
+                    .class
+                    .iter()
+                    .flat_map(|shape| shape.members.iter())
+                    .find(|m| m.kind == MemberKind::Method && m.name.eq_ignore_ascii_case(method))
+                    .and_then(|m| m.params.get(position))
+                    .and_then(|(_, ty)| ty.clone())
+                    .filter(|ty| !crate::infer::names_no_class(ty));
+                if declared.is_some() {
+                    return declared;
+                }
+                pending.push(fqn.clone());
+            }
+        }
+        None
+    }
+
     pub(crate) fn typed_ancestor(
         &self,
         class: &str,
