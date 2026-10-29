@@ -21,6 +21,8 @@ pub enum TypeExpr {
         class: String,
         args: Vec<TypeExpr>,
     },
+    /// `class-string<T>`: the name of a class, not an object of it.
+    ClassString(Box<TypeExpr>),
     /// Unions and intersections: navigation treats both as "any of these".
     Union(Vec<TypeExpr>),
     /// A class carrying a framework tag, such as a storage that knows its entity
@@ -290,6 +292,10 @@ impl TypeParser<'_> {
             "self" => TypeExpr::SelfType,
             "static" => TypeExpr::StaticType,
             "parent" => TypeExpr::ParentType,
+            "class-string" => match args.map(|mut args| (args.len(), args.pop())) {
+                Some((1, Some(Parsed::Type(class)))) => TypeExpr::ClassString(Box::new(class)),
+                _ => TypeExpr::Other,
+            },
             _ if NON_CLASS.contains(&lower.as_str()) => TypeExpr::Other,
             _ => {
                 let fqn = match word.strip_prefix('\\') {
@@ -847,11 +853,19 @@ mod tests {
             "callable(int): void",
             "mixed",
             "string|int",
-            "class-string<Foo>",
+            "class-string",
             "",
         ] {
             assert_eq!(ty(text), TypeExpr::Other, "{text}");
         }
+    }
+
+    #[test]
+    fn class_strings_keep_their_class() {
+        assert_eq!(
+            ty("class-string<Foo>"),
+            TypeExpr::ClassString(Box::new(ty("Foo")))
+        );
     }
 
     #[test]

@@ -56,6 +56,9 @@ pub(crate) fn substitute(ty: &TypeExpr, templates: &[String], args: &[TypeExpr])
             None => ty.clone(),
         },
         TypeExpr::ArrayOf(element) => array_of(substitute(element, templates, args)),
+        TypeExpr::ClassString(class) => {
+            TypeExpr::ClassString(Box::new(substitute(class, templates, args)))
+        }
         TypeExpr::Generic { class, args: inner } => TypeExpr::Generic {
             class: class.clone(),
             args: inner

@@ -47,7 +47,7 @@ use crate::generics::{array_element, element_type, offset_type, substitute, supe
 use crate::index::{Index, Location};
 use crate::phpdoc::{TypeExpr, array_of, parse_docblock, parse_type};
 use crate::summary::{
-    FileSummary, MemberKind, NameKind, NameRef, SymbolKind, pick_type, summarize,
+    FileSummary, Member, MemberKind, NameKind, NameRef, SymbolKind, pick_type, summarize,
 };
 
 const MAX_DEPTH: u32 = 16;
@@ -1740,11 +1740,25 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             ]),
             Expression::Call(Call::Method(call)) => {
                 let receiver = self.expr(call.object, at, depth);
-                self.method_call(&receiver, &call.method, &call.argument_list, at, None)
+                self.method_call(
+                    &receiver,
+                    &call.method,
+                    &call.argument_list,
+                    at,
+                    depth,
+                    None,
+                )
             }
             Expression::Call(Call::NullSafeMethod(call)) => {
                 let receiver = self.expr(call.object, at, depth);
-                self.method_call(&receiver, &call.method, &call.argument_list, at, None)
+                self.method_call(
+                    &receiver,
+                    &call.method,
+                    &call.argument_list,
+                    at,
+                    depth,
+                    None,
+                )
             }
             Expression::Call(Call::StaticMethod(call)) => {
                 let Some(class) = self.class_of(call.class, at, depth) else {
@@ -1764,6 +1778,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     &call.method,
                     &call.argument_list,
                     at,
+                    depth,
                     forwarded.as_deref(),
                 )
             }
@@ -1786,6 +1801,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                         &TypeExpr::Named(class),
                         MemberKind::Property,
                         &variable_name(variable.name),
+                        None,
                         None,
                     ),
                     _ => TypeExpr::Other,
@@ -1838,6 +1854,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         selector: &ClassLikeMemberSelector<'_>,
         arguments: &ArgumentList<'_>,
         at: u32,
+        depth: u32,
         static_class: Option<&str>,
     ) -> TypeExpr {
         if let TypeExpr::Union(members) = receiver
@@ -1846,12 +1863,23 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             return union(
                 members
                     .iter()
-                    .map(|member| self.method_call(member, selector, arguments, at, static_class))
+                    .map(|member| {
+                        self.method_call(member, selector, arguments, at, depth, static_class)
+                    })
                     .collect(),
             );
         }
         self.framework_type(receiver, selector, arguments, at)
-            .unwrap_or_else(|| self.member_on(receiver, selector, MemberKind::Method, static_class))
+            .unwrap_or_else(|| match selector {
+                ClassLikeMemberSelector::Identifier(name) => self.member_type(
+                    receiver,
+                    MemberKind::Method,
+                    &String::from_utf8_lossy(name.value),
+                    static_class,
+                    Some((arguments, at, depth)),
+                ),
+                _ => TypeExpr::Other,
+            })
     }
 
     /// The type the active frameworks give a method call on `receiver`, when one of
@@ -2027,6 +2055,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 kind,
                 &String::from_utf8_lossy(name.value),
                 static_class,
+                None,
             ),
             _ => TypeExpr::Other,
         }
@@ -2042,6 +2071,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         kind: MemberKind,
         name: &str,
         static_class: Option<&str>,
+        call: Option<(&ArgumentList<'_>, u32, u32)>,
     ) -> TypeExpr {
         let mut types = Vec::new();
         for (class, args) in classes_with_args(receiver) {
@@ -2068,6 +2098,15 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 let Some(ty) = &member.ty else {
                     continue;
                 };
+                // A method's own templates take what the call's arguments give them,
+                // before the class's templates of the same name could.
+                let ty = match call {
+                    Some((arguments, at, depth)) if !member.templates.is_empty() => {
+                        let bound = self.method_templates(member, arguments, at, depth);
+                        substitute(ty, &member.templates, &bound)
+                    }
+                    _ => ty.clone(),
+                };
                 let declaration = declaring.declaration;
                 let self_class = if declaration.kind == SymbolKind::Trait {
                     class.as_str()
@@ -2081,9 +2120,9 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     Some(shape) if !shape.templates.is_empty() => {
                         let given = supertype_args(self.index, &class, &args, &declaration.fqn)
                             .unwrap_or_default();
-                        substitute(ty, &shape.templates, &given)
+                        substitute(&ty, &shape.templates, &given)
                     }
-                    _ => ty.clone(),
+                    _ => ty,
                 };
                 types.push(bind(&ty, &static_type, self_class, parent));
             }
@@ -2092,6 +2131,48 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             }
         }
         union(types)
+    }
+
+    /// The type each of `member`'s templates takes in a call with `arguments`: the
+    /// class of an `X::class` argument given to a `class-string<T>` parameter, or the
+    /// type of an argument given to a parameter typed `T`; `Other` when unbound.
+    fn method_templates(
+        &self,
+        member: &Member,
+        arguments: &ArgumentList<'_>,
+        at: u32,
+        depth: u32,
+    ) -> Vec<TypeExpr> {
+        member
+            .templates
+            .iter()
+            .map(|template| {
+                member
+                    .params
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, (_, ty))| {
+                        let argument = || positional(arguments, position);
+                        match ty.as_ref()? {
+                            TypeExpr::ClassString(class) if matches!(&**class, TypeExpr::Named(name) if name == template) => {
+                                match argument()? {
+                                    Expression::Access(Access::ClassConstant(access))
+                                        if matches!(&access.constant, ClassLikeConstantSelector::Identifier(name) if name.value.eq_ignore_ascii_case(b"class")) =>
+                                    {
+                                        self.class_of(access.class, at, depth).map(TypeExpr::Named)
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            TypeExpr::Named(name) if name == template => {
+                                Some(self.expr(argument()?, at, depth + 1))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or(TypeExpr::Other)
+            })
+            .collect()
     }
 
     /// The types the classes of `class`'s parent chain assign to property `name`,
@@ -2140,7 +2221,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     fn function_returns(&self, function: &Expression<'_>, at: u32, depth: u32) -> TypeExpr {
         let Expression::Identifier(identifier) = function else {
             let callee = self.expr(function, at, depth);
-            return self.member_type(&callee, MemberKind::Method, "__invoke", None);
+            return self.member_type(&callee, MemberKind::Method, "__invoke", None, None);
         };
         let Some(name) = self
             .names

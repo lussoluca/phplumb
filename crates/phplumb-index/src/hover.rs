@@ -126,6 +126,7 @@ fn display(ty: &TypeExpr) -> String {
             "\\{class}<{}>",
             args.iter().map(display).collect::<Vec<_>>().join(", ")
         ),
+        TypeExpr::ClassString(class) => format!("class-string<{}>", display(class)),
         TypeExpr::Union(members) => members.iter().map(display).collect::<Vec<_>>().join("|"),
         TypeExpr::Other => "mixed".to_string(),
     }
