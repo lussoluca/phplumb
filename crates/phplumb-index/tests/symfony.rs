@@ -1064,3 +1064,65 @@ fn self_built_twig_environments_and_generators_stay_silent() {
     // Templates outside the configured directories are not the app's.
     assert!(diagnostics(&index, "tests/Fixtures/views/page.html.twig").is_empty());
 }
+
+#[test]
+fn php_updates_keep_the_yaml_read_before() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(&fixture(), &root);
+    let mut index = Index::build(&root, &DiscoverOptions::default()).unwrap().0;
+    let services = root.join("config/services.yaml");
+    let text = std::fs::read_to_string(&services).unwrap();
+    std::fs::write(&services, text.replace("app.limit", "app.ceiling")).unwrap();
+    let count = |index: &Index, name: &str| {
+        index
+            .framework::<Symfony>()
+            .unwrap()
+            .parameter_targets(name)
+            .len()
+    };
+
+    index.update(&[root.join("src/Controller/HomeController.php")], &[]);
+    assert_eq!(count(&index, "app.limit"), 1);
+
+    index.update(&[services], &[]);
+    assert_eq!(count(&index, "app.limit"), 0);
+    assert_eq!(count(&index, "app.ceiling"), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_config_follows_edits_reported_at_the_real_path() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(&fixture(), &root);
+    std::fs::create_dir_all(root.join("shared")).unwrap();
+    let shared = root.join("shared/extra.yaml");
+    std::fs::write(&shared, "parameters:\n    app.extra: 1\n").unwrap();
+    std::os::unix::fs::symlink(&shared, root.join("config/packages/extra.yaml")).unwrap();
+    let controller = root.join("src/Controller/ParamsController.php");
+    let text = std::fs::read_to_string(&controller).unwrap();
+    std::fs::write(&controller, text.replace("app.limit", "app.other")).unwrap();
+    let mut index = Index::build(&root, &DiscoverOptions::default()).unwrap().0;
+    let count = |index: &Index, name: &str| {
+        index
+            .framework::<Symfony>()
+            .unwrap()
+            .parameter_targets(name)
+            .len()
+    };
+    assert_eq!(count(&index, "app.extra"), 1);
+
+    std::fs::write(&shared, "parameters:\n    app.other: 1\n").unwrap();
+    index.update(&[shared], &[]);
+
+    let source = std::fs::read(&controller).unwrap();
+    let messages: Vec<String> = index
+        .diagnostics(&controller, &source)
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+    assert_eq!(count(&index, "app.other"), 1);
+    assert_eq!(count(&index, "app.extra"), 0);
+    assert!(messages.is_empty(), "{messages:?}");
+}

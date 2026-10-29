@@ -1,6 +1,7 @@
 //! Workspace-wide symbol table and the definition query.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Instant, UNIX_EPOCH};
@@ -11,9 +12,11 @@ use crate::builtins;
 use crate::cache::{self, CachedFile};
 use crate::calls::{self, CallItem, CallKind, Calls};
 use crate::diagnostics::{self, Diagnostic};
-use crate::discover::{self, DiscoverOptions, discover_in, discover_with};
+use crate::discover::{self, DiscoverOptions, discover_with, is_recorded_framework_file, walk};
 use crate::filter::{PHP_EXTENSION, PathFilter, is_framework_file};
-use crate::frameworks::{self, FoundCall, Framework, FrameworkCall, FrameworkDeclaration, Project};
+use crate::frameworks::{
+    self, Detection, FoundCall, Framework, FrameworkCall, FrameworkDeclaration, Project,
+};
 use crate::hover::{self, Hover};
 use crate::infer::{self, Assigning, PropertyTypes, Receiver};
 use crate::members;
@@ -97,11 +100,15 @@ pub struct Index {
     property_types: RwLock<HashMap<String, Arc<PropertyTypes>>>,
     /// The index of the phpstorm stubs, which declares PHP's built-in symbols.
     stubs: Option<Arc<Index>>,
+    /// The YAML, Twig and Doctrine XML files outside `vendor`, which only the
+    /// frameworks read.
+    framework_files: BTreeSet<PathBuf>,
 }
 
 impl Index {
     pub fn build(root: &Path, opts: &DiscoverOptions) -> anyhow::Result<(Index, IndexStats)> {
-        Self::build_from(root, opts, HashMap::new())
+        let detection = frameworks::detect(root, &opts.frameworks);
+        Self::build_with(root, opts, None, &detection)
     }
 
     /// Loads `cache` when it was written by this engine version for the same root and
@@ -112,20 +119,26 @@ impl Index {
         opts: &DiscoverOptions,
         cache: &Path,
     ) -> anyhow::Result<(Index, IndexStats)> {
-        let filter = PathFilter::new(root, opts)?;
-        let cached = cache::load(cache, &filter, cache::ENGINE);
-        Self::build_from(root, opts, cached)
+        let detection = frameworks::detect(root, &opts.frameworks);
+        Self::build_with(root, opts, Some(cache), &detection)
     }
 
-    fn build_from(
+    /// Builds the index with the framework modules `detection` found, from `cache`
+    /// when there is one.
+    pub fn build_with(
         root: &Path,
         opts: &DiscoverOptions,
-        mut cached: HashMap<PathBuf, CachedFile>,
+        cache: Option<&Path>,
+        detection: &Detection,
     ) -> anyhow::Result<(Index, IndexStats)> {
         let started = Instant::now();
-        let active = frameworks::active(root, &opts.frameworks);
+        let active = detection.frameworks();
         let mut filter = PathFilter::for_frameworks(root, opts, &active)?;
-        let paths = discover_with(&mut filter);
+        let mut cached = cache
+            .map(|cache| cache::load(cache, &filter, cache::ENGINE))
+            .unwrap_or_default();
+        let walked = discover_with(&mut filter);
+        let paths = walked.php;
 
         let stamps: Vec<Option<(u64, u64)>> = paths.par_iter().map(|p| stamp(p)).collect();
         let mut files: Vec<Option<CachedFile>> = Vec::with_capacity(paths.len());
@@ -164,6 +177,7 @@ impl Index {
             namespaces: HashMap::new(),
             property_types: RwLock::new(HashMap::new()),
             stubs: opts.stubs.as_deref().and_then(crate::stubs::load),
+            framework_files: walked.framework.into_iter().collect(),
         };
         for file in files.into_iter().flatten() {
             stats.files_with_parse_errors += usize::from(file.has_errors);
@@ -191,11 +205,16 @@ impl Index {
             stubs: None,
             ..DiscoverOptions::default()
         };
-        let filter = PathFilter::new(dir, &opts)?;
+        let filter = PathFilter::for_frameworks(dir, &opts, &[])?;
         let mut paths: Vec<PathBuf> = Vec::new();
         let mut pending = vec![filter.root().to_path_buf()];
+        std::fs::read_dir(filter.root())?;
         while let Some(next) = pending.pop() {
-            for entry in std::fs::read_dir(&next)?.flatten() {
+            // An unreadable directory leaves out only its own files.
+            let Ok(entries) = std::fs::read_dir(&next) else {
+                continue;
+            };
+            for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     pending.push(path);
@@ -219,8 +238,11 @@ impl Index {
             namespaces: HashMap::new(),
             property_types: RwLock::new(HashMap::new()),
             stubs: None,
+            framework_files: BTreeSet::new(),
         };
-        for file in read_files_with(&paths, crate::stubs::summarize_stub) {
+        // Finding references never reads the stubs, so they need no candidates.
+        for mut file in read_files_with(&paths, crate::stubs::summarize_stub) {
+            file.ref_keys = Vec::new();
             index.insert(file);
         }
         // A name the stubs declare in several files, such as `Ds\Map` in `ds` and
@@ -262,6 +284,9 @@ impl Index {
         let mut stats = UpdateStats::default();
 
         let deleted: Vec<PathBuf> = removed.iter().map(|p| self.filter.under_root(p)).collect();
+        for path in &deleted {
+            self.forget_framework_files(path);
+        }
         let mut rejected: Vec<PathBuf> = Vec::new();
         let mut fresh: Vec<PathBuf> = Vec::new();
         for path in changed {
@@ -269,12 +294,25 @@ impl Index {
             let chosen = discover::chosen_path(self.filter.root(), &path).map(|(_, chosen)| chosen);
             match chosen {
                 Some(chosen) if chosen.is_dir() => {
+                    self.forget_framework_files(&path);
+                    self.forget_framework_files(&chosen);
                     if self.filter.accepts_dir(&chosen) {
-                        fresh.extend(discover_in(&mut self.filter, &chosen));
+                        let walked = walk(&mut self.filter, &chosen);
+                        fresh.extend(walked.php);
+                        self.framework_files.extend(walked.framework);
+                    }
+                }
+                Some(chosen) if is_framework_file(&chosen) => {
+                    self.forget_framework_files(&path);
+                    if chosen.is_file() && is_recorded_framework_file(&self.filter, &chosen) {
+                        self.framework_files.insert(chosen);
                     }
                 }
                 Some(chosen) if self.filter.accepts(&chosen) => fresh.push(chosen),
-                _ => rejected.push(path),
+                _ => {
+                    self.forget_framework_files(&path);
+                    rejected.push(path);
+                }
             }
         }
 
@@ -303,6 +341,30 @@ impl Index {
             .clear();
         stats.elapsed_ms = started.elapsed().as_millis();
         stats
+    }
+
+    /// The YAML, Twig and Doctrine XML files below `dir` that only the frameworks
+    /// read, outside `vendor`, hidden directories, `node_modules` and excluded paths,
+    /// sorted.
+    pub fn framework_files_under<'a>(
+        &'a self,
+        dir: &'a Path,
+    ) -> impl Iterator<Item = &'a Path> + 'a {
+        self.framework_files
+            .range::<Path, _>((Bound::Included(dir), Bound::Unbounded))
+            .take_while(move |path| path.starts_with(dir))
+            .map(PathBuf::as_path)
+    }
+
+    /// Drops the recorded framework files at or below `path`.
+    fn forget_framework_files(&mut self, path: &Path) {
+        let gone: Vec<PathBuf> = self
+            .framework_files_under(path)
+            .map(Path::to_path_buf)
+            .collect();
+        for path in gone {
+            self.framework_files.remove(&path);
+        }
     }
 
     /// Hover text for the word at `offset` in `path`, whose current content is
@@ -349,11 +411,12 @@ impl Index {
     }
 
     /// Instance, null-safe and static calls to methods named one of `names`, in
-    /// every candidate file, sorted by path and offset.
-    pub fn calls_named(&self, names: &[&str]) -> Vec<FoundCall> {
+    /// every candidate file inside `project`, sorted by path and offset.
+    pub fn calls_named(&self, names: &[&str], project: &Project) -> Vec<FoundCall> {
         let mut files: Vec<PathBuf> = names
             .iter()
             .flat_map(|name| self.candidate_files(&RefKey::Member(name.to_string())))
+            .filter(|path| project.contains(path))
             .map(Path::to_path_buf)
             .collect();
         files.sort();
@@ -435,11 +498,6 @@ impl Index {
             .find_map(|f| f.as_any().downcast_ref::<F>())
     }
 
-    /// The framework modules active for this project.
-    pub(crate) fn frameworks(&self) -> &[Box<dyn Framework>] {
-        &self.frameworks
-    }
-
     /// The active framework modules whose project holds `path`: the only ones asked
     /// about the file.
     pub(crate) fn frameworks_for<'a>(
@@ -504,10 +562,10 @@ impl Index {
     /// offset. Every rule must prove the target missing; uncertainty stays silent.
     pub fn diagnostics(&self, path: &Path, source: &[u8]) -> Vec<Diagnostic> {
         // Only the frameworks read YAML, Twig and Doctrine XML files.
-        let mut found = if is_framework_file(path) {
-            Vec::new()
-        } else {
-            diagnostics::find(self, path, source)
+        let summary = (!is_framework_file(path)).then(|| summarize(source));
+        let mut found = match &summary {
+            Some(summary) => diagnostics::find(self, path, source, summary),
+            None => Vec::new(),
         };
         // `*.api.php` files document hooks with example code that never runs.
         let documentation = path
@@ -517,7 +575,7 @@ impl Index {
         if !documentation {
             found.extend(
                 self.frameworks_for(path)
-                    .flat_map(|f| f.diagnostics(self, path, source)),
+                    .flat_map(|f| f.diagnostics(self, path, source, summary.as_ref())),
             );
         }
         found.sort_by_key(|d| (d.start, d.end));
@@ -1190,13 +1248,7 @@ impl Index {
         declarations: bool,
     ) -> Vec<Location> {
         let found = self.resolve(path, source, offset, declarations);
-        let mut stale: Vec<PathBuf> = found
-            .iter()
-            .filter(|(location, name)| !holds_name(location, name))
-            .map(|(location, _)| location.path.clone())
-            .collect();
-        stale.sort();
-        stale.dedup();
+        let stale = self.stale_paths(&found);
         if stale.is_empty() {
             return found.into_iter().map(|(location, _)| location).collect();
         }
@@ -1205,6 +1257,20 @@ impl Index {
             .into_iter()
             .map(|(location, _)| location)
             .collect()
+    }
+
+    /// The files of `found` that no longer hold the expected name at the target's
+    /// range, sorted, each once. Stub files never change, and some of their names,
+    /// such as constants declared with `define()`, never sit at their range.
+    fn stale_paths(&self, found: &[(Location, String)]) -> Vec<PathBuf> {
+        let mut stale: Vec<PathBuf> = found
+            .iter()
+            .filter(|(location, name)| !self.is_stub(&location.path) && !holds_name(location, name))
+            .map(|(location, _)| location.path.clone())
+            .collect();
+        stale.sort();
+        stale.dedup();
+        stale
     }
 
     /// Implementations of what the cursor is on. On a class-like, declared or
@@ -1235,13 +1301,7 @@ impl Index {
             found
         };
         let found = compute(self);
-        let mut stale: Vec<PathBuf> = found
-            .iter()
-            .filter(|(location, name)| !holds_name(location, name))
-            .map(|(location, _)| location.path.clone())
-            .collect();
-        stale.sort();
-        stale.dedup();
+        let stale = self.stale_paths(&found);
         if stale.is_empty() {
             return found.into_iter().map(|(location, _)| location).collect();
         }
@@ -1389,9 +1449,7 @@ impl Index {
         source: &[u8],
         offset: u32,
     ) -> Option<Vec<(Location, String)>> {
-        if self.frameworks.is_empty() {
-            return None;
-        }
+        self.frameworks_for(path).next()?;
         let argument = infer::string_argument_at(self, path, summary, source, offset)?;
         let call = FrameworkCall {
             targets: &argument.targets,
@@ -1431,7 +1489,15 @@ impl Index {
         source: &[u8],
         offset: u32,
     ) -> Option<Vec<(Location, String)>> {
-        self.frameworks_for(path).next()?;
+        let (start, end) = hover::word_at(source, offset)?;
+        let name =
+            String::from_utf8_lossy(&source[start as usize..end as usize]).to_ascii_lowercase();
+        if !self
+            .frameworks_for(path)
+            .any(|f| f.targeted_methods().contains(&name.as_str()))
+        {
+            return None;
+        }
         let found = infer::call_at(self, path, summary, source, offset)?;
         let call = FrameworkCall {
             targets: &found.parts.targets,
@@ -1453,9 +1519,7 @@ impl Index {
         source: &[u8],
         offset: u32,
     ) -> Option<Vec<(Location, String)>> {
-        if self.frameworks.is_empty() {
-            return None;
-        }
+        self.frameworks_for(path).next()?;
         let keyed = infer::keyed_string_at(self, path, summary, source, offset)?;
         let call = keyed.call.as_ref().map(|argument| {
             let call = FrameworkCall {
@@ -2014,4 +2078,51 @@ fn read_files_with(paths: &[PathBuf], summarize_with: fn(&[u8]) -> FileSummary) 
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn empty_project() -> (TempDir, Index) {
+        let dir = TempDir::new().unwrap();
+        let (index, _) = Index::build(dir.path(), &DiscoverOptions::default()).unwrap();
+        (dir, index)
+    }
+
+    #[test]
+    fn stub_locations_are_never_stale() {
+        let (_dir, index) = empty_project();
+        let stubs = index.stubs.as_ref().expect("the default stubs");
+        let key = symbol_key(SymbolKind::Constant, "pcov\\all");
+        let entry = lookup(&stubs.constants, &key)
+            .first()
+            .expect("pcov\\all in the stubs");
+        let path = stubs.files[entry.file as usize]
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        let location = Location {
+            path,
+            start: entry.start,
+            end: entry.end,
+        };
+        assert!(!holds_name(&location, "all"));
+
+        assert!(
+            index
+                .stale_paths(&[(location, "all".to_string())])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stub_index_has_no_candidates() {
+        let (_dir, index) = empty_project();
+        let stubs = index.stubs.as_ref().expect("the default stubs");
+
+        assert!(stubs.candidates.is_empty());
+    }
 }

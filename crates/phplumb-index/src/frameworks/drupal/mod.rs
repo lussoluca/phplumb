@@ -18,7 +18,7 @@ use crate::frameworks::ancestry::is_a;
 use crate::frameworks::{CallTarget, Framework, FrameworkCall, FrameworkDeclaration, Project};
 use crate::index::{Index, Location};
 use crate::phpdoc::TypeExpr;
-use crate::summary::NameRef;
+use crate::summary::{FileSummary, NameRef};
 
 pub use entities::EntityType;
 use entities::EntityTypes;
@@ -167,11 +167,11 @@ impl Framework for Drupal {
     /// Reads files and declarations of the Drupal project only.
     fn rebuild(&mut self, index: &Index) {
         let filter = index.filter().scoped(&self.project);
-        self.services = Services::read(&filter);
+        self.services = Services::read(index, &filter);
         self.entities = EntityTypes::read(index, &filter);
         self.hooks = Hooks::read(index, &filter);
         self.plugins = Plugins::read(index, &filter, self.hooks.extensions());
-        self.routes = Routes::read(&filter);
+        self.routes = Routes::read(index, &filter);
         self.routes.read_attributes(index, &filter);
         self.literals = PhpLiterals::read(index, &filter);
     }
@@ -197,14 +197,22 @@ impl Framework for Drupal {
                 .collect()
         };
         let (changed, removed) = (ours(changed), ours(removed));
-        self.services.update(&filter, &changed, &removed);
+        self.services.update(index, &filter, &changed, &removed);
         self.entities = EntityTypes::read(index, &filter);
         self.hooks.update(index, &filter, &changed, &removed);
         self.plugins
             .update(index, &filter, self.hooks.extensions(), &changed, &removed);
-        self.routes.update(&filter, &changed, &removed);
+        self.routes.update(index, &filter, &changed, &removed);
         self.routes.read_attributes(index, &filter);
         self.literals.update(&changed, &removed, index, &filter);
+    }
+
+    fn typed_methods(&self) -> &'static [&'static str] {
+        &TYPED_METHODS
+    }
+
+    fn targeted_methods(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// `\Drupal::service(id)` and a container's `get(id)` give the service's classes;
@@ -343,11 +351,17 @@ impl Framework for Drupal {
     }
 
     /// Service ids, route names and plugin ids in PHP defined nowhere on disk.
-    fn diagnostics(&self, index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic> {
-        if crate::filter::is_framework_file(path) {
-            return Vec::new();
+    fn diagnostics(
+        &self,
+        index: &Index,
+        path: &Path,
+        source: &[u8],
+        summary: Option<&FileSummary>,
+    ) -> Vec<Diagnostic> {
+        match summary {
+            Some(summary) => broken::find(self, index, path, source, summary),
+            None => Vec::new(),
         }
-        broken::find(self, index, path, source)
     }
 
     /// Plugin discovery reads the annotations of a class in the subdirectory of a
@@ -395,7 +409,7 @@ impl Framework for Drupal {
     ) -> Vec<(Location, String)> {
         let entity_types = |id: &str, storage: Storage| self.has_entity_type(index, id, storage);
         self.hooks
-            .implementation_targets(index, declaration, &entity_types)
+            .implementation_targets(index, &self.project, declaration, &entity_types)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -410,6 +424,18 @@ const ENTITY_TAG: &str = "drupal.entity:";
 
 /// Storage methods that return one entity, and those that return several.
 const LOAD_ONE: [&str; 4] = ["load", "loadUnchanged", "loadRevision", "create"];
+/// Every method `call_type` reads, lowercased: service, storage and loading calls.
+const TYPED_METHODS: [&str; 9] = [
+    "service",
+    "get",
+    "getstorage",
+    "load",
+    "loadunchanged",
+    "loadrevision",
+    "create",
+    "loadmultiple",
+    "loadbyproperties",
+];
 const LOAD_MANY: [&str; 2] = ["loadMultiple", "loadByProperties"];
 
 /// One type, or their union; nothing when there is none.

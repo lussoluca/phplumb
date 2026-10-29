@@ -2,6 +2,25 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-29, batch A performance
+
+Same machine. The Drupal reference project is now on its `develop` branch, so both projects were measured with this branch and with `main` on the same checkouts, alternating, twice each. The batch fixes issues #1, #2, #3, #6, #24, #25, #26, #44 and #60.
+
+| Metric                    | Drupal reference                      | Symfony reference                 |
+| ------------------------- | ------------------------------------- | --------------------------------- |
+| Member coverage           | 42,929, the same as `main`            | 13,097, the same as `main`        |
+| Cold index                | 2.3 to 2.7 s (6.1 to 7.0 s on `main`) | 0.5 s (0.8 to 1.2 s on `main`)    |
+| Warm start from the cache | 1.4 to 1.5 s (4.8 to 5.1 s)           | 0.19 s (0.43 to 0.46 s)           |
+| Update of one file        | 100 ms (96 to 99 ms)                  | 18 ms (25 ms)                     |
+| Update of 1,000 files     | 0.23 to 0.25 s (7.0 to 7.2 s)         | 76 ms (64 to 83 ms)               |
+| Peak resident memory      | 653 to 702 MB (576 to 589 MB)         | 252 to 262 MB (245 to 251 MB)     |
+| All cases                 | 85 passed, 9 failed, as on `main`     | 31 passed, 0 failed, as on `main` |
+| Diagnostics               | 94, the same entries as on `main`     | 0, as on `main`                   |
+
+The warm start and the update of 1,000 files meet their targets again, for the first time since step 2b. The Drupal module walked its project three more times for YAML files and canonicalized every file it met; it now reads the YAML files the discovery walk records. Its updates compared every changed path with every known file, which cost 7 s for 1,000 files. Discovery itself runs in parallel and canonicalizes only paths reached through a symlink.
+
+Peak memory is about 70 MB higher on the Drupal reference project since the parallel walk, still under the 1 GB target; issue #74 tracks it. The coverage sweep of `web/modules/custom` now reports its time, 10.2 to 10.5 s. The diagnostics sweep of the same directory takes 4.8 s for the whole run, against 10.8 s on `main`.
+
 ## 2026-10-28, step 6g broken Symfony references
 
 Same machine and checkouts as step 6f. Route, template and parameter names defined nowhere are flagged in PHP, Twig and YAML, and the diagnostics sweep now also checks the YAML, Twig and Doctrine XML files below its directory. The build before this step ran first.

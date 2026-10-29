@@ -2,14 +2,14 @@
 //! Drupal's hook collector passes find them, and the `hook_*` documentation of
 //! `*.api.php` files.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::extensions::{Extensions, INFO};
 use super::services::{Tests, is_drupal_file};
 use crate::filter::PathFilter;
 use crate::frameworks::ancestry::is_a;
-use crate::frameworks::{CallTarget, FoundCall, FrameworkDeclaration};
+use crate::frameworks::{CallTarget, FoundCall, FrameworkDeclaration, Project, under_any};
 use crate::index::{Index, Location};
 use crate::metadata::{MetaValue, Metadata};
 use crate::summary::{Declaration, MemberKind, SymbolKind};
@@ -473,7 +473,7 @@ pub(crate) struct Hooks {
 impl Hooks {
     pub(crate) fn read(index: &Index, filter: &PathFilter) -> Hooks {
         let mut hooks = Hooks {
-            extensions: Extensions::read(filter),
+            extensions: Extensions::read(index, filter),
             ..Hooks::default()
         };
         hooks.collect(index, filter);
@@ -489,17 +489,17 @@ impl Hooks {
         changed: &[PathBuf],
         removed: &[PathBuf],
     ) {
-        let extensions_changed = removed.iter().chain(changed).any(|path| {
-            path.is_dir()
-                || is_drupal_file(filter, path, INFO, Tests::Skip)
-                || self
-                    .extensions
-                    .by_dir
-                    .keys()
-                    .any(|dir| dir.starts_with(path))
-        });
+        let paths: HashSet<PathBuf> = removed.iter().chain(changed).cloned().collect();
+        let extensions_changed = paths
+            .iter()
+            .any(|path| path.is_dir() || is_drupal_file(filter, path, INFO, Tests::Skip))
+            || self
+                .extensions
+                .by_dir
+                .keys()
+                .any(|dir| under_any(dir, &paths));
         if extensions_changed {
-            self.extensions = Extensions::read(filter);
+            self.extensions = Extensions::read(index, filter);
         }
         self.collect(index, filter);
     }
@@ -596,6 +596,7 @@ impl Hooks {
     pub(crate) fn implementation_targets(
         &self,
         index: &Index,
+        project: &Project,
         declaration: &FrameworkDeclaration<'_>,
         entity_types: EntityTypes<'_>,
     ) -> Vec<(Location, String)> {
@@ -606,7 +607,7 @@ impl Hooks {
                 .map(|hook| self.doc_targets(&hook, entity_types))
                 .unwrap_or_default();
         }
-        let calls = index.calls_named(&invoking_methods());
+        let calls = index.calls_named(&invoking_methods(), project);
         let mut sites: Vec<&FoundCall> = calls
             .iter()
             .filter(|call| implemented.iter().any(|i| invokes(index, call, i)))

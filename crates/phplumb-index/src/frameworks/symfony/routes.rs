@@ -3,6 +3,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use super::files::{ConfigFiles, Parsed};
 
 use crate::filter::{PathFilter, is_yaml};
 use crate::frameworks::Project;
@@ -50,7 +53,12 @@ pub(crate) struct Routes {
 impl Routes {
     /// Every route of the project: attribute routes of project classes, then the
     /// routes of `config/routes.yaml` and the YAML files below `config/routes`.
-    pub(crate) fn read(index: &Index, filter: &PathFilter, project: &Project) -> Routes {
+    pub(crate) fn read(
+        index: &Index,
+        filter: &PathFilter,
+        project: &Project,
+        config_files: &ConfigFiles,
+    ) -> Routes {
         let mut routes = Routes::default();
         let mut routed: HashMap<String, bool> = HashMap::new();
         for (path, declaration) in index.declarations() {
@@ -72,7 +80,7 @@ impl Routes {
         let files = route_files(&config, filter);
         routes.unknown |= has_unread_route_files(&config);
         for file in &files {
-            routes.read_yaml(index, file, &files, &config);
+            routes.read_yaml(index, config_files.get(file), file, &files, &config);
         }
         routes
     }
@@ -200,12 +208,20 @@ impl Routes {
     /// The routes of one YAML route file: top-level keys with a `path`, also inside
     /// `when@<env>` blocks; imports define none, and say whether the routes they
     /// load are known. `files` are the route files read, below `config`.
-    fn read_yaml(&mut self, index: &Index, file: &Path, files: &[PathBuf], config: &Path) {
-        let Ok(text) = std::fs::read_to_string(file) else {
+    fn read_yaml(
+        &mut self,
+        index: &Index,
+        parsed: Option<Arc<Parsed>>,
+        file: &Path,
+        files: &[PathBuf],
+        config: &Path,
+    ) {
+        let Some(parsed) = parsed else {
             self.unknown = true;
             return;
         };
-        let entries = match yaml::parse(&text) {
+        let text = parsed.text.as_str();
+        let entries = match &parsed.yaml {
             Some(Yaml::Map(entries)) => entries,
             // A file of comments only holds no document.
             None if text.lines().all(|line| {
@@ -221,7 +237,7 @@ impl Routes {
             }
         };
         let mut found: Vec<(&Yaml, &Yaml)> = Vec::new();
-        for (key, value) in &entries {
+        for (key, value) in entries {
             if key.text().is_some_and(|k| k.starts_with("when@")) {
                 if let Yaml::Map(inner) = value {
                     found.extend(inner.iter().map(|(k, v)| (k, v)));
@@ -254,7 +270,7 @@ impl Routes {
             if value.get("path").is_none() {
                 continue;
             }
-            let (start, end) = yaml::value_range(&text, name, *start, *end);
+            let (start, end) = yaml::value_range(text, name, *start, *end);
             self.add(
                 name.clone(),
                 RouteTarget {

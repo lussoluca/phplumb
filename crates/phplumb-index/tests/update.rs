@@ -307,3 +307,43 @@ fn update_skips_created_hidden_and_node_modules_directories() {
 
     assert_eq!(stats.reparsed, 0);
 }
+
+fn framework_files(index: &Index, root: &Path) -> Vec<String> {
+    index
+        .framework_files_under(root)
+        .map(|path| path.strip_prefix(root).unwrap().display().to_string())
+        .collect()
+}
+
+#[test]
+fn framework_files_follow_updates() {
+    let workspace = Workspace::new(&[
+        ("a/a.services.yml", "services: {}\n"),
+        ("vendor/p/p.services.yml", "services: {}\n"),
+        (".hidden/h.yml", "x: 1\n"),
+        ("src/A.php", "<?php\n"),
+    ]);
+    let mut index = workspace.index(&DiscoverOptions::default());
+    assert_eq!(
+        framework_files(&index, &workspace.root),
+        vec!["a/a.services.yml"]
+    );
+
+    workspace.write("b/b.routing.yml", "x: {}\n");
+    index.update(&[workspace.path("b")], &[]);
+    assert_eq!(
+        framework_files(&index, &workspace.root),
+        vec!["a/a.services.yml", "b/b.routing.yml"]
+    );
+
+    fs::remove_file(workspace.path("a/a.services.yml")).unwrap();
+    index.update(&[], &[workspace.path("a/a.services.yml")]);
+    assert_eq!(
+        framework_files(&index, &workspace.root),
+        vec!["b/b.routing.yml"]
+    );
+    assert_eq!(
+        framework_files(&index, &workspace.path("b")),
+        vec!["b.routing.yml"]
+    );
+}

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use super::extensions::Extensions;
 use crate::filter::PathFilter;
 use crate::frameworks::ancestry::is_a;
-use crate::frameworks::{CallTarget, FrameworkCall};
+use crate::frameworks::{CallTarget, FrameworkCall, under_any};
 use crate::index::{Index, Location};
 use crate::infer::{self, class_names};
 use crate::metadata::{MetaValue, Metadata};
@@ -119,14 +119,13 @@ impl Plugins {
         changed: &[PathBuf],
         removed: &[PathBuf],
     ) {
-        let touches_managers = removed
-            .iter()
-            .chain(changed)
-            .any(|path| self.manager_files.iter().any(|file| file.starts_with(path)))
+        let gone: HashSet<PathBuf> = removed.iter().chain(changed).cloned().collect();
+        let changed: HashSet<PathBuf> = changed.iter().cloned().collect();
+        let touches_managers = self.manager_files.iter().any(|file| under_any(file, &gone))
             || index.declarations().any(|(path, declaration)| {
-                filter.in_scope(path)
-                    && declaration.kind == SymbolKind::Class
-                    && changed.iter().any(|changed| path.starts_with(changed))
+                declaration.kind == SymbolKind::Class
+                    && under_any(path, &changed)
+                    && filter.in_scope(path)
                     && is_a(index, &declaration.fqn, &[DEFAULT_MANAGER])
             });
         if touches_managers {

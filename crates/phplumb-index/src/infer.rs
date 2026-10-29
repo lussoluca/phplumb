@@ -42,7 +42,7 @@ use mago_syntax::parser::parse_file_content;
 use mago_syntax::walker::Walker;
 
 use crate::calls::{self, CallKind};
-use crate::frameworks::{AttributeString, CallTarget, FoundCall, FrameworkCall};
+use crate::frameworks::{AttributeString, CallTarget, FoundCall, Framework, FrameworkCall};
 use crate::generics::{array_element, element_type, offset_type, substitute, supertype_args};
 use crate::index::{Index, Location};
 use crate::phpdoc::{TypeExpr, array_of, parse_docblock, parse_type};
@@ -1521,8 +1521,6 @@ impl State {
 
 struct Ctx<'a, 'ast, 'arena> {
     index: &'a Index,
-    /// The file being read: frameworks answer only for files of their project.
-    path: &'a Path,
     summary: &'a FileSummary,
     program: &'arena Program<'arena>,
     source: &'a [u8],
@@ -1534,6 +1532,9 @@ struct Ctx<'a, 'ast, 'arena> {
     memo: RefCell<HashMap<(String, u32), TypeExpr>>,
     /// The property assignment computation this context serves.
     assigning: Option<&'a Assigning<'a>>,
+    /// The framework modules whose project holds the file being read: only they
+    /// answer for it.
+    frameworks: Vec<&'a dyn Framework>,
 }
 
 impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
@@ -1563,7 +1564,6 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             .collect();
         Ctx {
             index,
-            path,
             summary,
             program,
             source,
@@ -1572,6 +1572,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             var_docs,
             memo: RefCell::new(HashMap::new()),
             assigning: None,
+            frameworks: index.frameworks_for(path).collect(),
         }
     }
 
@@ -1751,7 +1752,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         static_class: Option<&str>,
     ) -> TypeExpr {
         if let TypeExpr::Union(members) = receiver
-            && !self.index.frameworks().is_empty()
+            && self.framework_types(selector)
         {
             return union(
                 members
@@ -1773,7 +1774,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         arguments: &ArgumentList<'_>,
         at: u32,
     ) -> Option<TypeExpr> {
-        if self.index.frameworks().is_empty() {
+        if !self.framework_types(selector) {
             return None;
         }
         let ClassLikeMemberSelector::Identifier(name) = selector else {
@@ -1789,9 +1790,21 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             strings: &strings,
             receiver: Some(receiver),
         };
-        self.index
-            .frameworks_for(self.path)
+        self.frameworks
+            .iter()
             .find_map(|framework| framework.call_type(self.index, &call))
+    }
+
+    /// Whether a framework module of the file may type calls to the method `selector`
+    /// names.
+    fn framework_types(&self, selector: &ClassLikeMemberSelector<'_>) -> bool {
+        let ClassLikeMemberSelector::Identifier(name) = selector else {
+            return false;
+        };
+        let name = String::from_utf8_lossy(name.value).to_ascii_lowercase();
+        self.frameworks
+            .iter()
+            .any(|framework| framework.typed_methods().contains(&name.as_str()))
     }
 
     /// `Class::method` for every declaration method `name` resolves to on `receiver`.

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::discover::chosen_path;
 use crate::filter::PathFilter;
+use crate::frameworks::under_any;
 use crate::index::Index;
 use crate::infer;
 use rayon::prelude::*;
@@ -76,13 +77,15 @@ impl PhpLiterals {
         index: &Index,
         filter: &PathFilter,
     ) {
+        let mut gone: HashSet<PathBuf> = HashSet::new();
         for path in removed.iter().chain(changed) {
             let path = filter.under_root(path);
-            let chosen = chosen_path(filter.root(), &path).map(|(_, chosen)| chosen);
-            self.by_file.retain(|file, _| {
-                !file.starts_with(&path) && chosen.as_ref().is_none_or(|c| !file.starts_with(c))
-            });
+            if let Some((_, chosen)) = chosen_path(filter.root(), &path) {
+                gone.insert(chosen);
+            }
+            gone.insert(path);
         }
+        self.by_file.retain(|file, _| !under_any(file, &gone));
         self.refresh(index, filter);
     }
 

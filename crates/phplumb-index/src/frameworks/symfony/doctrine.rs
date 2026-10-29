@@ -4,11 +4,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use ignore::WalkBuilder;
-
-use crate::filter::{PathFilter, SKIPPED_DIR_NAMES, is_doctrine_xml};
+use super::files::ConfigFiles;
+use crate::filter::{PathFilter, is_doctrine_xml};
 use crate::index::Index;
 use crate::metadata::MetaValue;
 use crate::summary::SymbolKind;
@@ -196,13 +194,18 @@ pub(crate) struct Mappings {
 impl Mappings {
     /// The `repository-class` of every entity in the project's `*.orm.xml` files,
     /// then the `repositoryClass` of `#[ORM\Entity]` attributes of project classes.
-    pub(crate) fn read(index: &Index, filter: &PathFilter, files: &[PathBuf]) -> Mappings {
+    pub(crate) fn read(
+        index: &Index,
+        filter: &PathFilter,
+        files: &[PathBuf],
+        config_files: &ConfigFiles,
+    ) -> Mappings {
         let mut repositories = HashMap::new();
         for file in files {
-            let Ok(text) = std::fs::read_to_string(file) else {
+            let Some(parsed) = config_files.get(file) else {
                 continue;
             };
-            for element in elements(&text) {
+            for element in elements(&parsed.text) {
                 if element.name != "entity" {
                     continue;
                 }
@@ -258,37 +261,18 @@ pub(crate) fn qualify(mapped: &str, name: &str) -> String {
     }
 }
 
-/// Every `*.orm.xml` below `dir`, outside `vendor`, the top `var` directory, hidden
-/// directories, `node_modules`, excluded paths and nested projects, in path order.
-pub(crate) fn mapping_files(dir: &Path, filter: PathFilter) -> Vec<PathBuf> {
-    let filter = Arc::new(filter);
-    let excluded = |filter: &PathFilter, path: &Path| {
-        path.strip_prefix(filter.root())
-            .map_or(true, |relative| filter.excludes(relative))
-    };
-    let walk_filter = Arc::clone(&filter);
-    let mut files: Vec<PathBuf> = WalkBuilder::new(dir)
-        .standard_filters(false)
-        .hidden(true)
-        .filter_entry(move |entry| {
-            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-            !(is_dir
-                && entry.depth() > 0
-                && (entry.file_name() == "vendor"
-                    || (entry.depth() == 1 && entry.file_name() == "var")
-                    || SKIPPED_DIR_NAMES
-                        .iter()
-                        .any(|name| entry.file_name() == *name)
-                    || excluded(&walk_filter, entry.path())))
+/// Every `*.orm.xml` below `dir` the index records, outside the top `var`
+/// directory and nested projects, in path order.
+pub(crate) fn mapping_files(index: &Index, dir: &Path, filter: &PathFilter) -> Vec<PathBuf> {
+    index
+        .framework_files_under(dir)
+        .filter(|path| is_doctrine_xml(path) && filter.in_scope(path))
+        .filter(|path| {
+            path.strip_prefix(dir)
+                .is_ok_and(|relative| !relative.starts_with("var"))
         })
-        .build()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
-        .map(|entry| entry.into_path())
-        .filter(|path| is_doctrine_xml(path) && !excluded(&filter, path))
-        .collect();
-    files.sort();
-    files
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 #[cfg(test)]

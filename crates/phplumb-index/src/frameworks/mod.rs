@@ -10,6 +10,7 @@ pub mod symfony;
 pub(crate) mod yaml;
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -39,6 +40,24 @@ pub enum Activation {
 pub struct FrameworkSettings {
     pub drupal: Activation,
     pub symfony: Activation,
+}
+
+/// Whether `path` or one of its ancestors is in `paths`. A few paths are compared
+/// directly, which costs less than hashing every ancestor.
+pub(crate) fn under_any(path: &Path, paths: &HashSet<PathBuf>) -> bool {
+    if paths.len() <= 16 {
+        paths.iter().any(|known| path.starts_with(known))
+    } else {
+        path.ancestors().any(|ancestor| paths.contains(ancestor))
+    }
+}
+
+/// Whether the summary mentions a member named one of `names`.
+pub(crate) fn mentions_member(summary: &FileSummary, names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        let key = RefKey::Member(name.to_string()).hash();
+        summary.ref_keys.binary_search(&key).is_ok()
+    })
 }
 
 /// Whether the summary mentions one of `classes`.
@@ -143,12 +162,16 @@ pub trait Framework: Send + Sync {
     /// Extensions besides `php` of the PHP files the framework uses.
     fn php_extensions(&self) -> &'static [&'static str];
     /// Reads what the framework needs from the index and its own files, after the
-    /// index is built. While `rebuild` and `update` run, `index.frameworks()` is
-    /// empty, so a framework cannot query the others.
+    /// index is built. While `rebuild` and `update` run, the index has no active
+    /// framework, so a framework cannot query the others.
     fn rebuild(&mut self, index: &Index);
     /// Applies changed and removed paths (files or directories, any extension),
     /// after the index applied them.
     fn update(&mut self, index: &Index, changed: &[PathBuf], removed: &[PathBuf]);
+    /// Lowercased names of the methods whose calls `call_type` may type.
+    fn typed_methods(&self) -> &'static [&'static str];
+    /// Lowercased names of the methods whose calls `call_targets` may answer.
+    fn targeted_methods(&self) -> &'static [&'static str];
     /// The type `call` returns when the framework knows better than its declaration.
     fn call_type(&self, index: &Index, call: &FrameworkCall<'_>) -> Option<TypeExpr>;
     /// Targets of the string literal at position `argument` of `call`, or of one of
@@ -188,9 +211,16 @@ pub trait Framework: Send + Sync {
         value: &str,
         call: Option<(&FrameworkCall<'_>, usize)>,
     ) -> Vec<(Location, String)>;
-    /// Broken references the framework finds in the PHP file at `path`, whose
-    /// current content is `source`.
-    fn diagnostics(&self, index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic>;
+    /// Broken references the framework finds in the file at `path`, whose current
+    /// content is `source`; `summary` is the summary of a PHP file, and none for the
+    /// files only the frameworks read.
+    fn diagnostics(
+        &self,
+        index: &Index,
+        path: &Path,
+        source: &[u8],
+        summary: Option<&FileSummary>,
+    ) -> Vec<Diagnostic>;
     /// Implementations the framework adds to the class-like `class`, each with the
     /// text expected at its range.
     fn class_implementations(&self, index: &Index, class: &str) -> Vec<(Location, String)>;
@@ -227,12 +257,6 @@ pub fn registered(settings: &FrameworkSettings) -> Vec<(Activation, Box<dyn Fram
     ]
 }
 
-/// Extensions of the files read as PHP in the project at `root`: `php`, then those
-/// the active frameworks add.
-pub fn php_extensions(root: &Path, settings: &FrameworkSettings) -> Vec<&'static str> {
-    extensions(&active(root, settings))
-}
-
 /// `php`, then the extensions `frameworks` add.
 pub(crate) fn extensions(frameworks: &[Box<dyn Framework>]) -> Vec<&'static str> {
     std::iter::once(PHP_EXTENSION)
@@ -244,34 +268,149 @@ pub(crate) fn extensions(frameworks: &[Box<dyn Framework>]) -> Vec<&'static str>
         .collect()
 }
 
-/// The frameworks to run for the workspace at `root`, each with its project: the
-/// directory of its nearest `composer.lock`, or the root when forced on without one,
-/// without the projects of the other active modules inside it.
-pub(crate) fn active(root: &Path, settings: &FrameworkSettings) -> Vec<Box<dyn Framework>> {
+/// The framework modules to run for a workspace, each with the directory of its
+/// project.
+#[derive(Clone, Debug)]
+pub struct Detection {
+    settings: FrameworkSettings,
+    projects: Vec<(&'static str, PathBuf)>,
+}
+
+impl Detection {
+    /// Extensions of the files read as PHP: `php`, then those the modules add.
+    pub fn php_extensions(&self) -> Vec<&'static str> {
+        extensions(&self.frameworks())
+    }
+
+    /// Fresh modules, each set to its project: the directory of its nearest
+    /// `composer.lock`, or the root when forced on without one, without the projects
+    /// of the other modules inside it.
+    pub(crate) fn frameworks(&self) -> Vec<Box<dyn Framework>> {
+        registered(&self.settings)
+            .into_iter()
+            .filter_map(|(_, mut framework)| {
+                let (_, dir) = self
+                    .projects
+                    .iter()
+                    .find(|(name, _)| *name == framework.name())?;
+                let excluded = self
+                    .projects
+                    .iter()
+                    .map(|(_, other)| other)
+                    .filter(|other| *other != dir && other.starts_with(dir))
+                    .cloned()
+                    .collect();
+                framework.set_project(Project {
+                    dir: dir.clone(),
+                    excluded,
+                });
+                Some(framework)
+            })
+            .collect()
+    }
+}
+
+/// Which framework modules run for the workspace at `root`. The `composer.lock`
+/// files are looked for once, and not at all when every module is off.
+pub fn detect(root: &Path, settings: &FrameworkSettings) -> Detection {
+    detect_with(root, settings, project::locks)
+}
+
+pub(crate) fn detect_with(
+    root: &Path,
+    settings: &FrameworkSettings,
+    find_locks: impl FnOnce(&Path) -> Vec<project::Lock>,
+) -> Detection {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let found: Vec<(Box<dyn Framework>, PathBuf)> = registered(settings)
+    let modules = registered(settings);
+    let locks = if modules
+        .iter()
+        .any(|(activation, _)| *activation != Activation::Off)
+    {
+        find_locks(&root)
+    } else {
+        Vec::new()
+    };
+    let projects = modules
         .into_iter()
         .filter_map(|(activation, framework)| {
-            let lock = project::nearest_lock(&root, framework.package());
+            let lock = locks
+                .iter()
+                .find(|lock| lock.requires(framework.package()))
+                .map(|lock| lock.dir.clone());
             let dir = match activation {
                 Activation::Off => return None,
                 Activation::On => lock.unwrap_or_else(|| root.clone()),
                 Activation::Auto => lock?,
             };
-            Some((framework, dir))
+            Some((framework.name(), dir))
         })
         .collect();
-    let dirs: Vec<PathBuf> = found.iter().map(|(_, dir)| dir.clone()).collect();
-    found
-        .into_iter()
-        .map(|(mut framework, dir)| {
-            let excluded = dirs
-                .iter()
-                .filter(|other| **other != dir && other.starts_with(&dir))
-                .cloned()
-                .collect();
-            framework.set_project(Project { dir, excluded });
-            framework
-        })
-        .collect()
+    Detection {
+        settings: settings.clone(),
+        projects,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const BOTH_LOCK: &str =
+        r#"{"packages": [{"name": "drupal/core"}, {"name": "symfony/framework-bundle"}]}"#;
+
+    fn root_with_lock(lock: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("composer.lock"), lock).unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn detection_skips_the_walk_when_every_module_is_off() {
+        let (_dir, root) = root_with_lock(BOTH_LOCK);
+        let settings = FrameworkSettings {
+            drupal: Activation::Off,
+            symfony: Activation::Off,
+        };
+
+        let detection = detect_with(&root, &settings, |_| panic!("walked for locks"));
+
+        assert!(detection.frameworks().is_empty());
+        assert_eq!(detection.php_extensions(), vec!["php"]);
+    }
+
+    #[test]
+    fn under_any_matches_whole_components_for_few_and_many_paths() {
+        let few: HashSet<PathBuf> = [PathBuf::from("/p/a")].into();
+        let many: HashSet<PathBuf> = (0..40)
+            .map(|i| PathBuf::from(format!("/q/{i}")))
+            .chain([PathBuf::from("/p/a")])
+            .collect();
+        for paths in [&few, &many] {
+            assert!(under_any(Path::new("/p/a"), paths));
+            assert!(under_any(Path::new("/p/a/b.php"), paths));
+            assert!(!under_any(Path::new("/p/ab.php"), paths));
+            assert!(!under_any(Path::new("/p"), paths));
+        }
+        assert!(!under_any(Path::new("/p/a"), &HashSet::new()));
+    }
+
+    #[test]
+    fn detection_finds_both_modules_in_one_lock() {
+        let (_dir, root) = root_with_lock(BOTH_LOCK);
+
+        let detection = detect(&root, &FrameworkSettings::default());
+
+        let projects: Vec<(&str, PathBuf)> = detection
+            .frameworks()
+            .iter()
+            .map(|f| (f.name(), f.project().dir.clone()))
+            .collect();
+        assert_eq!(
+            projects,
+            vec![("drupal", root.clone()), ("symfony", root.clone())]
+        );
+    }
 }

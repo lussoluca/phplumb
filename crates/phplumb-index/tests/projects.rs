@@ -630,3 +630,53 @@ fn unread_twig_configuration_silences_template_diagnostics() {
         assert!(template_messages(&[file]).is_empty(), "{file:?}");
     }
 }
+
+const MODULE_HANDLER: &str = "<?php\nnamespace Drupal\\Core\\Extension;\ninterface ModuleHandlerInterface\n{\n    public function invokeAll($hook, array $args = []);\n}\n";
+
+fn runner(namespace: &str) -> String {
+    format!(
+        "<?php\nnamespace {namespace};\nuse Drupal\\Core\\Extension\\ModuleHandlerInterface;\nclass Runner\n{{\n    public function go(ModuleHandlerInterface $handler): void\n    {{\n        $handler->invokeAll('cron');\n    }}\n}}\n"
+    )
+}
+
+#[test]
+fn hook_invocations_stay_in_the_drupal_project() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(&nested(), &root);
+    let drupal_dir = root.join("codebase/drupal/web");
+    let files = [
+        (
+            drupal_dir.join("core/lib/Drupal/Core/Extension/ModuleHandlerInterface.php"),
+            MODULE_HANDLER.to_string(),
+        ),
+        (
+            drupal_dir.join("modules/custom/demo/demo.module"),
+            "<?php\nfunction demo_cron() {}\n".to_string(),
+        ),
+        (
+            drupal_dir.join("modules/custom/demo/src/Runner.php"),
+            runner("Drupal\\demo"),
+        ),
+        (root.join("src/Runner.php"), runner("App")),
+    ];
+    for (path, content) in &files {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let mut index = auto(&root);
+    let module = drupal_dir.join("modules/custom/demo/demo.module");
+    let source = fs::read(&module).unwrap();
+    let offset = String::from_utf8_lossy(&source).find("demo_cron").unwrap() as u32;
+
+    let targets: Vec<PathBuf> = index
+        .definition(&module, &source, offset)
+        .into_iter()
+        .map(|location| location.path)
+        .collect();
+
+    assert_eq!(
+        targets,
+        vec![drupal_dir.join("modules/custom/demo/src/Runner.php")]
+    );
+}

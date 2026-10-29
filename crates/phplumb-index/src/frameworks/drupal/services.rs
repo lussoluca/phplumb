@@ -4,10 +4,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
-
 use crate::discover::chosen_path;
 use crate::filter::{PathFilter, SKIPPED_DIR_NAMES, has_skipped_component};
+use crate::frameworks::under_any;
 use crate::frameworks::yaml::{self, Yaml};
 use crate::index::Index;
 
@@ -38,12 +37,12 @@ pub(crate) struct Services {
 
 impl Services {
     /// Every services file below the filter's root.
-    pub(crate) fn read(filter: &PathFilter) -> Services {
+    pub(crate) fn read(index: &Index, filter: &PathFilter) -> Services {
         let mut services = Services {
             root: filter.root().to_path_buf(),
             ..Services::default()
         };
-        for path in drupal_files(filter, filter.start(), SERVICES, Tests::Include) {
+        for path in drupal_files(index, filter, filter.start(), SERVICES, Tests::Include) {
             services.by_file.insert(path.clone(), parse_file(&path));
         }
         services.reindex();
@@ -51,29 +50,20 @@ impl Services {
     }
 
     /// Re-reads changed services files and directories; drops removed ones.
-    pub(crate) fn update(&mut self, filter: &PathFilter, changed: &[PathBuf], removed: &[PathBuf]) {
-        let mut touched = false;
-        for path in removed.iter().chain(changed) {
-            let before = self.by_file.len();
-            self.by_file.retain(|file, _| !file.starts_with(path));
-            touched |= self.by_file.len() != before;
-        }
-        for path in changed {
-            let files = if path.is_dir() {
-                drupal_files(filter, path, SERVICES, Tests::Include)
-            } else {
-                chosen_path(filter.root(), path)
-                    .map(|(_, chosen)| chosen)
-                    .filter(|chosen| {
-                        is_drupal_file(filter, chosen, SERVICES, Tests::Include) && chosen.is_file()
-                    })
-                    .into_iter()
-                    .collect()
-            };
-            for file in files {
-                self.by_file.insert(file.clone(), parse_file(&file));
-                touched = true;
-            }
+    pub(crate) fn update(
+        &mut self,
+        index: &Index,
+        filter: &PathFilter,
+        changed: &[PathBuf],
+        removed: &[PathBuf],
+    ) {
+        let gone: HashSet<PathBuf> = removed.iter().chain(changed).cloned().collect();
+        let before = self.by_file.len();
+        self.by_file.retain(|file, _| !under_any(file, &gone));
+        let mut touched = self.by_file.len() != before;
+        for file in changed_drupal_files(index, filter, changed, SERVICES, Tests::Include) {
+            self.by_file.insert(file.clone(), parse_file(&file));
+            touched = true;
         }
         if touched {
             self.reindex();
@@ -195,10 +185,7 @@ pub(super) fn in_tests(root: &Path, path: &Path) -> bool {
 /// outside `vendor`, hidden or skipped directories, and test modules unless `tests`
 /// includes them.
 pub(super) fn is_drupal_file(filter: &PathFilter, path: &Path, suffix: &str, tests: Tests) -> bool {
-    let name_matches = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(suffix) || (suffix == SERVICES && n == SITE_SERVICES));
+    let name_matches = has_suffix(path, suffix);
     let Ok(relative) = path.strip_prefix(filter.root()) else {
         return false;
     };
@@ -214,49 +201,46 @@ pub(super) fn is_drupal_file(filter: &PathFilter, path: &Path, suffix: &str, tes
 }
 
 /// The files named `*{suffix}` that the Drupal registries read below `start`, a
-/// directory under the filter's root, each once under the path PHP discovery would
-/// choose for it.
+/// directory under the filter's root, from the files the index records, each under
+/// the path PHP discovery chose for it.
 pub(super) fn drupal_files(
+    index: &Index,
     filter: &PathFilter,
     start: &Path,
     suffix: &str,
     tests: Tests,
 ) -> Vec<PathBuf> {
-    if !filter.accepts_dir(start) {
-        return Vec::new();
-    }
-    let walker = WalkBuilder::new(start)
-        .hidden(true)
-        .parents(false)
-        .ignore(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .follow_links(true)
-        .filter_entry(move |entry| {
-            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-            let name = entry.file_name();
-            !(is_dir
-                && (name == "vendor"
-                    || (tests == Tests::Skip && name == "tests")
-                    || SKIPPED_DIR_NAMES.iter().any(|s| name == *s)))
-        })
-        .build();
-    let mut by_canonical: HashMap<PathBuf, PathBuf> = HashMap::new();
-    for entry in walker.flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let Some((canonical, chosen)) = chosen_path(filter.root(), entry.path()) else {
-            continue;
-        };
-        if is_drupal_file(filter, &chosen, suffix, tests) {
-            by_canonical.entry(canonical).or_insert(chosen);
-        }
-    }
-    let mut files: Vec<PathBuf> = by_canonical.into_values().collect();
+    index
+        .framework_files_under(start)
+        .filter(|path| is_drupal_file(filter, path, suffix, tests))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// The files named `*{suffix}` the registries read at or below the changed paths,
+/// under the paths the index chose for them.
+pub(super) fn changed_drupal_files(
+    index: &Index,
+    filter: &PathFilter,
+    changed: &[PathBuf],
+    suffix: &str,
+    tests: Tests,
+) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = changed
+        .iter()
+        .filter(|path| path.is_dir() || has_suffix(path, suffix))
+        .filter_map(|path| chosen_path(filter.root(), path).map(|(_, chosen)| chosen))
+        .flat_map(|chosen| drupal_files(index, filter, &chosen, suffix, tests))
+        .collect();
     files.sort();
+    files.dedup();
     files
+}
+
+fn has_suffix(path: &Path, suffix: &str) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(suffix) || (suffix == SERVICES && n == SITE_SERVICES))
 }
 
 /// The service definitions of one file, with their ids; nothing when it does not

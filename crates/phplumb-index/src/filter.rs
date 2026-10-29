@@ -61,7 +61,11 @@ pub struct PathFilter {
 
 impl PathFilter {
     pub fn new(root: &Path, opts: &DiscoverOptions) -> anyhow::Result<PathFilter> {
-        Self::for_frameworks(root, opts, &frameworks::active(root, &opts.frameworks))
+        Self::for_frameworks(
+            root,
+            opts,
+            &frameworks::detect(root, &opts.frameworks).frameworks(),
+        )
     }
 
     /// The filter for a project whose active frameworks are `active`.
@@ -122,7 +126,7 @@ impl PathFilter {
         !self.exclude_patterns.is_empty()
     }
 
-    fn has_php_extension(&self, path: &Path) -> bool {
+    pub(crate) fn has_php_extension(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| self.extensions.contains(&ext))

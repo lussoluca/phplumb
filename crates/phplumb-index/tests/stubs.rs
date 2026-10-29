@@ -381,3 +381,60 @@ fn project_class_with_a_built_in_name_wins() {
     let method = definition(&mut index, "app/Legacy.php", "work()", 0);
     assert_eq!(described(&index, &method), [pair("lib/Worker.php", "work")]);
 }
+
+/// A project whose `uses.php` creates `class`, indexed with the stubs in `stubs`;
+/// the definition of `class` there.
+fn stub_definition(stubs: &Path, class: &str) -> Vec<PathBuf> {
+    let project = tempfile::TempDir::new().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    let uses = root.join("uses.php");
+    let source = format!("<?php\nnew \\{class}();\n");
+    std::fs::write(&uses, &source).unwrap();
+    let opts = DiscoverOptions {
+        stubs: Some(stubs.to_path_buf()),
+        ..DiscoverOptions::default()
+    };
+    let (mut index, _) = Index::build(&root, &opts).unwrap();
+    let offset = source.find(class).unwrap() as u32;
+    index
+        .definition(&uses, source.as_bytes(), offset)
+        .into_iter()
+        .map(|location| location.path)
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_stub_directories_skip_only_their_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::TempDir::new().unwrap();
+    let stubs = dir.path().canonicalize().unwrap();
+    std::fs::write(stubs.join("a.php"), "<?php\nclass ArrayObject {}\n").unwrap();
+    let locked = stubs.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("b.php"), "<?php\nclass ArrayIterator {}\n").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Permissions do not stop a privileged user.
+    let readable = std::fs::read_dir(&locked).is_ok();
+
+    let found = (!readable).then(|| stub_definition(&stubs, "ArrayObject"));
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if let Some(found) = found {
+        assert_eq!(found, vec![stubs.join("a.php")]);
+    }
+}
+
+#[test]
+fn an_empty_stub_directory_is_read_again() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stubs = dir.path().canonicalize().unwrap();
+    assert!(stub_definition(&stubs, "ArrayObject").is_empty());
+
+    std::fs::write(stubs.join("x.php"), "<?php\nclass ArrayObject {}\n").unwrap();
+
+    assert_eq!(
+        stub_definition(&stubs, "ArrayObject"),
+        vec![stubs.join("x.php")]
+    );
+}

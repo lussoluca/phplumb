@@ -8,10 +8,10 @@ use super::services::in_tests;
 use super::{Drupal, plugins};
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::frameworks::ancestry::is_a;
-use crate::frameworks::{CallTarget, FoundCall, FrameworkCall, mentions};
+use crate::frameworks::{CallTarget, FoundCall, FrameworkCall, mentions, mentions_member};
 use crate::index::Index;
 use crate::infer;
-use crate::summary::summarize;
+use crate::summary::FileSummary;
 
 /// Containers whose `get(id)` takes a service id. A plain PSR container may be any
 /// other container.
@@ -40,7 +40,13 @@ const PLUGIN_NOT_FOUND: [&str; 2] = [
     "Drupal\\Component\\Plugin\\Exception\\PluginException",
 ];
 
-pub(super) fn find(drupal: &Drupal, index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic> {
+pub(super) fn find(
+    drupal: &Drupal,
+    index: &Index,
+    path: &Path,
+    source: &[u8],
+    summary: &FileSummary,
+) -> Vec<Diagnostic> {
     // Ids defined in excluded files are unknown.
     if index.has_exclusions() {
         return Vec::new();
@@ -50,8 +56,7 @@ pub(super) fn find(drupal: &Drupal, index: &Index, path: &Path, source: &[u8]) -
     if in_tests(index.filter().root(), &index.filter().under_root(path)) {
         return Vec::new();
     }
-    let summary = summarize(source);
-    let catches = |exceptions: &[&str]| mentions(&summary, exceptions);
+    let catches = |exceptions: &[&str]| mentions(summary, exceptions);
     let (services_caught, routes_caught, plugins_caught) = (
         catches(&SERVICE_NOT_FOUND),
         catches(&ROUTE_NOT_FOUND),
@@ -69,7 +74,11 @@ pub(super) fn find(drupal: &Drupal, index: &Index, path: &Path, source: &[u8]) -
         "addConstraint",
     ];
     names.extend(route_methods());
-    let calls = infer::calls_named(index, path, &summary, source, &names);
+    let calls = if mentions_member(summary, &names) {
+        infer::calls_named(index, path, summary, source, &names)
+    } else {
+        Vec::new()
+    };
     let guarded = |method: &str, id: &str| {
         calls.iter().any(|call| {
             call.strings.first().cloned().flatten().as_deref() == Some(id)
@@ -124,7 +133,7 @@ pub(super) fn find(drupal: &Drupal, index: &Index, path: &Path, source: &[u8]) -
             }
         }
     }
-    for keyed in infer::keyed_strings(index, path, &summary, source) {
+    for keyed in infer::keyed_strings(index, path, summary, source) {
         let call = keyed.keyed.call.as_ref().map(|argument| {
             (
                 FrameworkCall {

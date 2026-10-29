@@ -162,7 +162,11 @@ fn found_calls(
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("Calls.php"), format!("<?php\n{content}")).unwrap();
     let index = Index::build(&root, &DiscoverOptions::default()).unwrap().0;
-    let found = index.calls_named(names);
+    let project = phplumb_index::frameworks::Project {
+        dir: root.clone(),
+        excluded: Vec::new(),
+    };
+    let found = index.calls_named(names, &project);
     (dir, found)
 }
 

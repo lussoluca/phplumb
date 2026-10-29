@@ -11,10 +11,10 @@ use super::{
 };
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::frameworks::yaml::{self, Yaml};
-use crate::frameworks::{FrameworkCall, mentions};
+use crate::frameworks::{FrameworkCall, mentions, mentions_member};
 use crate::index::Index;
 use crate::infer;
-use crate::summary::summarize;
+use crate::summary::FileSummary;
 
 /// Classes that leave a file's names of one kind unchecked: the exception a
 /// missing route, template or parameter throws, which the file may catch, and the
@@ -38,15 +38,15 @@ pub(super) fn find(
     index: &Index,
     path: &Path,
     source: &[u8],
+    summary: &FileSummary,
 ) -> Vec<Diagnostic> {
     // Names defined in excluded files are unknown.
     if index.has_exclusions() {
         return Vec::new();
     }
-    let summary = summarize(source);
-    let routes = !mentions(&summary, &ROUTE_NOT_FOUND);
-    let templates = !mentions(&summary, &TEMPLATE_NOT_FOUND);
-    let parameters = !mentions(&summary, &PARAMETER_NOT_FOUND);
+    let routes = !mentions(summary, &ROUTE_NOT_FOUND);
+    let templates = !mentions(summary, &TEMPLATE_NOT_FOUND);
+    let parameters = !mentions(summary, &PARAMETER_NOT_FOUND);
     let names: Vec<&str> = ROUTE_METHODS
         .iter()
         .chain(&TEMPLATE_METHODS)
@@ -54,7 +54,12 @@ pub(super) fn find(
         .flat_map(|(_, methods)| methods.iter().copied())
         .collect();
     let mut found = Vec::new();
-    for call in infer::calls_named(index, path, &summary, source, &names) {
+    let calls = if mentions_member(summary, &names) {
+        infer::calls_named(index, path, summary, source, &names)
+    } else {
+        Vec::new()
+    };
+    for call in calls {
         let (Some(Some(name)), Some(Some(range))) = (call.strings.first(), call.ranges.first())
         else {
             continue;
@@ -80,7 +85,12 @@ pub(super) fn find(
         };
         found.push(diagnostic(*range, message));
     }
-    for (attribute, end) in infer::attribute_strings(&summary, source) {
+    let attributes = if mentions(summary, &[AUTOWIRE_ATTRIBUTE, TEMPLATE_ATTRIBUTE]) {
+        infer::attribute_strings(summary, source)
+    } else {
+        Vec::new()
+    };
+    for (attribute, end) in attributes {
         let first = attribute.key.is_none() && attribute.position == 0;
         let key = attribute.key.as_deref();
         if parameters && attribute.attribute.eq_ignore_ascii_case(AUTOWIRE_ATTRIBUTE) {
