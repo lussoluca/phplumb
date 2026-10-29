@@ -1027,7 +1027,7 @@ const PHP_ROUTES: &str = "<?php\nuse App\\Controller\\Uses;\nuse Symfony\\Compon
 
 #[test]
 fn php_route_files_define_their_routes() {
-    let (_dir, root) = broken_symfony(&[("config/routes.php", PHP_ROUTES)]);
+    let (_dir, root) = broken_symfony(&[("config/routes/app.php", PHP_ROUTES)]);
     let index = auto(&root);
 
     assert_eq!(route_files_of(&index, "php_home"), ["php_home", "run"]);
@@ -1053,4 +1053,56 @@ fn php_route_imports_and_computed_names_silence_route_diagnostics() {
             "{content}"
         );
     }
+}
+
+#[test]
+fn route_files_follow_the_kernel_patterns() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/routes/deep/nested/x.yaml",
+            "deep_x:\n    path: /x\n",
+        ),
+        ("config/routes/y.yml", "yml_y:\n    path: /y\n"),
+        ("config/routes/dev/z.yaml", "dev_z:\n    path: /z\n"),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "dev_z"), ["dev_z"]);
+    assert!(route_files_of(&index, "deep_x").is_empty());
+    assert!(route_files_of(&index, "yml_y").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn route_file_symlink_loops_read_each_file_once() {
+    let (_dir, root) = broken_symfony(&[("config/routes/a.yaml", "a_route:\n    path: /a\n")]);
+    std::os::unix::fs::symlink("..", root.join("config/routes/loop")).unwrap();
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "home"), ["home"]);
+    assert_eq!(route_files_of(&index, "a_route"), ["a_route"]);
+}
+
+#[test]
+fn route_file_updates_read_extensions_in_any_case() {
+    let (_dir, root) = broken_symfony(&[]);
+    let mut index = auto(&root);
+    let upper = root.join("config/routes/A.YAML");
+    fs::create_dir_all(upper.parent().unwrap()).unwrap();
+    fs::write(&upper, "upper_a:\n    path: /a\n").unwrap();
+
+    index.update(&[upper], &[]);
+
+    assert_eq!(route_files_of(&index, "upper_a"), ["upper_a"]);
+}
+
+#[test]
+fn routes_php_is_read_only_without_routes_yaml() {
+    let (_dir, root) = broken_symfony(&[("config/routes.php", PHP_ROUTES)]);
+    assert!(route_files_of(&auto(&root), "php_home").is_empty());
+    fs::remove_file(root.join("config/routes.yaml")).unwrap();
+    assert_eq!(
+        route_files_of(&auto(&root), "php_home"),
+        ["php_home", "run"]
+    );
 }

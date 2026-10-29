@@ -619,53 +619,71 @@ fn controller_target(index: &Index, controller: &str) -> Option<RouteTarget> {
     })
 }
 
-/// `routes.php` in `config`, then the PHP files directly in `config/routes`, in path
-/// order.
+/// `routes.php` in `config` when there is no `routes.yaml`, then the PHP files the
+/// kernel imports from `config/routes`.
 fn php_route_files(config: &Path, filter: &PathFilter) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(config.join("routes"))
+    let main = config.join("routes.php");
+    let main = (main.is_file() && !config.join("routes.yaml").is_file()).then_some(main);
+    kernel_route_files(config, filter, main, "php")
+}
+
+/// `routes.yaml` in `config`, then the YAML files the kernel imports from
+/// `config/routes`.
+fn route_files(config: &Path, filter: &PathFilter) -> Vec<PathBuf> {
+    let main = config.join("routes.yaml");
+    kernel_route_files(config, filter, main.is_file().then_some(main), "yaml")
+}
+
+/// `main`, then the files with `extension` directly in `config/routes` and in its
+/// environment directories, as `MicroKernelTrait` imports them, each once (by real
+/// path), in path order.
+fn kernel_route_files(
+    config: &Path,
+    filter: &PathFilter,
+    main: Option<PathBuf>,
+    extension: &str,
+) -> Vec<PathBuf> {
+    let routes = config.join("routes");
+    let files_in = |dir: &Path| -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case(extension))
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    let mut environments: Vec<PathBuf> = std::fs::read_dir(&routes)
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.is_file() && path.extension().is_some_and(|e| e == "php"))
+        .filter(|path| path.is_dir())
         .collect();
-    files.sort();
-    let main = config.join("routes.php");
-    if main.is_file() {
-        files.insert(0, main);
+    environments.sort();
+    let mut files: Vec<PathBuf> = main.into_iter().collect();
+    files.extend(files_in(&routes));
+    for environment in &environments {
+        files.extend(files_in(environment));
     }
-    files.retain(|path| filter.in_scope(path));
-    files
-}
-
-/// `routes.yaml` (or `.yml`) in `config`, then every YAML file below
-/// `config/routes`, in path order.
-fn route_files(config: &Path, filter: &PathFilter) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = ["routes.yaml", "routes.yml"]
-        .iter()
-        .map(|name| config.join(name))
-        .filter(|path| path.is_file())
-        .collect();
-    let mut below = Vec::new();
-    collect_yaml(&config.join("routes"), &mut below);
-    below.sort();
-    files.extend(below);
-    files.retain(|path| filter.in_scope(path));
-    files
-}
-
-fn collect_yaml(dir: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_yaml(&path, found);
-        } else if is_yaml(&path) {
-            found.push(path);
+    let mut seen: Vec<PathBuf> = Vec::new();
+    files.retain(|path| {
+        let real = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if seen.contains(&real) {
+            return false;
         }
-    }
+        seen.push(real);
+        filter.in_scope(path)
+    });
+    files
 }
 
 /// The name Symfony gives the `index`-th unnamed route of `method` (from 0):
