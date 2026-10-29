@@ -126,7 +126,7 @@ fn scan_file(
                     .iter()
                     .filter(|n| {
                         index
-                            .annotation_classes(summary, n)
+                            .annotation_classes(path, summary, n)
                             .iter()
                             .any(|class| class.eq_ignore_ascii_case(fqn))
                     })

@@ -460,11 +460,17 @@ impl Index {
         found
     }
 
-    /// The classes an annotation name of `summary` may be: the class a qualified or
-    /// imported name names; for an unimported name on a class whose annotations a
-    /// framework's discovery reads, what that framework reads it as; otherwise the
-    /// class of the file's namespace, as Doctrine reads it.
-    pub(crate) fn annotation_classes(&self, summary: &FileSummary, name: &NameRef) -> Vec<String> {
+    /// The classes an annotation name of `summary`, the file at `path`, may be: the
+    /// class a qualified or imported name names; for an unimported name on a class
+    /// whose annotations the discovery of a module of the file reads, what that
+    /// module reads it as; otherwise the class of the file's namespace, as Doctrine
+    /// reads it.
+    pub(crate) fn annotation_classes(
+        &self,
+        path: &Path,
+        summary: &FileSummary,
+        name: &NameRef,
+    ) -> Vec<String> {
         if name.qualified || name.imported {
             return vec![name.fqn.clone()];
         }
@@ -480,15 +486,11 @@ impl Index {
                 })
             })
             .map(|d| d.fqn.as_str());
+        // The modules of the file decide, so a file the index does not hold, or
+        // leaves out, reads its annotations as discovery does.
         let discovered: Vec<Vec<String>> = class
             .map(|class| {
-                self.frameworks
-                    .iter()
-                    .filter(|f| {
-                        self.classes_named(class)
-                            .iter()
-                            .any(|c| f.project().contains(c.path))
-                    })
+                self.frameworks_for(path)
                     .filter_map(|f| f.annotation_classes(self, class, name))
                     .collect()
             })
@@ -1814,7 +1816,7 @@ impl Index {
             name_at(&summary.names, offset).or_else(|| name_at(&summary.doc_names, offset))
         else {
             return name_at(&summary.annotation_names, offset)
-                .map(|name| self.class_targets(&self.annotation_classes(&summary, name)))
+                .map(|name| self.class_targets(&self.annotation_classes(path, &summary, name)))
                 .unwrap_or_default();
         };
         let (key, holder, entries): (String, &Index, &[Entry]) = match name.kind {

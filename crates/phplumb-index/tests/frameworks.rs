@@ -2003,3 +2003,73 @@ fn excluded_services_files_are_not_read() {
     assert!(classes(&index, "late.svc").is_empty());
     assert_eq!(route_keys(&index, &root, "late.page").len(), 1);
 }
+
+/// Go to definition on `@Block` in `source`, given as the content of `file` below
+/// `root`, as `path: text`.
+fn block_annotation(index: &mut Index, root: &Path, file: &str, source: &str) -> Vec<String> {
+    let path = root.join(file);
+    let offset = source.find(" * @").unwrap() + " * @".len();
+    index
+        .definition(&path, source.as_bytes(), offset as u32)
+        .into_iter()
+        .map(|l| {
+            let content = fs::read_to_string(&l.path).unwrap();
+            let name = l.path.strip_prefix(root).unwrap().display().to_string();
+            format!("{name}: {}", &content[l.start as usize..l.end as usize])
+        })
+        .collect()
+}
+
+const UNIMPORTED: &str = "modules/contrib/gadget/src/Plugin/Block/UnimportedBlock.php";
+
+#[test]
+fn annotations_navigate_in_unindexed_files() {
+    let (root, mut index) = drupal_fixture();
+    let source = fs::read_to_string(root.join(UNIMPORTED))
+        .unwrap()
+        .replace("UnimportedBlock", "LateBlock");
+
+    assert_eq!(
+        block_annotation(
+            &mut index,
+            &root,
+            "modules/contrib/gadget/src/Plugin/Block/LateBlock.php",
+            &source
+        ),
+        vec!["core/lib/Drupal/Core/Block/Annotation/Block.php: Block"]
+    );
+}
+
+#[test]
+fn annotations_navigate_in_excluded_files() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drupal"),
+        &root,
+    );
+    let opts = DiscoverOptions {
+        exclude: vec![UNIMPORTED.to_string()],
+        ..DiscoverOptions::default()
+    };
+    let mut index = Index::build(&root, &opts).unwrap().0;
+    let source = fs::read_to_string(root.join(UNIMPORTED)).unwrap();
+
+    assert_eq!(
+        block_annotation(&mut index, &root, UNIMPORTED, &source),
+        vec!["core/lib/Drupal/Core/Block/Annotation/Block.php: Block"]
+    );
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
