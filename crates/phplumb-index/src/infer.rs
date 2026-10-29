@@ -672,7 +672,7 @@ pub(crate) fn calls_named(
                 CallRef::Method(c) => ctx.expr(c.object, start, 0),
                 CallRef::NullSafe(c) => ctx.expr(c.object, start, 0),
                 CallRef::Static(c) => ctx
-                    .class_of(c.class, start)
+                    .class_of(c.class, start, 0)
                     .map_or(TypeExpr::Other, TypeExpr::Named),
             };
             let caller =
@@ -1621,7 +1621,9 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     }
 
     /// The class an expression before `::` or after `new` names.
-    fn class_of(&self, expression: &Expression<'_>, at: u32) -> Option<String> {
+    /// The class `expression` names before `::`: a class name, `self`, `static` or
+    /// `parent`, or a variable holding an object of one class.
+    fn class_of(&self, expression: &Expression<'_>, at: u32, depth: u32) -> Option<String> {
         match expression {
             Expression::Identifier(identifier) => self
                 .names
@@ -1630,6 +1632,14 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 .map(|n| n.fqn.clone()),
             Expression::Self_(_) | Expression::Static(_) => self.enclosing(at),
             Expression::Parent(_) => self.enclosing_parent(at),
+            Expression::Variable(Variable::Direct(variable)) => match self.var(
+                &variable_name(variable.name),
+                variable.span.start.offset,
+                depth + 1,
+            ) {
+                TypeExpr::Named(class) | TypeExpr::Tagged { class, .. } => Some(class),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1649,7 +1659,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             Expression::Clone(clone) => self.expr(clone.object, at, depth),
             Expression::Assignment(assignment) => self.expr(assignment.rhs, at, depth),
             Expression::Instantiation(instantiation) => self
-                .class_of(instantiation.class, at)
+                .class_of(instantiation.class, at, depth)
                 .map_or(TypeExpr::Other, TypeExpr::Named),
             Expression::Binary(binary) if binary.operator.is_null_coalesce() => union(vec![
                 self.expr(binary.lhs, at, depth),
@@ -1668,7 +1678,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 self.method_call(&receiver, &call.method, &call.argument_list, at, None)
             }
             Expression::Call(Call::StaticMethod(call)) => {
-                let Some(class) = self.class_of(call.class, at) else {
+                let Some(class) = self.class_of(call.class, at, depth) else {
                     return TypeExpr::Other;
                 };
                 // `self::`, `static::` and `parent::` forward late static binding to
@@ -1702,7 +1712,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 None,
             ),
             Expression::Access(Access::StaticProperty(access)) => {
-                match (self.class_of(access.class, at), &access.property) {
+                match (self.class_of(access.class, at, depth), &access.property) {
                     (Some(class), Variable::Direct(variable)) => self.member_type(
                         &TypeExpr::Named(class),
                         MemberKind::Property,
@@ -1716,7 +1726,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 offset_type(self.index, &self.expr(access.array, at, depth))
             }
             Expression::Access(Access::ClassConstant(access)) => {
-                match (self.class_of(access.class, at), &access.constant) {
+                match (self.class_of(access.class, at, depth), &access.constant) {
                     (Some(class), ClassLikeConstantSelector::Identifier(name)) => {
                         self.enum_case(&class, &String::from_utf8_lossy(name.value))
                     }
@@ -1729,10 +1739,21 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
 
     /// The enum that declares case `name` reached from `class`; any other constant
     /// has no type.
+    /// In a trait that does not declare the case, `self::` reaches the cases of the
+    /// classes using the trait.
     fn enum_case(&self, class: &str, name: &str) -> TypeExpr {
+        let found = self.index.find_member(class, MemberKind::Constant, name);
+        if found.is_empty() && self.index.is_trait(class) {
+            return union(
+                self.index
+                    .trait_users(class)
+                    .iter()
+                    .map(|user| self.enum_case(user, name))
+                    .collect(),
+            );
+        }
         union(
-            self.index
-                .find_member(class, MemberKind::Constant, name)
+            found
                 .into_iter()
                 .filter(|(_, member)| member.kind == MemberKind::EnumCase)
                 .map(|(found, _)| TypeExpr::Named(found.declaration.fqn.clone()))
@@ -1865,7 +1886,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             CallRef::Method(c) => (self.expr(c.object, start, 0), &c.method),
             CallRef::NullSafe(c) => (self.expr(c.object, start, 0), &c.method),
             CallRef::Static(c) => (
-                self.class_of(c.class, start)
+                self.class_of(c.class, start, 0)
                     .map_or(TypeExpr::Other, TypeExpr::Named),
                 &c.method,
             ),
@@ -1917,7 +1938,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 ClassLikeConstantSelector::Identifier(name)
                     if name.value.eq_ignore_ascii_case(b"class") =>
                 {
-                    self.class_of(access.class, at)
+                    self.class_of(access.class, at, 0)
                 }
                 _ => None,
             },

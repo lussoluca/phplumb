@@ -2,7 +2,7 @@
 
 namespace App;
 
-function uses(Severity $severity, Plain $plain): void
+function uses(Severity $severity, Plain $plain, string $name): void
 {
     Severity::from('low');
     Severity::tryFrom('low');
@@ -15,4 +15,6 @@ function uses(Severity $severity, Plain $plain): void
     Severity::tryFrom('low')?->label();
     Severity::LIMIT->label();
     Plain::One->value; // pure
+    $severity::from('low')->label();
+    $name::from('low')->label();
 }

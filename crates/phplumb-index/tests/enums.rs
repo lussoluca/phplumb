@@ -176,3 +176,32 @@ fn pure_enum_cases_have_no_value() {
     let mut index = build();
     assert!(definition(&mut index, "app/Uses.php", "value; // pure", 0).is_empty());
 }
+
+#[test]
+fn this_cases_resolve() {
+    let mut index = build();
+    let found = definition(&mut index, "app/Severity.php", "label();", 2);
+    assert_eq!(described(&index, &found), label());
+}
+
+#[test]
+fn variable_classes_resolve() {
+    let mut index = build();
+    let found = definition(&mut index, "app/Uses.php", "label();", 4);
+    assert_eq!(described(&index, &found), label());
+}
+
+#[test]
+fn string_class_names_give_nothing() {
+    let mut index = build();
+    assert!(definition(&mut index, "app/Uses.php", "label();", 5).is_empty());
+}
+
+#[test]
+fn trait_self_cases_reach_the_using_enums() {
+    let mut index = build();
+    let found = definition(&mut index, "app/Labels.php", "label();", 0);
+    assert_eq!(described(&index, &found), label());
+    let case = definition(&mut index, "app/Labels.php", "Low", 0);
+    assert_eq!(described(&index, &case), [pair("app/Severity.php", "Low")]);
+}

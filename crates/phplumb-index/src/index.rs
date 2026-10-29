@@ -842,8 +842,15 @@ impl Index {
             .any(|(c, m)| c.path == own.path && m.name_start == own.start)
     }
 
+    /// Whether `fqn` names a trait.
+    pub(crate) fn is_trait(&self, fqn: &str) -> bool {
+        self.classes_named(fqn)
+            .iter()
+            .any(|c| c.declaration.kind == SymbolKind::Trait)
+    }
+
     /// Classes and enums using the trait `fqn`, directly or through other traits.
-    fn trait_users(&self, fqn: &str) -> Vec<String> {
+    pub(crate) fn trait_users(&self, fqn: &str) -> Vec<String> {
         let mut users = Vec::new();
         let mut seen: HashSet<String> = HashSet::from([fqn.to_ascii_lowercase()]);
         let mut queue: Vec<String> = vec![fqn.to_string()];
@@ -1674,9 +1681,20 @@ impl Index {
             {
                 return self.anonymous_member_targets(path, range, member.kind, &member.name);
             }
-            return class_of(&member.class)
-                .map(|class| self.member_targets(&[class], member.kind, &member.name))
-                .unwrap_or_default();
+            let Some(class) = class_of(&member.class) else {
+                return Vec::new();
+            };
+            let found =
+                self.member_targets(std::slice::from_ref(&class), member.kind, &member.name);
+            // In a trait, `self::` and `static::` reach the members of the classes
+            // using it.
+            let in_trait = matches!(member.class, ClassSel::SelfKw | ClassSel::StaticKw)
+                && found.is_empty()
+                && self.is_trait(&class);
+            if in_trait {
+                return self.member_targets(&self.trait_users(&class), member.kind, &member.name);
+            }
+            return found;
         }
         if let Some(member) = summary.doc_members.iter().find(|r| covers(r.start, r.end)) {
             let Some(class) = class_of(&member.class) else {

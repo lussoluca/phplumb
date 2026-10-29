@@ -4,6 +4,8 @@ namespace App;
 
 enum Severity: string
 {
+    use Labels;
+
     case Low = 'low';
     case High = 'high';
 
@@ -22,5 +24,10 @@ enum Severity: string
     public function lowestLate(): string
     {
         return static::Low->label();
+    }
+
+    public function lowestThis(): string
+    {
+        return $this::Low->label();
     }
 }
