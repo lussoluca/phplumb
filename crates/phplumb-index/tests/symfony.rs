@@ -1086,6 +1086,8 @@ fn broken_names_in_twig_are_flagged() {
                 "Undefined template 'nowhere.html.twig'",
                 "nowhere.html.twig"
             ),
+            pair("Undefined route 'nope_route'", "nope_route"),
+            pair("Undefined route 'nope_named'", "nope_named"),
         ]
     );
     // A list names templates to try in turn.
