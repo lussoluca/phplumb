@@ -56,6 +56,12 @@ pub(crate) fn substitute(ty: &TypeExpr, templates: &[String], args: &[TypeExpr])
             None => ty.clone(),
         },
         TypeExpr::ArrayOf(element) => array_of(substitute(element, templates, args)),
+        TypeExpr::Shape(entries) => TypeExpr::Shape(
+            entries
+                .iter()
+                .map(|(key, ty)| (key.clone(), substitute(ty, templates, args)))
+                .collect(),
+        ),
         TypeExpr::Callable(params) => TypeExpr::Callable(
             params
                 .iter()
@@ -118,6 +124,7 @@ fn templates_of(index: &Index, class: &str) -> Vec<String> {
 pub(crate) fn element_type(index: &Index, ty: &TypeExpr) -> TypeExpr {
     match ty {
         TypeExpr::ArrayOf(element) => (**element).clone(),
+        TypeExpr::Shape(entries) => union(entries.iter().map(|(_, ty)| ty.clone()).collect()),
         TypeExpr::Union(members) => union(
             members
                 .iter()
@@ -132,6 +139,24 @@ pub(crate) fn element_type(index: &Index, ty: &TypeExpr) -> TypeExpr {
             args[0].clone()
         }
         _ => value_of(index, ty, "Traversable"),
+    }
+}
+
+/// The type of `$value[$key]` for a value of type `ty` and a literal `key`, when
+/// known: a shape's entry under that key, an array's element, or the value argument
+/// a class passes to `ArrayAccess`. Without a literal key a shape gives nothing.
+pub(crate) fn entry_type(index: &Index, ty: &TypeExpr, key: Option<&str>) -> TypeExpr {
+    match ty {
+        TypeExpr::Shape(entries) => key
+            .and_then(|key| entries.iter().find(|(name, _)| name == key))
+            .map_or(TypeExpr::Other, |(_, ty)| ty.clone()),
+        TypeExpr::Union(members) => union(
+            members
+                .iter()
+                .map(|member| entry_type(index, member, key))
+                .collect(),
+        ),
+        _ => offset_type(index, ty),
     }
 }
 
@@ -188,6 +213,7 @@ fn reaches(index: &Index, class: &str, root: &str) -> bool {
 pub(crate) fn array_element(ty: &TypeExpr) -> TypeExpr {
     match ty {
         TypeExpr::ArrayOf(element) => (**element).clone(),
+        TypeExpr::Shape(entries) => union(entries.iter().map(|(_, ty)| ty.clone()).collect()),
         TypeExpr::Union(members) => union(members.iter().map(array_element).collect()),
         _ => TypeExpr::Other,
     }

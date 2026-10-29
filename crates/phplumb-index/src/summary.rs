@@ -813,6 +813,7 @@ fn names_a_class(ty: &TypeExpr) -> bool {
         | TypeExpr::StaticType
         | TypeExpr::ParentType => true,
         TypeExpr::ArrayOf(element) | TypeExpr::ClassString(element) => names_a_class(element),
+        TypeExpr::Shape(entries) => entries.iter().any(|(_, ty)| names_a_class(ty)),
         TypeExpr::Union(members) => members.iter().any(names_a_class),
         TypeExpr::Scalar(_) | TypeExpr::Callable(_) | TypeExpr::Other => false,
     }

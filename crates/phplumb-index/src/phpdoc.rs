@@ -21,6 +21,8 @@ pub enum TypeExpr {
         class: String,
         args: Vec<TypeExpr>,
     },
+    /// `array{key: A, B}`: each entry's key, the position for unkeyed ones, and type.
+    Shape(Vec<(String, TypeExpr)>),
     /// `callable(A, B): R` or `Closure(A, B): R`: the parameter types.
     Callable(Vec<TypeExpr>),
     /// A scalar or pseudo-type written as a generic argument, such as the `int` of
@@ -284,6 +286,10 @@ impl TypeParser<'_> {
                 Some(self.generic_args())
             }
             Some(b'{') => {
+                if ARRAY_LIKE.contains(&word.to_ascii_lowercase().as_str()) {
+                    self.pos += 1;
+                    return Parsed::Type(TypeExpr::Shape(self.shape_entries()));
+                }
                 self.skip_balanced(b'{', b'}');
                 return Parsed::Type(TypeExpr::Other);
             }
@@ -371,6 +377,78 @@ impl TypeParser<'_> {
                 return params;
             }
         }
+    }
+
+    /// The entries of `array{key: A, B, ...}` after its `{`, up to and including its
+    /// `}`: keyed entries under their key, the others under their position.
+    fn shape_entries(&mut self) -> Vec<(String, TypeExpr)> {
+        let mut entries = Vec::new();
+        let mut position = 0;
+        loop {
+            self.skip_spaces();
+            if self.peek().is_none() || self.eat(b'}') {
+                return entries;
+            }
+            // An unsealed shape, `...` or `...<K, V>`, says nothing more.
+            if self.text[self.pos..].starts_with(b"...") {
+                self.pos += 3;
+                while self.peek().is_some_and(|b| b != b'}') {
+                    if self.peek() == Some(b'<') {
+                        self.skip_balanced(b'<', b'>');
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+                self.eat(b'}');
+                return entries;
+            }
+            let key = self.shape_key().unwrap_or_else(|| {
+                position += 1;
+                (position - 1).to_string()
+            });
+            entries.push((key, finish(self.union())));
+            if !self.eat(b',') {
+                self.eat(b'}');
+                return entries;
+            }
+        }
+    }
+
+    /// A shape key followed by `:` or `?:`, consumed; nothing consumed when the
+    /// entry has no key.
+    fn shape_key(&mut self) -> Option<String> {
+        let start = self.pos;
+        let key = match self.peek() {
+            Some(quote @ (b'\'' | b'"')) => {
+                let end = self.text[start + 1..]
+                    .iter()
+                    .position(|b| *b == quote)
+                    .map(|i| start + 1 + i)?;
+                self.pos = end + 1;
+                String::from_utf8_lossy(&self.text[start + 1..end]).into_owned()
+            }
+            Some(b) if b.is_ascii_alphanumeric() || b == b'_' => {
+                while self
+                    .peek()
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                {
+                    self.pos += 1;
+                }
+                String::from_utf8_lossy(&self.text[start..self.pos]).into_owned()
+            }
+            _ => return None,
+        };
+        self.skip_spaces();
+        if self.peek() == Some(b'?') {
+            self.pos += 1;
+            self.skip_spaces();
+        }
+        if self.peek() == Some(b':') && self.text.get(self.pos + 1) != Some(&b':') {
+            self.pos += 1;
+            return Some(key);
+        }
+        self.pos = start;
+        None
     }
 
     /// Consumes `word` when it comes next as a whole word.
@@ -929,15 +1007,7 @@ mod tests {
 
     #[test]
     fn scalars_and_shapes_are_other() {
-        for text in [
-            "int",
-            "array",
-            "array{a: int}",
-            "mixed",
-            "string|int",
-            "class-string",
-            "",
-        ] {
+        for text in ["int", "array", "mixed", "string|int", "class-string", ""] {
             assert_eq!(ty(text), TypeExpr::Other, "{text}");
         }
     }
@@ -972,6 +1042,24 @@ mod tests {
         assert_eq!(
             doc.params,
             [("p".to_string(), TypeExpr::Callable(vec![named("App\\T")]))]
+        );
+    }
+
+    #[test]
+    fn shapes_keep_their_entries() {
+        assert_eq!(
+            ty("array{startedAt: \\DateTimeImmutable, id?: int}"),
+            TypeExpr::Shape(vec![
+                ("startedAt".to_string(), named("DateTimeImmutable")),
+                ("id".to_string(), TypeExpr::Other),
+            ])
+        );
+        assert_eq!(
+            ty("list{Foo, 'x'}"),
+            TypeExpr::Shape(vec![
+                ("0".to_string(), named("App\\Foo")),
+                ("1".to_string(), TypeExpr::Other),
+            ])
         );
     }
 
