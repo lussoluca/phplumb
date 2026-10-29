@@ -118,6 +118,26 @@ fn bench_reports_member_coverage() {
 }
 
 #[test]
+fn bench_reports_coverage_time() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../phplumb-index/tests/fixtures/inference")
+        .canonicalize()
+        .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_phplumb"))
+        .arg("bench")
+        .arg("--root")
+        .arg(&root)
+        .arg("--coverage")
+        .arg("app")
+        .output()
+        .unwrap();
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["coverage"]["elapsed_ms"].is_u64(), "{report}");
+}
+
+#[test]
 fn bench_runs_implementation_cases() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../phplumb-index/tests/fixtures/implementations")

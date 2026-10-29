@@ -149,12 +149,16 @@ pub trait Framework: Send + Sync {
     /// Extensions besides `php` of the PHP files the framework uses.
     fn php_extensions(&self) -> &'static [&'static str];
     /// Reads what the framework needs from the index and its own files, after the
-    /// index is built. While `rebuild` and `update` run, `index.frameworks()` is
-    /// empty, so a framework cannot query the others.
+    /// index is built. While `rebuild` and `update` run, the index has no active
+    /// framework, so a framework cannot query the others.
     fn rebuild(&mut self, index: &Index);
     /// Applies changed and removed paths (files or directories, any extension),
     /// after the index applied them.
     fn update(&mut self, index: &Index, changed: &[PathBuf], removed: &[PathBuf]);
+    /// Lowercased names of the methods whose calls `call_type` may type.
+    fn typed_methods(&self) -> &'static [&'static str];
+    /// Lowercased names of the methods whose calls `call_targets` may answer.
+    fn targeted_methods(&self) -> &'static [&'static str];
     /// The type `call` returns when the framework knows better than its declaration.
     fn call_type(&self, index: &Index, call: &FrameworkCall<'_>) -> Option<TypeExpr>;
     /// Targets of the string literal at position `argument` of `call`, or of one of

@@ -121,12 +121,14 @@ struct Diagnostics {
     entries: Vec<String>,
 }
 
-/// How many member accesses under a directory reach at least one definition.
+/// How many member accesses under a directory reach at least one definition, and
+/// how long asking for all of them took.
 #[derive(Serialize)]
 struct Coverage {
     member_accesses: usize,
     resolved: usize,
     percent: f64,
+    elapsed_ms: u128,
 }
 
 #[derive(Serialize)]
@@ -301,6 +303,7 @@ fn coverage(
     dir: &Path,
     opts: &DiscoverOptions,
 ) -> anyhow::Result<Coverage> {
+    let started = std::time::Instant::now();
     let dir = dir.canonicalize()?;
     let mut member_accesses = 0;
     let mut resolved = 0;
@@ -325,6 +328,7 @@ fn coverage(
         member_accesses,
         resolved,
         percent,
+        elapsed_ms: started.elapsed().as_millis(),
     })
 }
 

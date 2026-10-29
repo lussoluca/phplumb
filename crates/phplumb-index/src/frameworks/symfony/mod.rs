@@ -492,6 +492,14 @@ impl Framework for Symfony {
         }
     }
 
+    fn typed_methods(&self) -> &'static [&'static str] {
+        &["getrepository"]
+    }
+
+    fn targeted_methods(&self) -> &'static [&'static str] {
+        &["dispatch"]
+    }
+
     /// `getRepository(X::class)` returns the repository the mappings declare for `X`,
     /// when the index knows that class.
     fn call_type(&self, index: &Index, call: &FrameworkCall<'_>) -> Option<TypeExpr> {

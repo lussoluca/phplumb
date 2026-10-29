@@ -498,11 +498,6 @@ impl Index {
             .find_map(|f| f.as_any().downcast_ref::<F>())
     }
 
-    /// The framework modules active for this project.
-    pub(crate) fn frameworks(&self) -> &[Box<dyn Framework>] {
-        &self.frameworks
-    }
-
     /// The active framework modules whose project holds `path`: the only ones asked
     /// about the file.
     pub(crate) fn frameworks_for<'a>(
@@ -1454,9 +1449,7 @@ impl Index {
         source: &[u8],
         offset: u32,
     ) -> Option<Vec<(Location, String)>> {
-        if self.frameworks.is_empty() {
-            return None;
-        }
+        self.frameworks_for(path).next()?;
         let argument = infer::string_argument_at(self, path, summary, source, offset)?;
         let call = FrameworkCall {
             targets: &argument.targets,
@@ -1496,7 +1489,15 @@ impl Index {
         source: &[u8],
         offset: u32,
     ) -> Option<Vec<(Location, String)>> {
-        self.frameworks_for(path).next()?;
+        let (start, end) = hover::word_at(source, offset)?;
+        let name =
+            String::from_utf8_lossy(&source[start as usize..end as usize]).to_ascii_lowercase();
+        if !self
+            .frameworks_for(path)
+            .any(|f| f.targeted_methods().contains(&name.as_str()))
+        {
+            return None;
+        }
         let found = infer::call_at(self, path, summary, source, offset)?;
         let call = FrameworkCall {
             targets: &found.parts.targets,
@@ -1518,9 +1519,7 @@ impl Index {
         source: &[u8],
         offset: u32,
     ) -> Option<Vec<(Location, String)>> {
-        if self.frameworks.is_empty() {
-            return None;
-        }
+        self.frameworks_for(path).next()?;
         let keyed = infer::keyed_string_at(self, path, summary, source, offset)?;
         let call = keyed.call.as_ref().map(|argument| {
             let call = FrameworkCall {

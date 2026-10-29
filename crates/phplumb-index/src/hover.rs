@@ -127,7 +127,7 @@ fn display(ty: &TypeExpr) -> String {
 }
 
 /// The identifier, variable or qualified name around `offset`.
-fn word_at(source: &[u8], offset: u32) -> Option<(u32, u32)> {
+pub(crate) fn word_at(source: &[u8], offset: u32) -> Option<(u32, u32)> {
     let is_word =
         |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'\\' || b >= 0x80;
     let offset = offset as usize;

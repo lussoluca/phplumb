@@ -207,6 +207,14 @@ impl Framework for Drupal {
         self.literals.update(&changed, &removed, index, &filter);
     }
 
+    fn typed_methods(&self) -> &'static [&'static str] {
+        &TYPED_METHODS
+    }
+
+    fn targeted_methods(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// `\Drupal::service(id)` and a container's `get(id)` give the service's classes;
     /// `getStorage(id)` gives the entity type's storage, tagged with the entity type,
     /// and that storage's loading methods give the entity class.
@@ -410,6 +418,18 @@ const ENTITY_TAG: &str = "drupal.entity:";
 
 /// Storage methods that return one entity, and those that return several.
 const LOAD_ONE: [&str; 4] = ["load", "loadUnchanged", "loadRevision", "create"];
+/// Every method `call_type` reads, lowercased: service, storage and loading calls.
+const TYPED_METHODS: [&str; 9] = [
+    "service",
+    "get",
+    "getstorage",
+    "load",
+    "loadunchanged",
+    "loadrevision",
+    "create",
+    "loadmultiple",
+    "loadbyproperties",
+];
 const LOAD_MANY: [&str; 2] = ["loadMultiple", "loadByProperties"];
 
 /// One type, or their union; nothing when there is none.
