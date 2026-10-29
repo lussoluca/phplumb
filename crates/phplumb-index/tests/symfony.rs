@@ -169,6 +169,53 @@ fn route_names_in_php_lead_to_their_routes() {
     );
 }
 
+/// The definitions of the literal `needle` that follows `context` in `file`.
+fn definition_after(
+    index: &mut Index,
+    file: &str,
+    context: &str,
+    needle: &str,
+) -> Vec<(String, String)> {
+    let path = fixture().join(file);
+    let source = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&source);
+    let start = text
+        .find(context)
+        .unwrap_or_else(|| panic!("no {context} in {file}"));
+    let offset = start + text[start..].find(needle).unwrap() + 1;
+    index
+        .definition(&path, &source, offset as u32)
+        .into_iter()
+        .map(|location| {
+            let source = std::fs::read(&location.path).unwrap();
+            let range = &source[location.start as usize..location.end as usize];
+            (
+                location
+                    .path
+                    .strip_prefix(fixture())
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                String::from_utf8_lossy(range).into_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn named_route_arguments_lead_to_their_routes() {
+    let mut index = build();
+    assert_eq!(
+        definition_after(&mut index, LINKS, "route: 'home'", "'home'"),
+        [pair("src/Controller/HomeController.php", "index")]
+    );
+    assert_eq!(
+        definition_after(&mut index, LINKS, "name: 'about'", "'about'"),
+        [pair("src/Controller/AboutController.php", "__invoke")]
+    );
+    assert!(definition_after(&mut index, LINKS, "status: 'about'", "'about'").is_empty());
+}
+
 #[test]
 fn unknown_and_dynamic_route_names_give_nothing() {
     let mut index = build();

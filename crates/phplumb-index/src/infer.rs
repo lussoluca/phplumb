@@ -2316,8 +2316,9 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             .map(|(value, argument)| StringArgument { value, ..argument })
     }
 
-    /// The first positional argument of `call` for which `find` gives something,
-    /// with what the call targets; the argument's `value` is left empty.
+    /// The first argument of `call` for which `find` gives something, with what the
+    /// call targets; the argument's `value` is left empty. A named argument takes
+    /// the position of the parameter of that name in the first target declaring it.
     fn argument_with<T>(
         &self,
         call: &CallRef<'_, '_>,
@@ -2328,19 +2329,41 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             CallRef::NullSafe(c) => &c.argument_list,
             CallRef::Static(c) => &c.argument_list,
         };
-        let (position, found) =
+        let (position, name, found) =
             arguments
                 .arguments
                 .iter()
                 .enumerate()
-                .find_map(|(i, argument)| {
-                    let Argument::Positional(argument) = argument else {
-                        return None;
-                    };
-                    find(argument.value).map(|found| (i, found))
+                .find_map(|(i, argument)| match argument {
+                    Argument::Positional(argument) => {
+                        find(argument.value).map(|found| (i, None, found))
+                    }
+                    Argument::Named(argument) => {
+                        find(argument.value).map(|found| (i, Some(argument.name.value), found))
+                    }
                 })?;
         let mut argument = self.call_parts(call)?;
-        argument.position = position;
+        argument.position = match name {
+            None => position,
+            Some(name) => {
+                let name = String::from_utf8_lossy(name);
+                argument.targets.iter().find_map(|target| {
+                    let CallTarget::Method {
+                        class,
+                        name: method,
+                    } = target
+                    else {
+                        return None;
+                    };
+                    let (_, member) = self
+                        .index
+                        .find_member(class, MemberKind::Method, method)
+                        .into_iter()
+                        .next()?;
+                    member.params.iter().position(|(param, _)| *param == name)
+                })?
+            }
+        };
         Some((found, argument))
     }
 
