@@ -1345,10 +1345,12 @@ fn add_file(index: &mut Index, root: &Path, file: &str, content: &str) -> PathBu
     path
 }
 
-/// The files the definitions of the literal `needle` in `path` lead to, by name.
+/// The files the definitions of the literal in `needle`, at its first quote, in
+/// `path` lead to, by name.
 fn opened(index: &mut Index, path: &Path, needle: &str) -> Vec<String> {
     let source = std::fs::read(path).unwrap();
-    let offset = String::from_utf8_lossy(&source).find(needle).unwrap() as u32 + 1;
+    let quote = needle.find(['\'', '"']).unwrap_or(0);
+    let offset = (String::from_utf8_lossy(&source).find(needle).unwrap() + quote) as u32 + 1;
     index
         .definition(path, &source, offset)
         .iter()
@@ -1448,5 +1450,44 @@ fn class_template_attributes_open_their_template() {
     assert_eq!(
         messages(&index, &path),
         ["Undefined template 'gone_class.html.twig'"]
+    );
+}
+
+#[test]
+fn render_block_and_stream_open_their_template() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Controller/Blocks.php",
+        "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Blocks extends AbstractController\n{\n    public function show(): void\n    {\n        $this->renderBlock('page.html.twig', 'a');\n        $this->renderBlockView('page.html.twig', 'b');\n        $this->stream('page.html.twig');\n    }\n}\n",
+    );
+
+    for needle in ["renderBlock('page", "renderBlockView('page", "stream('page"] {
+        assert_eq!(
+            opened(&mut index, &path, needle),
+            ["templates/page.html.twig"],
+            "{needle}"
+        );
+    }
+}
+
+#[test]
+fn environment_display_and_load_open_their_template() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Display.php",
+        "<?php\nnamespace App;\nuse Twig\\Environment;\nfunction display(Environment $twig): void\n{\n    $twig->display('page.html.twig');\n    $twig->load('base.html.twig');\n}\n",
+    );
+
+    assert_eq!(
+        opened(&mut index, &path, "display('page"),
+        ["templates/page.html.twig"]
+    );
+    assert_eq!(
+        opened(&mut index, &path, "load('base"),
+        ["extra/base.html.twig"]
     );
 }
