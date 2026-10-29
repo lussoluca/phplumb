@@ -254,11 +254,111 @@ fn twig_without_a_literal_route_gives_nothing() {
 #[test]
 fn twig_files_get_no_php_answers() {
     let mut index = build();
-    let path = fixture().join(TWIG);
+    let path = fixture().join("templates/php.html.twig");
     let source = std::fs::read(&path).unwrap();
-    let offset = String::from_utf8_lossy(&source).find("path").unwrap() as u32;
-    assert!(index.hover(&path, &source, offset).is_none());
+    let text = String::from_utf8_lossy(&source).into_owned();
+    let at = |needle: &str| text.find(needle).unwrap() as u32 + 1;
+
+    assert!(index.hover(&path, &source, at("$crud->")).is_none());
+    assert!(
+        index
+            .definition(&path, &source, at("CrudController"))
+            .is_empty()
+    );
+    assert!(
+        index
+            .references(&path, &source, at("CrudController"), true)
+            .is_empty()
+    );
+    assert!(
+        index
+            .implementations(&path, &source, at("generate"))
+            .is_empty()
+    );
     assert!(index.diagnostics(&path, &source).is_empty());
+    assert_eq!(
+        definition(&mut index, "templates/php.html.twig", "'home'"),
+        [pair("src/Controller/HomeController.php", "index")]
+    );
+}
+
+/// A copy of the fixture, built.
+fn copied() -> (tempfile::TempDir, PathBuf, Index) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(&fixture(), &root);
+    let index = Index::build(&root, &DiscoverOptions::default()).unwrap().0;
+    (dir, root, index)
+}
+
+/// The targets of the route `name`, each as its file name and the text at its range.
+fn route_files(index: &Index, name: &str) -> Vec<(String, String)> {
+    index
+        .framework::<Symfony>()
+        .unwrap()
+        .route_targets(name)
+        .iter()
+        .map(|target| {
+            let file = target.location.path.file_name().unwrap();
+            (file.to_string_lossy().into_owned(), target.text.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn route_edits_update_route_targets() {
+    let (_dir, root, mut index) = copied();
+    let controller = root.join("src/Controller/HomeController.php");
+    let text = std::fs::read_to_string(&controller).unwrap();
+    std::fs::write(&controller, text.replace("'home'", "'start'")).unwrap();
+
+    index.update(&[controller], &[]);
+
+    assert!(route_files(&index, "home").is_empty());
+    assert_eq!(
+        route_files(&index, "start"),
+        [pair("HomeController.php", "index")]
+    );
+}
+
+#[test]
+fn removed_controllers_lose_their_routes() {
+    let (_dir, root, mut index) = copied();
+    let controller = root.join("src/Controller/AdminController.php");
+    std::fs::remove_file(&controller).unwrap();
+
+    index.update(&[], &[controller]);
+
+    assert!(route_files(&index, "admin_users").is_empty());
+}
+
+#[test]
+fn route_file_edits_update_route_targets() {
+    let (_dir, root, mut index) = copied();
+    let routes = root.join("config/routes.yaml");
+    let text = std::fs::read_to_string(&routes).unwrap();
+    std::fs::write(&routes, text.replace("legacy_page:", "old_page:")).unwrap();
+
+    index.update(&[routes], &[]);
+
+    assert!(route_files(&index, "legacy_page").is_empty());
+    assert_eq!(
+        route_files(&index, "old_page")[0],
+        pair("routes.yaml", "old_page")
+    );
+}
+
+#[test]
+fn added_xml_route_files_make_routes_uncertain() {
+    let (_dir, root, mut index) = copied();
+    let missing = |index: &Index| index.framework::<Symfony>().unwrap().route_missing("nope");
+    assert!(missing(&index));
+    let xml = root.join("config/routes/legacy.xml");
+    std::fs::write(&xml, "<routes/>\n").unwrap();
+
+    index.update(&[xml], &[]);
+
+    assert!(!missing(&index));
 }
 
 #[test]
