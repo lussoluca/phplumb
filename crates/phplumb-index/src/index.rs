@@ -544,6 +544,19 @@ impl Index {
             .map(|f| f.project())
     }
 
+    /// Each active framework module with its project directory relative to the
+    /// root, empty when the project is the root.
+    pub fn framework_projects(&self) -> Vec<(&'static str, PathBuf)> {
+        self.frameworks
+            .iter()
+            .map(|f| {
+                let dir = &f.project().dir;
+                let relative = dir.strip_prefix(self.filter.root()).unwrap_or(dir);
+                (f.name(), relative.to_path_buf())
+            })
+            .collect()
+    }
+
     /// The names of the framework modules active for this project.
     pub fn active_frameworks(&self) -> Vec<&'static str> {
         self.frameworks.iter().map(|f| f.name()).collect()
