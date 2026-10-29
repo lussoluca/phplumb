@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use phplumb_index::Index;
 use phplumb_index::discover::DiscoverOptions;
 use phplumb_index::frameworks::drupal::Drupal;
-use phplumb_index::frameworks::symfony::Symfony;
+use phplumb_index::frameworks::symfony::{Symfony, TemplateStatus};
 use phplumb_index::frameworks::{Activation, FrameworkSettings, Project};
 use tempfile::TempDir;
 
@@ -1492,5 +1492,73 @@ fn bundles_built_on_kernel_abstract_bundles_keep_their_own_path() {
     assert_eq!(
         route_files_of(&auto(&root), "_preview_error"),
         ["_preview_error"]
+    );
+}
+
+/// TwigBridge's form themes, so the main namespace can be known in full.
+const TWIG_BRIDGE: (&str, &str) = (
+    "vendor/symfony/twig-bridge/Resources/views/Form/form_div_layout.html.twig",
+    "form\n",
+);
+
+fn template_status(root: &Path, name: &str) -> TemplateStatus {
+    auto(root)
+        .framework::<Symfony>()
+        .unwrap()
+        .template_status(name)
+}
+
+#[test]
+fn environment_twig_files_add_namespaced_paths() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/packages/dev/twig.yaml",
+            "twig:\n    paths:\n        '%kernel.project_dir%/dev/templates': Dev\n",
+        ),
+        ("dev/templates/tools.html.twig", "tools\n"),
+        ("templates/base.html.twig", "base\n"),
+        TWIG_BRIDGE,
+    ]);
+
+    assert!(matches!(
+        template_status(&root, "@Dev/tools.html.twig"),
+        TemplateStatus::Found(_)
+    ));
+    assert_eq!(
+        template_status(&root, "gone.html.twig"),
+        TemplateStatus::Missing
+    );
+}
+
+#[test]
+fn environment_twig_files_with_main_paths_keep_main_names_unknown() {
+    for twig in [
+        "twig:\n    paths:\n        '%kernel.project_dir%/dev/main': ~\n",
+        "twig:\n    default_path: '%kernel.project_dir%/dev/main'\n",
+    ] {
+        let (_dir, root) = broken_symfony(&[
+            ("config/packages/dev/twig.yaml", twig),
+            ("templates/base.html.twig", "base\n"),
+            TWIG_BRIDGE,
+        ]);
+        assert_eq!(
+            template_status(&root, "gone.html.twig"),
+            TemplateStatus::Unknown,
+            "{twig}"
+        );
+    }
+}
+
+#[test]
+fn environment_twig_php_keeps_names_unknown() {
+    let (_dir, root) = broken_symfony(&[
+        ("config/packages/dev/twig.php", "<?php\nreturn [];\n"),
+        ("templates/base.html.twig", "base\n"),
+        TWIG_BRIDGE,
+    ]);
+
+    assert_eq!(
+        template_status(&root, "gone.html.twig"),
+        TemplateStatus::Unknown
     );
 }

@@ -68,8 +68,21 @@ impl Templates {
                     .filter(|(key, _)| key.text().is_some_and(|k| k.starts_with("when@")))
                     .filter_map(|(_, value)| value.get("twig"));
                 for twig in environments {
-                    templates.read_paths(dir, twig.get("paths"), false);
-                    templates.main_unknown |= twig.get("default_path").is_some();
+                    templates.read_environment(dir, twig);
+                }
+            }
+        }
+        // Environment directories, loaded after `config/packages`.
+        for file in environment_twig_files(&dir.join("config/packages")) {
+            let Some(parsed) = config_files.get(&file) else {
+                continue;
+            };
+            let Some(root) = &parsed.yaml else {
+                continue;
+            };
+            for block in super::config::top_blocks(root) {
+                if let Some(twig) = block.get("twig") {
+                    templates.read_environment(dir, twig);
                 }
             }
         }
@@ -83,6 +96,13 @@ impl Templates {
         let form_themes = form_themes.is_dir().then_some(form_themes);
         templates.paths.push((None, form_themes));
         templates
+    }
+
+    /// The Twig configuration of one environment: its namespaced paths, while its
+    /// main-namespace paths and `default_path` leave main-namespace names unknown.
+    fn read_environment(&mut self, dir: &Path, twig: &Yaml) {
+        self.read_paths(dir, twig.get("paths"), false);
+        self.main_unknown |= twig.get("default_path").is_some();
     }
 
     /// `paths` as a map from directory to namespace (empty or null for the main
@@ -170,9 +190,25 @@ impl Templates {
     }
 }
 
-/// Whether `packages`, the `config/packages` directory, holds Twig configuration
-/// other than `twig.yaml` and `twig.yml`: `twig.php`, a `twig:` section in another
-/// file, or an environment directory with Twig configuration.
+/// The `twig.yaml` and `twig.yml` files of the environment directories of
+/// `packages`, in path order.
+fn environment_twig_files(packages: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(packages)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .flat_map(|dir| [dir.join("twig.yaml"), dir.join("twig.yml")])
+        .filter(|file| file.is_file())
+        .collect();
+    files.sort();
+    files
+}
+
+/// Whether `packages`, the `config/packages` directory or one of its environment
+/// directories, holds Twig configuration other than `twig.yaml` and `twig.yml`:
+/// `twig.php`, or a `twig:` section in another file.
 fn has_unread_twig_configuration(packages: &Path, config_files: &ConfigFiles) -> bool {
     let Ok(entries) = std::fs::read_dir(packages) else {
         return false;
@@ -183,16 +219,7 @@ fn has_unread_twig_configuration(packages: &Path, config_files: &ConfigFiles) ->
             .and_then(|n| n.to_str())
             .unwrap_or_default();
         if path.is_dir() {
-            return std::fs::read_dir(&path)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .any(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|n| n.starts_with("twig."))
-                });
+            return has_unread_twig_configuration(&path, config_files);
         }
         if name == "twig.yaml" || name == "twig.yml" {
             return false;
