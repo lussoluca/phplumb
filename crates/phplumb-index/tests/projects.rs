@@ -436,7 +436,7 @@ fn unknown_route_imports_silence_route_diagnostics() {
 }
 
 #[test]
-fn unreadable_route_names_silence_route_diagnostics() {
+fn literal_constant_route_names_keep_routes_certain() {
     let (_dir, root) = broken_symfony(&[
         (
             "lib/Route.php",
@@ -445,6 +445,27 @@ fn unreadable_route_names_silence_route_diagnostics() {
         (
             "src/Controller/Named.php",
             "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass Named\n{\n    const ROUTE = 'named';\n    #[Route('/named', name: self::ROUTE)]\n    public function show(): void {}\n}\n",
+        ),
+    ]);
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+}
+
+#[test]
+fn constants_without_literal_values_keep_routes_uncertain() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "lib/Route.php",
+            "<?php\nnamespace Symfony\\Component\\Routing\\Attribute;\n#[\\Attribute]\nclass Route\n{\n    public function __construct(string $path = '', ?string $name = null) {}\n}\n",
+        ),
+        (
+            "src/Controller/Named.php",
+            "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass Named\n{\n    const ROUTE = 'named';\n    const OTHER = self::ROUTE;\n    #[Route('/named', name: self::OTHER)]\n    public function show(): void {}\n}\n",
         ),
     ]);
     assert_eq!(

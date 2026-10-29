@@ -186,6 +186,9 @@ pub struct Member {
     /// arguments.
     #[serde(default)]
     pub templates: Vec<String>,
+    /// Constants: the value, when it is a string literal.
+    #[serde(default)]
+    pub value: Option<String>,
 }
 
 /// A use of a name, resolved against the file's namespace and imports.
@@ -879,6 +882,8 @@ enum PendingValue {
     Ready(MetaValue),
     /// `X::class`: the offset of `X`.
     Class(u32),
+    /// `X::NAME`: the offset of `X`, and the constant's name.
+    Constant(u32, String),
     List(Vec<(Option<String>, PendingValue)>),
     Nested(PendingMeta),
 }
@@ -907,6 +912,12 @@ impl PendingValue {
             PendingValue::Ready(value) => value,
             PendingValue::Class(offset) => {
                 fqn_at(offset).map_or(MetaValue::Other, MetaValue::Class)
+            }
+            PendingValue::Constant(offset, name) => {
+                fqn_at(offset).map_or(MetaValue::Other, |class| MetaValue::Constant {
+                    class,
+                    name,
+                })
             }
             PendingValue::List(entries) => MetaValue::List(
                 entries
@@ -1069,6 +1080,7 @@ impl Collector<'_> {
                     MetaValue::String(String::from_utf8_lossy(v).into_owned())
                 }))
             }
+            Expression::Literal(Literal::Null(_)) => PendingValue::Ready(MetaValue::Null),
             Expression::Literal(Literal::True(_)) => PendingValue::Ready(MetaValue::Bool(true)),
             Expression::Literal(Literal::False(_)) => PendingValue::Ready(MetaValue::Bool(false)),
             Expression::Literal(Literal::Integer(_) | Literal::Float(_)) => {
@@ -1080,9 +1092,24 @@ impl Collector<'_> {
             Expression::Access(Access::ClassConstant(access)) => {
                 let is_class = matches!(&access.constant,
                     ClassLikeConstantSelector::Identifier(name) if name.value.eq_ignore_ascii_case(b"class"));
-                match (is_class, access.class) {
-                    (true, Expression::Identifier(class)) => {
+                let constant = match &access.constant {
+                    ClassLikeConstantSelector::Identifier(name) => {
+                        Some(String::from_utf8_lossy(name.value).into_owned())
+                    }
+                    _ => None,
+                };
+                match (is_class, access.class, constant) {
+                    (true, Expression::Identifier(class), _) => {
                         PendingValue::Class(class.span().start.offset)
+                    }
+                    (false, Expression::Identifier(class), Some(name)) => {
+                        PendingValue::Constant(class.span().start.offset, name)
+                    }
+                    (false, Expression::Self_(_) | Expression::Static(_), Some(name)) => {
+                        PendingValue::Ready(MetaValue::Constant {
+                            class: "self".to_string(),
+                            name,
+                        })
                     }
                     _ => PendingValue::Ready(MetaValue::Other),
                 }
@@ -1372,6 +1399,12 @@ impl Collector<'_> {
                             is_abstract: false,
                             is_private: false,
                             templates: Vec::new(),
+                            value: match item.value {
+                                Expression::Literal(Literal::String(literal)) => literal
+                                    .value
+                                    .map(|v| String::from_utf8_lossy(v).into_owned()),
+                                _ => None,
+                            },
                             range: (start, constant.span().end.offset),
                         });
                     }
@@ -1398,6 +1431,7 @@ impl Collector<'_> {
                         is_abstract: false,
                         is_private: false,
                         templates: Vec::new(),
+                        value: None,
                         range: (case.span().start.offset, case.span().end.offset),
                     });
                 }
@@ -1464,6 +1498,7 @@ impl Collector<'_> {
                 is_abstract: false,
                 is_private: has_private(modifiers),
                 templates: Vec::new(),
+                value: None,
                 range: (start, property.span().end.offset),
                 name,
             });
@@ -1504,6 +1539,7 @@ impl Collector<'_> {
                     is_abstract: false,
                     is_private: has_private(&param.modifiers),
                     templates: Vec::new(),
+                    value: None,
                     range: (param.span().start.offset, param.span().end.offset),
                 });
             }
@@ -1534,6 +1570,7 @@ impl Collector<'_> {
             is_abstract: in_interface || has_abstract(&method.modifiers),
             is_private: has_private(&method.modifiers),
             templates: tags.templates.clone(),
+            value: None,
             range: (start, method.span().end.offset),
             name,
         });

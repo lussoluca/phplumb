@@ -14,6 +14,13 @@ pub enum MetaValue {
     Number(String),
     /// Arrays, `{ ... }` annotation maps and lists: keyed entries keep their key.
     List(Vec<(Option<String>, MetaValue)>),
+    Null,
+    /// `X::NAME`, fully qualified, no leading backslash; `self` for `self::NAME` and
+    /// `static::NAME`.
+    Constant {
+        class: String,
+        name: String,
+    },
     /// A nested attribute (`new X(...)`) or annotation (`@X(...)`).
     Nested(Box<Metadata>),
     Other,

@@ -121,7 +121,7 @@ impl Routes {
             return;
         }
         let fqn = &class.fqn;
-        let class_routes = route_names(&shape.metadata);
+        let class_routes = route_names(&shape.metadata, index, fqn);
         self.unknown |= has_route_aliases(&shape.metadata);
         let prefix = match class_routes.first() {
             Some(RouteName::Literal(prefix)) => prefix.clone(),
@@ -144,7 +144,7 @@ impl Routes {
         let mut invoke_routes: Vec<String> = Vec::new();
         for entry in &methods {
             let method = entry.1;
-            let attributes = route_names(&method.metadata);
+            let attributes = route_names(&method.metadata, index, fqn);
             self.unknown |= has_route_aliases(&method.metadata);
             let mut defaults = 0;
             let mut names = Vec::new();
@@ -406,11 +406,10 @@ fn has_routes(index: &Index, class: &Declaration, memo: &mut HashMap<String, boo
     let Some(shape) = &class.class else {
         return false;
     };
-    let own = !route_names(&shape.metadata).is_empty()
-        || shape
-            .members
-            .iter()
-            .any(|m| m.kind == MemberKind::Method && !route_names(&m.metadata).is_empty());
+    let own = !route_names(&shape.metadata, index, &class.fqn).is_empty()
+        || shape.members.iter().any(|m| {
+            m.kind == MemberKind::Method && !route_names(&m.metadata, index, &class.fqn).is_empty()
+        });
     let found = own
         || shape.parent.iter().chain(&shape.traits).any(|name| {
             index

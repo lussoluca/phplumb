@@ -1,6 +1,8 @@
 //! Route names written in attributes, as both Drupal and Symfony read them.
 
+use crate::index::Index;
 use crate::metadata::{MetaValue, Metadata};
+use crate::summary::MemberKind;
 
 /// Route attribute classes, whose `name` argument (named or at position 1) names a
 /// route.
@@ -29,8 +31,9 @@ pub(crate) fn has_route_aliases(metadata: &[Metadata]) -> bool {
 }
 
 /// The names of the route attributes in `metadata`: the `name` argument, named or at
-/// position 1.
-pub(crate) fn route_names(metadata: &[Metadata]) -> Vec<RouteName> {
+/// position 1. A class constant gives its string value, read through the index;
+/// `self::` is `class`. A `null` name is missing.
+pub(crate) fn route_names(metadata: &[Metadata], index: &Index, class: &str) -> Vec<RouteName> {
     metadata
         .iter()
         .filter(|m| {
@@ -49,8 +52,16 @@ pub(crate) fn route_names(metadata: &[Metadata]) -> Vec<RouteName> {
             });
             match name {
                 Some(MetaValue::String(name)) => RouteName::Literal(name.clone()),
+                Some(MetaValue::Constant { class: owner, name }) => {
+                    let owner = if owner == "self" { class } else { owner };
+                    index
+                        .find_member(owner, MemberKind::Constant, name)
+                        .first()
+                        .and_then(|(_, member)| member.value.clone())
+                        .map_or(RouteName::Unreadable, RouteName::Literal)
+                }
+                Some(MetaValue::Null) | None => RouteName::Missing,
                 Some(_) => RouteName::Unreadable,
-                None => RouteName::Missing,
             }
         })
         .collect()

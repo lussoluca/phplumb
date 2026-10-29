@@ -1126,3 +1126,21 @@ fn symlinked_config_follows_edits_reported_at_the_real_path() {
     assert_eq!(count(&index, "app.extra"), 0);
     assert!(messages.is_empty(), "{messages:?}");
 }
+
+#[test]
+fn routes_named_by_constants() {
+    let index = build();
+    assert_eq!(
+        routes(&index, "app_login"),
+        [pair("src/Controller/LoginController.php", "login")]
+    );
+}
+
+#[test]
+fn class_routes_named_null_have_no_prefix() {
+    let index = build();
+    assert_eq!(
+        routes(&index, "panel_home"),
+        [pair("src/Controller/PanelController.php", "home")]
+    );
+}
