@@ -1,6 +1,7 @@
 //! Workspace-wide symbol table and the definition query.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Instant, UNIX_EPOCH};
@@ -11,7 +12,7 @@ use crate::builtins;
 use crate::cache::{self, CachedFile};
 use crate::calls::{self, CallItem, CallKind, Calls};
 use crate::diagnostics::{self, Diagnostic};
-use crate::discover::{self, DiscoverOptions, discover_in, discover_with};
+use crate::discover::{self, DiscoverOptions, discover_with, is_recorded_framework_file, walk};
 use crate::filter::{PHP_EXTENSION, PathFilter, is_framework_file};
 use crate::frameworks::{
     self, Detection, FoundCall, Framework, FrameworkCall, FrameworkDeclaration, Project,
@@ -99,6 +100,9 @@ pub struct Index {
     property_types: RwLock<HashMap<String, Arc<PropertyTypes>>>,
     /// The index of the phpstorm stubs, which declares PHP's built-in symbols.
     stubs: Option<Arc<Index>>,
+    /// The YAML, Twig and Doctrine XML files outside `vendor`, which only the
+    /// frameworks read.
+    framework_files: BTreeSet<PathBuf>,
 }
 
 impl Index {
@@ -133,7 +137,8 @@ impl Index {
         let mut cached = cache
             .map(|cache| cache::load(cache, &filter, cache::ENGINE))
             .unwrap_or_default();
-        let paths = discover_with(&mut filter);
+        let walked = discover_with(&mut filter);
+        let paths = walked.php;
 
         let stamps: Vec<Option<(u64, u64)>> = paths.par_iter().map(|p| stamp(p)).collect();
         let mut files: Vec<Option<CachedFile>> = Vec::with_capacity(paths.len());
@@ -172,6 +177,7 @@ impl Index {
             namespaces: HashMap::new(),
             property_types: RwLock::new(HashMap::new()),
             stubs: opts.stubs.as_deref().and_then(crate::stubs::load),
+            framework_files: walked.framework.into_iter().collect(),
         };
         for file in files.into_iter().flatten() {
             stats.files_with_parse_errors += usize::from(file.has_errors);
@@ -227,6 +233,7 @@ impl Index {
             namespaces: HashMap::new(),
             property_types: RwLock::new(HashMap::new()),
             stubs: None,
+            framework_files: BTreeSet::new(),
         };
         for file in read_files_with(&paths, crate::stubs::summarize_stub) {
             index.insert(file);
@@ -270,6 +277,9 @@ impl Index {
         let mut stats = UpdateStats::default();
 
         let deleted: Vec<PathBuf> = removed.iter().map(|p| self.filter.under_root(p)).collect();
+        for path in &deleted {
+            self.forget_framework_files(path);
+        }
         let mut rejected: Vec<PathBuf> = Vec::new();
         let mut fresh: Vec<PathBuf> = Vec::new();
         for path in changed {
@@ -277,12 +287,25 @@ impl Index {
             let chosen = discover::chosen_path(self.filter.root(), &path).map(|(_, chosen)| chosen);
             match chosen {
                 Some(chosen) if chosen.is_dir() => {
+                    self.forget_framework_files(&path);
+                    self.forget_framework_files(&chosen);
                     if self.filter.accepts_dir(&chosen) {
-                        fresh.extend(discover_in(&mut self.filter, &chosen));
+                        let walked = walk(&mut self.filter, &chosen);
+                        fresh.extend(walked.php);
+                        self.framework_files.extend(walked.framework);
+                    }
+                }
+                Some(chosen) if is_framework_file(&chosen) => {
+                    self.forget_framework_files(&path);
+                    if chosen.is_file() && is_recorded_framework_file(&self.filter, &chosen) {
+                        self.framework_files.insert(chosen);
                     }
                 }
                 Some(chosen) if self.filter.accepts(&chosen) => fresh.push(chosen),
-                _ => rejected.push(path),
+                _ => {
+                    self.forget_framework_files(&path);
+                    rejected.push(path);
+                }
             }
         }
 
@@ -311,6 +334,30 @@ impl Index {
             .clear();
         stats.elapsed_ms = started.elapsed().as_millis();
         stats
+    }
+
+    /// The YAML, Twig and Doctrine XML files below `dir` that only the frameworks
+    /// read, outside `vendor`, hidden directories, `node_modules` and excluded paths,
+    /// sorted.
+    pub fn framework_files_under<'a>(
+        &'a self,
+        dir: &'a Path,
+    ) -> impl Iterator<Item = &'a Path> + 'a {
+        self.framework_files
+            .range::<Path, _>((Bound::Included(dir), Bound::Unbounded))
+            .take_while(move |path| path.starts_with(dir))
+            .map(PathBuf::as_path)
+    }
+
+    /// Drops the recorded framework files at or below `path`.
+    fn forget_framework_files(&mut self, path: &Path) {
+        let gone: Vec<PathBuf> = self
+            .framework_files_under(path)
+            .map(Path::to_path_buf)
+            .collect();
+        for path in gone {
+            self.framework_files.remove(&path);
+        }
     }
 
     /// Hover text for the word at `offset` in `path`, whose current content is

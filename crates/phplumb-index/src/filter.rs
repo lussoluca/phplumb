@@ -126,7 +126,7 @@ impl PathFilter {
         !self.exclude_patterns.is_empty()
     }
 
-    fn has_php_extension(&self, path: &Path) -> bool {
+    pub(crate) fn has_php_extension(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| self.extensions.contains(&ext))

@@ -151,6 +151,42 @@ fn dedupes_symlinked_dirs() {
 }
 
 #[test]
+fn dedupes_symlinks_from_outside_the_root() {
+    let dir = TempDir::new().unwrap();
+    let root = canonical_root(&dir);
+    let outside = TempDir::new().unwrap();
+    write(outside.path(), "foo/Foo.php", "<?php\n");
+    fs::create_dir_all(root.join("web/modules/custom")).unwrap();
+    for link in ["foo", "bar"] {
+        symlink(
+            outside.path().join("foo"),
+            root.join("web/modules/custom").join(link),
+        )
+        .unwrap();
+    }
+
+    let found = discover(&root, &DiscoverOptions::default()).unwrap();
+
+    assert_eq!(
+        relative(&root, &found),
+        vec!["web/modules/custom/bar/Foo.php"]
+    );
+}
+
+#[test]
+fn dedupes_symlinked_files() {
+    let dir = TempDir::new().unwrap();
+    let root = canonical_root(&dir);
+    write(&root, "b/B.php", "<?php\n");
+    fs::create_dir_all(root.join("a")).unwrap();
+    symlink("../b/B.php", root.join("a/Link.php")).unwrap();
+
+    let found = discover(&root, &DiscoverOptions::default()).unwrap();
+
+    assert_eq!(relative(&root, &found), vec!["b/B.php"]);
+}
+
+#[test]
 fn survives_symlink_loop() {
     let dir = TempDir::new().unwrap();
     let root = canonical_root(&dir);
