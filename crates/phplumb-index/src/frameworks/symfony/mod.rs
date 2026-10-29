@@ -676,8 +676,7 @@ impl Framework for Symfony {
     /// In YAML configuration, a parameter, a template name, a service reference or a
     /// class name leads to its definition; in a Doctrine mapping, a class or
     /// property name opens it; in a Twig template, a template name opens its file,
-    /// and a route name in
-    /// `path()` or `url()` leads to the route.
+    /// and a route name in `path()` or `url()` leads to the route.
     fn file_targets(
         &self,
         index: &Index,
