@@ -2,6 +2,22 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-29, batch C1 call types
+
+Same machine and checkouts, measured with this branch and with `main` back to back, twice each. The batch fixes issues #12, #13, #14, #16 and #21.
+
+| Metric                    | Drupal reference                  | Symfony reference                   |
+| ------------------------- | --------------------------------- | ----------------------------------- |
+| Member coverage           | 42,717 (42,705 on `main`)         | 13,126 of 13,211 (13,097 on `main`) |
+| Warm start from the cache | 1.41 to 1.58 s (1.44 to 1.45 s)   | 0.24 to 0.45 s (0.27 to 0.29 s)     |
+| Update of one file        | 102 to 108 ms (96 to 105 ms)      | 21 to 41 ms (33 to 36 ms)           |
+| Update of 1,000 files     | 0.23 to 0.25 s (0.22 to 0.23 s)   | 85 to 169 ms (194 to 227 ms)        |
+| Peak resident memory      | 676 to 686 MB (643 to 687 MB)     | 258 to 265 MB (267 to 281 MB)       |
+| All cases                 | 85 passed, 9 failed, as on `main` | 31 passed, 0 failed                 |
+| Diagnostics               | 94, as on `main`                  | 0, as on `main`                     |
+
+The Symfony case for a parameter documented only on the interface now expects the method of the interface's element type, `Id::toString()`, where it expected nothing. Times vary from run to run on both builds.
+
 ## 2026-10-29, batch B stubs and enums
 
 Same machine. The Drupal reference project is now on another feature branch, so both projects were measured with this branch and with `main` on the same checkouts, alternating, twice each. The batch fixes issues #4, #5, #7, #8, #9 and #10.

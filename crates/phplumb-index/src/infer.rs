@@ -34,9 +34,9 @@ use mago_syntax::cst::{
     ClassLikeConstantSelector, ClassLikeMemberSelector, Closure, CompositeString, DoWhile,
     Expression, For, Foreach, ForeachTarget, Function, FunctionCall, FunctionLikeParameterList,
     Global, Hint, If, IfBody, InterpolatedString, KeyValueArrayElement, Literal, LiteralString,
-    Method, MethodCall, NullSafeMethodCall, NullSafePropertyAccess, PartialArgument, Program,
-    PropertyAccess, Static, StaticItem, StaticMethodCall, StringPart, Switch, TriviaKind, Try,
-    TryCatchClause, Variable, While,
+    Match, MatchArm, Method, MethodCall, NullSafeMethodCall, NullSafePropertyAccess,
+    PartialArgument, Program, PropertyAccess, Static, StaticItem, StaticMethodCall, StringPart,
+    Switch, TriviaKind, Try, TryCatchClause, Variable, While,
 };
 use mago_syntax::parser::parse_file_content;
 use mago_syntax::walker::Walker;
@@ -47,7 +47,7 @@ use crate::generics::{array_element, element_type, offset_type, substitute, supe
 use crate::index::{Index, Location};
 use crate::phpdoc::{TypeExpr, array_of, parse_docblock, parse_type};
 use crate::summary::{
-    FileSummary, MemberKind, NameKind, NameRef, SymbolKind, pick_type, summarize,
+    FileSummary, Member, MemberKind, NameKind, NameRef, SymbolKind, pick_type, summarize,
 };
 
 const MAX_DEPTH: u32 = 16;
@@ -1440,6 +1440,35 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
         }
     }
 
+    /// In `match (true)`, an arm with one condition narrows its expression as an
+    /// `if` with that condition narrows its body.
+    fn walk_in_match(&self, r#match: &'ast Match<'arena>, f: &mut Facts<'ast, 'arena>) {
+        if !matches!(r#match.expression, Expression::Literal(Literal::True(_))) {
+            return;
+        }
+        for arm in r#match.arms.iter() {
+            let MatchArm::Expression(arm) = arm else {
+                continue;
+            };
+            let [condition] = arm.conditions.as_slice() else {
+                continue;
+            };
+            let mut checks = Vec::new();
+            instanceof_checks(condition, &mut checks);
+            // From the arrow, so the narrowing comes before the arm's first use.
+            let start = arm.arrow.start.offset;
+            let end = arm.expression.span().end.offset;
+            for (var, class) in checks {
+                f.narrowings.push(NarrowFact {
+                    start,
+                    end,
+                    var,
+                    class,
+                });
+            }
+        }
+    }
+
     fn walk_in_variable(&self, variable: &'ast Variable<'arena>, f: &mut Facts<'ast, 'arena>) {
         if let Variable::Direct(direct) = variable {
             f.variables.push((
@@ -1677,7 +1706,9 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 variable.span.start.offset,
                 depth + 1,
             ) {
-                TypeExpr::Named(class) | TypeExpr::Tagged { class, .. } => Some(class),
+                TypeExpr::Named(class)
+                | TypeExpr::Tagged { class, .. }
+                | TypeExpr::Generic { class, .. } => Some(class),
                 _ => None,
             },
             _ => None,
@@ -1711,11 +1742,25 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             ]),
             Expression::Call(Call::Method(call)) => {
                 let receiver = self.expr(call.object, at, depth);
-                self.method_call(&receiver, &call.method, &call.argument_list, at, None)
+                self.method_call(
+                    &receiver,
+                    &call.method,
+                    &call.argument_list,
+                    at,
+                    depth,
+                    None,
+                )
             }
             Expression::Call(Call::NullSafeMethod(call)) => {
                 let receiver = self.expr(call.object, at, depth);
-                self.method_call(&receiver, &call.method, &call.argument_list, at, None)
+                self.method_call(
+                    &receiver,
+                    &call.method,
+                    &call.argument_list,
+                    at,
+                    depth,
+                    None,
+                )
             }
             Expression::Call(Call::StaticMethod(call)) => {
                 let Some(class) = self.class_of(call.class, at, depth) else {
@@ -1735,6 +1780,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     &call.method,
                     &call.argument_list,
                     at,
+                    depth,
                     forwarded.as_deref(),
                 )
             }
@@ -1757,6 +1803,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                         &TypeExpr::Named(class),
                         MemberKind::Property,
                         &variable_name(variable.name),
+                        None,
                         None,
                     ),
                     _ => TypeExpr::Other,
@@ -1809,6 +1856,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         selector: &ClassLikeMemberSelector<'_>,
         arguments: &ArgumentList<'_>,
         at: u32,
+        depth: u32,
         static_class: Option<&str>,
     ) -> TypeExpr {
         if let TypeExpr::Union(members) = receiver
@@ -1817,12 +1865,23 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             return union(
                 members
                     .iter()
-                    .map(|member| self.method_call(member, selector, arguments, at, static_class))
+                    .map(|member| {
+                        self.method_call(member, selector, arguments, at, depth, static_class)
+                    })
                     .collect(),
             );
         }
         self.framework_type(receiver, selector, arguments, at)
-            .unwrap_or_else(|| self.member_on(receiver, selector, MemberKind::Method, static_class))
+            .unwrap_or_else(|| match selector {
+                ClassLikeMemberSelector::Identifier(name) => self.member_type(
+                    receiver,
+                    MemberKind::Method,
+                    &String::from_utf8_lossy(name.value),
+                    static_class,
+                    Some((arguments, at, depth)),
+                ),
+                _ => TypeExpr::Other,
+            })
     }
 
     /// The type the active frameworks give a method call on `receiver`, when one of
@@ -1998,6 +2057,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 kind,
                 &String::from_utf8_lossy(name.value),
                 static_class,
+                None,
             ),
             _ => TypeExpr::Other,
         }
@@ -2013,10 +2073,20 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         kind: MemberKind,
         name: &str,
         static_class: Option<&str>,
+        call: Option<(&ArgumentList<'_>, u32, u32)>,
     ) -> TypeExpr {
         let mut types = Vec::new();
         for (class, args) in classes_with_args(receiver) {
-            let static_class = static_class.unwrap_or(&class);
+            // `static` is the receiver with its arguments, unless late static binding
+            // is forwarded from another class.
+            let static_type = match static_class {
+                Some(forwarded) => TypeExpr::Named(forwarded.to_string()),
+                None if !args.is_empty() => TypeExpr::Generic {
+                    class: class.clone(),
+                    args: args.clone(),
+                },
+                None => TypeExpr::Named(class.clone()),
+            };
             for (found, member) in self.index.find_member(&class, kind, name) {
                 let typed = match &member.ty {
                     Some(_) => Some((found, member)),
@@ -2029,6 +2099,15 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 };
                 let Some(ty) = &member.ty else {
                     continue;
+                };
+                // A method's own templates take what the call's arguments give them,
+                // before the class's templates of the same name could.
+                let ty = match call {
+                    Some((arguments, at, depth)) if !member.templates.is_empty() => {
+                        let bound = self.method_templates(member, arguments, at, depth);
+                        substitute(ty, &member.templates, &bound)
+                    }
+                    _ => ty.clone(),
                 };
                 let declaration = declaring.declaration;
                 let self_class = if declaration.kind == SymbolKind::Trait {
@@ -2043,17 +2122,59 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     Some(shape) if !shape.templates.is_empty() => {
                         let given = supertype_args(self.index, &class, &args, &declaration.fqn)
                             .unwrap_or_default();
-                        substitute(ty, &shape.templates, &given)
+                        substitute(&ty, &shape.templates, &given)
                     }
-                    _ => ty.clone(),
+                    _ => ty,
                 };
-                types.push(bind(&ty, static_class, self_class, parent));
+                types.push(bind(&ty, &static_type, self_class, parent));
             }
             if kind == MemberKind::Property {
                 types.extend(self.assigned_types(&class, name));
             }
         }
         union(types)
+    }
+
+    /// The type each of `member`'s templates takes in a call with `arguments`: the
+    /// class of an `X::class` argument given to a `class-string<T>` parameter, or the
+    /// type of an argument given to a parameter typed `T`; `Other` when unbound.
+    fn method_templates(
+        &self,
+        member: &Member,
+        arguments: &ArgumentList<'_>,
+        at: u32,
+        depth: u32,
+    ) -> Vec<TypeExpr> {
+        member
+            .templates
+            .iter()
+            .map(|template| {
+                member
+                    .params
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, (_, ty))| {
+                        let argument = || positional(arguments, position);
+                        match ty.as_ref()? {
+                            TypeExpr::ClassString(class) if matches!(&**class, TypeExpr::Named(name) if name == template) => {
+                                match argument()? {
+                                    Expression::Access(Access::ClassConstant(access))
+                                        if matches!(&access.constant, ClassLikeConstantSelector::Identifier(name) if name.value.eq_ignore_ascii_case(b"class")) =>
+                                    {
+                                        self.class_of(access.class, at, depth).map(TypeExpr::Named)
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            TypeExpr::Named(name) if name == template => {
+                                Some(self.expr(argument()?, at, depth + 1))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or(TypeExpr::Other)
+            })
+            .collect()
     }
 
     /// The types the classes of `class`'s parent chain assign to property `name`,
@@ -2097,9 +2218,18 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         types
     }
 
-    fn function_returns(&self, function: &Expression<'_>) -> TypeExpr {
-        let Expression::Identifier(identifier) = function else {
-            return TypeExpr::Other;
+    /// What calling `function` returns: a named function's return type, or for any
+    /// other callee, what its object's `__invoke()` returns.
+    fn function_returns(&self, call: &FunctionCall<'_>, at: u32, depth: u32) -> TypeExpr {
+        let Expression::Identifier(identifier) = call.function else {
+            let callee = self.expr(call.function, at, depth);
+            return self.member_type(
+                &callee,
+                MemberKind::Method,
+                "__invoke",
+                None,
+                Some((&call.argument_list, at, depth)),
+            );
         };
         let Some(name) = self
             .names
@@ -2243,7 +2373,12 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         match self.enclosing(at) {
             Some(class) => {
                 let parent = self.enclosing_parent(at);
-                bind(&ty, &class, &class, parent.as_deref())
+                bind(
+                    &ty,
+                    &TypeExpr::Named(class.clone()),
+                    &class,
+                    parent.as_deref(),
+                )
             }
             None => ty,
         }
@@ -2313,11 +2448,56 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 .map(|(_, ty)| ty)
             });
         // A variadic parameter collects several elements into an array.
-        if param.hint.is_none() && doc_type.is_none() && param.ellipsis.is_none() {
-            return self.callback_param(scope, i, depth);
+        let own = if param.hint.is_none() && doc_type.is_none() && param.ellipsis.is_none() {
+            self.callback_param(scope, i, depth)
+        } else {
+            let declared = param.hint.as_ref().map(|hint| self.hint_type(hint));
+            pick_type(doc_type, declared).unwrap_or(TypeExpr::Other)
+        };
+        // Only a parameter without a type or with a container type can take a
+        // class from its ancestor: a scalar one cannot.
+        let open = param.hint.as_ref().is_none_or(|hint| {
+            let span = hint.span();
+            let text = self
+                .text(span.start.offset, span.end.offset)
+                .trim_start_matches('?')
+                .to_ascii_lowercase();
+            matches!(text.as_str(), "array" | "iterable" | "mixed" | "object")
+        });
+        if open
+            && names_no_class(&own)
+            && let Some(inherited) = self.inherited_param(scope, i)
+        {
+            return inherited;
         }
-        let declared = param.hint.as_ref().map(|hint| self.hint_type(hint));
-        pick_type(doc_type, declared).unwrap_or(TypeExpr::Other)
+        own
+    }
+
+    /// The type an ancestor's declaration of the method at `scope` gives its
+    /// parameter `i`, as an interface documents it for its implementations.
+    /// Closures, arrow functions and constructors are not tied to an ancestor's
+    /// signature.
+    fn inherited_param(&self, scope: &ScopeFact<'_, '_>, i: usize) -> Option<TypeExpr> {
+        if !matches!(scope.kind, ScopeKind::Function) {
+            return None;
+        }
+        let fqn = self.summary.enclosing_class(scope.start)?.fqn.as_deref()?;
+        let method = self
+            .summary
+            .declarations
+            .iter()
+            .filter(|d| d.fqn == fqn)
+            .filter_map(|d| d.class.as_ref())
+            .flat_map(|shape| shape.members.iter())
+            .find(|member| {
+                member.kind == MemberKind::Method
+                    && member.range.0 <= scope.start
+                    && scope.start <= member.range.1
+            })?;
+        if method.name.eq_ignore_ascii_case("__construct") {
+            return None;
+        }
+        self.index.ancestor_param(fqn, &method.name, i)
     }
 
     /// The element type that PHP passes to parameter `i` of a callback written at
@@ -2378,7 +2558,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     /// functions keep, or the declared return type.
     fn function_call(&self, call: &FunctionCall<'_>, at: u32, depth: u32) -> TypeExpr {
         let Some(function) = self.builtin_function(call.function) else {
-            return self.function_returns(call.function);
+            return self.function_returns(call, at, depth);
         };
         let first = || {
             positional(&call.argument_list, 0)
@@ -2398,7 +2578,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 };
                 hint.map_or(TypeExpr::Other, |hint| array_of(self.hint_type(&hint.hint)))
             }
-            _ => self.function_returns(call.function),
+            _ => self.function_returns(call, at, depth),
         }
     }
 
@@ -2512,27 +2692,37 @@ fn is_plain_value(expression: &Expression<'_>) -> bool {
     }
 }
 
-/// Replaces `static`/`$this` with `static_class`, `self` with `self_class` and
-/// `parent` with `parent`.
-fn bind(ty: &TypeExpr, static_class: &str, self_class: &str, parent: Option<&str>) -> TypeExpr {
+/// Whether `ty` says nothing about classes: unknown, or an array of nothing known.
+pub(crate) fn names_no_class(ty: &TypeExpr) -> bool {
     match ty {
-        TypeExpr::StaticType => TypeExpr::Named(static_class.to_string()),
+        TypeExpr::Other => true,
+        TypeExpr::ArrayOf(element) => names_no_class(element),
+        TypeExpr::Union(members) => members.iter().all(names_no_class),
+        _ => false,
+    }
+}
+
+/// Replaces `static`/`$this` with `static_type`, `self` with `self_class` and
+/// `parent` with `parent`.
+fn bind(ty: &TypeExpr, static_type: &TypeExpr, self_class: &str, parent: Option<&str>) -> TypeExpr {
+    match ty {
+        TypeExpr::StaticType => static_type.clone(),
         TypeExpr::SelfType => TypeExpr::Named(self_class.to_string()),
         TypeExpr::ParentType => parent.map_or(TypeExpr::Other, |p| TypeExpr::Named(p.to_string())),
         TypeExpr::ArrayOf(element) => {
-            TypeExpr::ArrayOf(Box::new(bind(element, static_class, self_class, parent)))
+            TypeExpr::ArrayOf(Box::new(bind(element, static_type, self_class, parent)))
         }
         TypeExpr::Generic { class, args } => TypeExpr::Generic {
             class: class.clone(),
             args: args
                 .iter()
-                .map(|arg| bind(arg, static_class, self_class, parent))
+                .map(|arg| bind(arg, static_type, self_class, parent))
                 .collect(),
         },
         TypeExpr::Union(members) => union(
             members
                 .iter()
-                .map(|m| bind(m, static_class, self_class, parent))
+                .map(|m| bind(m, static_type, self_class, parent))
                 .collect(),
         ),
         other => other.clone(),

@@ -182,6 +182,10 @@ pub struct Member {
     /// Methods: their attributes.
     #[serde(default)]
     pub metadata: Vec<Metadata>,
+    /// Methods: their own `@template` names, which each call binds from its
+    /// arguments.
+    #[serde(default)]
+    pub templates: Vec<String>,
 }
 
 /// A use of a name, resolved against the file's namespace and imports.
@@ -801,7 +805,7 @@ fn names_a_class(ty: &TypeExpr) -> bool {
         | TypeExpr::SelfType
         | TypeExpr::StaticType
         | TypeExpr::ParentType => true,
-        TypeExpr::ArrayOf(element) => names_a_class(element),
+        TypeExpr::ArrayOf(element) | TypeExpr::ClassString(element) => names_a_class(element),
         TypeExpr::Union(members) => members.iter().any(names_a_class),
         TypeExpr::Other => false,
     }
@@ -1347,6 +1351,7 @@ impl Collector<'_> {
                             hints: Vec::new(),
                             is_abstract: false,
                             is_private: false,
+                            templates: Vec::new(),
                             range: (start, constant.span().end.offset),
                         });
                     }
@@ -1372,6 +1377,7 @@ impl Collector<'_> {
                         hints: Vec::new(),
                         is_abstract: false,
                         is_private: false,
+                        templates: Vec::new(),
                         range: (case.span().start.offset, case.span().end.offset),
                     });
                 }
@@ -1437,6 +1443,7 @@ impl Collector<'_> {
                 hints: Vec::new(),
                 is_abstract: false,
                 is_private: has_private(modifiers),
+                templates: Vec::new(),
                 range: (start, property.span().end.offset),
                 name,
             });
@@ -1476,6 +1483,7 @@ impl Collector<'_> {
                     hints: Vec::new(),
                     is_abstract: false,
                     is_private: has_private(&param.modifiers),
+                    templates: Vec::new(),
                     range: (param.span().start.offset, param.span().end.offset),
                 });
             }
@@ -1505,6 +1513,7 @@ impl Collector<'_> {
                 .collect(),
             is_abstract: in_interface || has_abstract(&method.modifiers),
             is_private: has_private(&method.modifiers),
+            templates: tags.templates.clone(),
             range: (start, method.span().end.offset),
             name,
         });
