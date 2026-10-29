@@ -9,7 +9,6 @@ use super::files::ConfigFiles;
 
 use crate::filter::{PathFilter, is_yaml};
 use crate::frameworks::Project;
-use crate::frameworks::ancestry::is_a;
 use crate::frameworks::attributes::{RouteName, route_names, route_variants};
 use crate::frameworks::yaml::{self, Yaml};
 use crate::index::{Index, Location};
@@ -679,8 +678,9 @@ fn resource_files(path: &Path) -> Option<Vec<PathBuf>> {
 }
 
 /// The directory of the bundle `name`, as `getPath()` gives it: that of the class
-/// with that short name registered in `config/bundles.php`, or its parent for an
-/// `AbstractBundle`. None when the bundle sets its own path.
+/// with that short name registered in `config/bundles.php` when its `getPath()` is
+/// `Bundle`'s, or its parent when it is an `AbstractBundle`'s. None when the bundle
+/// sets its own path.
 fn bundle_dir(sources: &Sources, name: &str) -> Option<PathBuf> {
     let source = std::fs::read(sources.config.join("bundles.php")).ok()?;
     let summary = summarize(&source);
@@ -692,23 +692,22 @@ fn bundle_dir(sources: &Sources, name: &str) -> Option<PathBuf> {
         .find(|fqn| fqn.rsplit('\\').next() == Some(name))?;
     let index = sources.index;
     let class = index.classes_named(fqn).into_iter().next()?;
-    let own_path = index
+    // The nearest `getPath()` decides: Symfony's own, or one the bundle sets.
+    let (owner, _) = index
         .find_member(fqn, MemberKind::Method, "getPath")
-        .first()
-        .is_some_and(|(owner, _)| {
-            let owner = &owner.declaration.fqn;
-            !std::iter::once(BUNDLE)
-                .chain(ABSTRACT_BUNDLES)
-                .any(|known| owner.eq_ignore_ascii_case(known))
-        });
-    if own_path {
-        return None;
-    }
+        .into_iter()
+        .next()?;
+    let owner = &owner.declaration.fqn;
     let dir = class.path.parent()?;
-    if is_a(index, fqn, &ABSTRACT_BUNDLES) {
+    if owner.eq_ignore_ascii_case(BUNDLE) {
+        Some(dir.to_path_buf())
+    } else if ABSTRACT_BUNDLES
+        .iter()
+        .any(|known| owner.eq_ignore_ascii_case(known))
+    {
         dir.parent().map(Path::to_path_buf)
     } else {
-        Some(dir.to_path_buf())
+        None
     }
 }
 

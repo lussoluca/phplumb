@@ -1471,3 +1471,26 @@ fn kernel_abstract_bundles_read_routes_from_their_parent_directory() {
 
     assert_eq!(route_files_of(&auto(&root), "acme_home"), ["acme_home"]);
 }
+
+#[test]
+fn bundles_built_on_kernel_abstract_bundles_keep_their_own_path() {
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/KernelAbstractBundle.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Kernel;\nabstract class AbstractBundle\n{\n    public function getPath(): string { return ''; }\n}\n",
+        ),
+        (
+            "lib/Bundle.php",
+            "<?php\nnamespace Symfony\\Component\\HttpKernel\\Bundle;\nuse Symfony\\Component\\DependencyInjection\\Kernel\\AbstractBundle as BaseAbstractBundle;\nabstract class Bundle extends BaseAbstractBundle\n{\n    public function getPath(): string { return ''; }\n}\n",
+        ),
+        (
+            "config/routes/framework.yaml",
+            "_errors:\n    resource: '@FrameworkBundle/Resources/config/routing/errors.php'\n",
+        ),
+    ]);
+
+    assert_eq!(
+        route_files_of(&auto(&root), "_preview_error"),
+        ["_preview_error"]
+    );
+}
