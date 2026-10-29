@@ -481,8 +481,11 @@ impl Framework for Symfony {
             .filter(|path| self.project.contains(path) || self.project.dir.starts_with(path))
             .collect();
         let relevant = paths.iter().any(|path| {
-            let kind = path.extension().and_then(|e| e.to_str());
-            path.is_dir() || matches!(kind, None | Some("php" | "yaml" | "yml" | "xml"))
+            let kind = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase);
+            path.is_dir() || matches!(kind.as_deref(), None | Some("php" | "yaml" | "yml" | "xml"))
         });
         let configuration: HashSet<PathBuf> = paths
             .iter()

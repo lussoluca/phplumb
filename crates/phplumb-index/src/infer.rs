@@ -34,9 +34,9 @@ use mago_syntax::cst::{
     ClassLikeConstantSelector, ClassLikeMemberSelector, Closure, CompositeString, DoWhile,
     Expression, For, Foreach, ForeachTarget, Function, FunctionCall, FunctionLikeParameterList,
     Global, Hint, If, IfBody, InterpolatedString, KeyValueArrayElement, Literal, LiteralString,
-    Match, MatchArm, Method, MethodCall, NullSafeMethodCall, NullSafePropertyAccess,
-    PartialArgument, Program, PropertyAccess, Static, StaticItem, StaticMethodCall, StringPart,
-    Switch, TriviaKind, Try, TryCatchClause, Variable, While,
+    Match, MatchArm, Method, MethodCall, NamespaceBody, NullSafeMethodCall, NullSafePropertyAccess,
+    PartialArgument, Program, PropertyAccess, Statement, Static, StaticItem, StaticMethodCall,
+    StringPart, Switch, TriviaKind, Try, TryCatchClause, Variable, While,
 };
 use mago_syntax::parser::parse_file_content;
 use mago_syntax::walker::Walker;
@@ -636,6 +636,240 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Vec<&'ast KeyValueArrayElement<'arena>>>
     ) {
         found.push(element);
     }
+}
+
+/// What a Symfony PHP route file defines through its `RoutingConfigurator`.
+#[derive(Default)]
+pub(crate) struct PhpRoutes {
+    /// Each `add('name', ...)`: the name, its range inside the quotes, and the
+    /// controller its chain sets, as `Class::method` or `Class`.
+    pub routes: Vec<(String, u32, u32, Option<String>)>,
+    /// Each `alias('alias', 'route')`.
+    pub aliases: Vec<(String, String)>,
+    /// Whether the file imports routes, names one the module cannot read, or is not
+    /// a closure the module reads.
+    pub unknown: bool,
+}
+
+/// The configurator methods a PHP route file's closure may call: those adding routes
+/// and aliases, and those setting what a route matches or leads to.
+const CONFIGURATOR_METHODS: [&str; 15] = [
+    "add",
+    "alias",
+    "condition",
+    "controller",
+    "defaults",
+    "deprecate",
+    "format",
+    "host",
+    "locale",
+    "methods",
+    "options",
+    "requirements",
+    "schemes",
+    "stateless",
+    "utf8",
+];
+
+/// Whether `statements` declare names and return a closure whose statements only
+/// call `CONFIGURATOR_METHODS` through its first parameter.
+fn returns_configurator<'s, 'arena: 's>(
+    statements: impl IntoIterator<Item = &'s Statement<'arena>>,
+) -> bool {
+    for statement in statements {
+        match statement {
+            Statement::OpeningTag(_)
+            | Statement::ClosingTag(_)
+            | Statement::Use(_)
+            | Statement::Declare(_)
+            | Statement::Noop(_) => {}
+            Statement::Namespace(namespace) => {
+                return match &namespace.body {
+                    NamespaceBody::Implicit(body) => returns_configurator(body.statements.iter()),
+                    NamespaceBody::BraceDelimited(block) => {
+                        returns_configurator(block.statements.iter())
+                    }
+                };
+            }
+            Statement::Return(returned) => {
+                let Some(Expression::Closure(closure)) = returned.value else {
+                    return false;
+                };
+                let Some(parameter) = closure.parameter_list.parameters.iter().next() else {
+                    return false;
+                };
+                let configurator = parameter.variable.name;
+                return closure
+                    .body
+                    .statements
+                    .iter()
+                    .all(|statement| match statement {
+                        Statement::Expression(statement) => {
+                            configures(statement.expression, configurator)
+                        }
+                        Statement::Return(returned) => returned.value.is_none(),
+                        Statement::Noop(_) => true,
+                        _ => false,
+                    });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether `expression` is a chain of `CONFIGURATOR_METHODS` calls on the variable
+/// `configurator`.
+fn configures(mut expression: &Expression<'_>, configurator: &[u8]) -> bool {
+    loop {
+        match expression {
+            Expression::Call(Call::Method(call)) => {
+                let ClassLikeMemberSelector::Identifier(method) = &call.method else {
+                    return false;
+                };
+                if !CONFIGURATOR_METHODS
+                    .iter()
+                    .any(|known| known.as_bytes().eq_ignore_ascii_case(method.value))
+                {
+                    return false;
+                }
+                expression = call.object;
+            }
+            Expression::Variable(Variable::Direct(variable)) => {
+                return variable.name == configurator;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The routes, aliases and imports of a PHP route file; a file in another form
+/// gives nothing and leaves route names unknown.
+pub(crate) fn php_routes(summary: &FileSummary, source: &[u8]) -> PhpRoutes {
+    let arena = LocalArena::new();
+    let program = parse_file_content(&arena, FileId::zero(), source);
+    if !returns_configurator(program.statements.iter()) {
+        return PhpRoutes {
+            unknown: !program.statements.iter().all(|s| {
+                matches!(
+                    s,
+                    Statement::OpeningTag(_) | Statement::ClosingTag(_) | Statement::Noop(_)
+                )
+            }),
+            ..PhpRoutes::default()
+        };
+    }
+    let mut calls: Vec<CallRef<'_, '_>> = Vec::new();
+    CallsWithArguments.walk_program(program, &mut calls);
+    let class_at = |offset: u32| {
+        summary
+            .names
+            .iter()
+            .find(|n| n.start == offset && n.kind == NameKind::ClassLike)
+            .map(|n| n.fqn.clone())
+    };
+    let name_of = |selector: &ClassLikeMemberSelector<'_>| match selector {
+        ClassLikeMemberSelector::Identifier(name) => {
+            Some(String::from_utf8_lossy(name.value).to_ascii_lowercase())
+        }
+        _ => None,
+    };
+    let mut found = PhpRoutes::default();
+    let mut controllers: Vec<(u32, String)> = Vec::new();
+    for call in &calls {
+        let CallRef::Method(call) = call else {
+            continue;
+        };
+        let Some(method) = name_of(&call.method) else {
+            continue;
+        };
+        let literal = |position: usize| match positional(&call.argument_list, position)? {
+            Expression::Literal(Literal::String(literal)) => {
+                let span = literal.span();
+                let value = String::from_utf8_lossy(literal.value?).into_owned();
+                Some((value, span.start.offset + 1, span.end.offset - 1))
+            }
+            _ => None,
+        };
+        match method.as_str() {
+            "add" => match literal(0) {
+                Some((name, start, end)) => found.routes.push((name, start, end, None)),
+                None => found.unknown = true,
+            },
+            "alias" => match (literal(0), literal(1)) {
+                (Some((alias, ..)), Some((route, ..))) => found.aliases.push((alias, route)),
+                _ => found.unknown = true,
+            },
+            "import" | "collection" => found.unknown = true,
+            "controller" => {
+                // The `add()` this chain starts from.
+                let mut object = call.object;
+                let add = loop {
+                    let Expression::Call(Call::Method(inner)) = object else {
+                        break None;
+                    };
+                    if name_of(&inner.method).as_deref() == Some("add") {
+                        break Some(inner);
+                    }
+                    object = inner.object;
+                };
+                let Some(add) = add else {
+                    continue;
+                };
+                let Some(Expression::Literal(Literal::String(name))) =
+                    positional(&add.argument_list, 0)
+                else {
+                    continue;
+                };
+                let controller = match positional(&call.argument_list, 0) {
+                    Some(Expression::Literal(Literal::String(literal))) => literal
+                        .value
+                        .map(|v| String::from_utf8_lossy(v).into_owned()),
+                    Some(Expression::Access(Access::ClassConstant(access))) => match access.class {
+                        Expression::Identifier(class) => class_at(class.span().start.offset),
+                        _ => None,
+                    },
+                    Some(Expression::Array(array)) => {
+                        let mut elements = array.elements.iter().filter_map(|e| match e {
+                            ArrayElement::Value(e) => Some(e.value),
+                            _ => None,
+                        });
+                        let class = match elements.next() {
+                            Some(Expression::Access(Access::ClassConstant(access))) => {
+                                match access.class {
+                                    Expression::Identifier(class) => {
+                                        class_at(class.span().start.offset)
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        let method = match elements.next() {
+                            Some(Expression::Literal(Literal::String(literal))) => literal
+                                .value
+                                .map(|v| String::from_utf8_lossy(v).into_owned()),
+                            _ => None,
+                        };
+                        class
+                            .zip(method)
+                            .map(|(class, method)| format!("{class}::{method}"))
+                    }
+                    _ => None,
+                };
+                if let Some(controller) = controller {
+                    controllers.push((name.span().start.offset + 1, controller));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (start, controller) in controllers {
+        if let Some(route) = found.routes.iter_mut().find(|route| route.1 == start) {
+            route.3 = Some(controller);
+        }
+    }
+    found
 }
 
 /// The method calls in a file named one of `names`, case-insensitively, in source

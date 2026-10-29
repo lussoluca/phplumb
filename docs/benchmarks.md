@@ -2,6 +2,12 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-29, batch E1 route definitions
+
+Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #29, #30, #31, #32 and #34. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged.
+
+The two Symfony reference routes named by class constants, such as `name: self::ROUTE` on a typed constant, now lead to their controller methods from `path()` in Twig, where they gave nothing. With them read, the project's route names are certain, and the sweep of `src`, `templates` and `config` still finds no broken route name.
+
 ## 2026-10-29, batch D framework projects
 
 Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #22, #23, #27 and #28. Neither reference project links a module from outside its framework project, so every member access keeps the same targets on both builds, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged. The Drupal warm start measured 1.36 s (1.32 s on `main`) and the update of 1,000 files 0.22 s on both.

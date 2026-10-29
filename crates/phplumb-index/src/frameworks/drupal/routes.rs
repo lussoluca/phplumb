@@ -117,7 +117,7 @@ impl Routes {
             let Some(shape) = &declaration.class else {
                 continue;
             };
-            let class_names = route_names(&shape.metadata);
+            let class_names = route_names(&shape.metadata, index, &declaration.fqn);
             let prefix = match class_names.first() {
                 Some(RouteName::Unreadable) => {
                     uncertain = true;
@@ -136,7 +136,7 @@ impl Routes {
                 .iter()
                 .filter(|m| m.kind == MemberKind::Method);
             for member in methods.clone() {
-                let names = route_names(&member.metadata);
+                let names = route_names(&member.metadata, index, &declaration.fqn);
                 let before = routes.len();
                 for name in &names {
                     match name {

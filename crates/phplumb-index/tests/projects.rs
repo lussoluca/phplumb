@@ -436,7 +436,7 @@ fn unknown_route_imports_silence_route_diagnostics() {
 }
 
 #[test]
-fn unreadable_route_names_silence_route_diagnostics() {
+fn literal_constant_route_names_keep_routes_certain() {
     let (_dir, root) = broken_symfony(&[
         (
             "lib/Route.php",
@@ -449,16 +449,40 @@ fn unreadable_route_names_silence_route_diagnostics() {
     ]);
     assert_eq!(
         broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+}
+
+#[test]
+fn constants_without_literal_values_keep_routes_uncertain() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "lib/Route.php",
+            "<?php\nnamespace Symfony\\Component\\Routing\\Attribute;\n#[\\Attribute]\nclass Route\n{\n    public function __construct(string $path = '', ?string $name = null) {}\n}\n",
+        ),
+        (
+            "src/Controller/Named.php",
+            "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass Named\n{\n    const ROUTE = 'named';\n    const OTHER = self::ROUTE;\n    #[Route('/named', name: self::OTHER)]\n    public function show(): void {}\n}\n",
+        ),
+    ]);
+    assert_eq!(
+        broken_messages(&root),
         ["Undefined parameter 'app.nowhere'"]
     );
 }
 
 #[test]
-fn php_route_files_silence_route_diagnostics() {
+fn empty_php_route_files_keep_routes_certain() {
     let (_dir, root) = broken_symfony(&[("config/routes/extra.php", "<?php\n")]);
     assert_eq!(
         broken_messages(&root),
-        ["Undefined parameter 'app.nowhere'"]
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
     );
 }
 
@@ -934,4 +958,355 @@ fn links_to_another_project_leave_it_alone() {
     let file = root.join("site/src/A.php");
     assert!(index.framework_project("symfony").unwrap().contains(&file));
     assert!(!index.framework_project("drupal").unwrap().contains(&file));
+}
+
+fn route_files_of(index: &Index, name: &str) -> Vec<String> {
+    index
+        .framework::<Symfony>()
+        .unwrap()
+        .route_targets(name)
+        .iter()
+        .map(|target| target.text.clone())
+        .collect()
+}
+
+const ROUTE_ATTRIBUTE: &str = "<?php\nnamespace Symfony\\Component\\Routing\\Attribute;\n#[\\Attribute]\nclass Route\n{\n    public function __construct(string $path = '', ?string $name = null) {}\n}\n";
+
+#[test]
+fn name_prefix_imports_prefix_their_attribute_routes() {
+    let (_dir, root) = broken_symfony(&[
+        ("lib/Route.php", ROUTE_ATTRIBUTE),
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\ncontrollers:\n    resource: ../src/Controller/\n    type: attribute\nadmin:\n    resource: ../src/Admin/\n    type: attribute\n    name_prefix: 'admin_'\n",
+        ),
+        (
+            "src/Admin/PanelController.php",
+            "<?php\nnamespace App\\Admin;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass PanelController\n{\n    #[Route('/panel', name: 'panel')]\n    public function panel(): void {}\n}\n",
+        ),
+        (
+            "src/Controller/HomeController.php",
+            "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass HomeController\n{\n    #[Route('/start', name: 'start')]\n    public function start(): void {}\n}\n",
+        ),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "admin_panel"), ["panel"]);
+    assert!(route_files_of(&index, "admin_start").is_empty());
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+}
+
+#[test]
+fn route_files_imported_from_outside_config_routes_are_read() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nblog:\n    resource: ../modules/blog/routes.yaml\n",
+        ),
+        ("modules/blog/routes.yaml", "blog_index:\n    path: /blog\n"),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "blog_index"), ["blog_index"]);
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+}
+
+const PHP_ROUTES: &str = "<?php\nuse App\\Controller\\Uses;\nuse Symfony\\Component\\Routing\\Loader\\Configurator\\RoutingConfigurator;\nreturn static function (RoutingConfigurator $routes): void {\n    $routes->add('php_home', '/')->methods(['GET'])->controller([Uses::class, 'run']);\n};\n";
+
+#[test]
+fn php_route_files_define_their_routes() {
+    let (_dir, root) = broken_symfony(&[("config/routes/app.php", PHP_ROUTES)]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "php_home"), ["php_home", "run"]);
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+}
+
+#[test]
+fn php_route_imports_and_computed_names_silence_route_diagnostics() {
+    for content in [
+        "<?php\nreturn static function ($routes): void {\n    $routes->import('../src/Other/', 'attribute');\n};\n",
+        "<?php\nreturn static function ($routes): void {\n    $name = 'x';\n    $routes->add($name, '/x');\n};\n",
+    ] {
+        let (_dir, root) = broken_symfony(&[("config/routes/extra.php", content)]);
+        assert_eq!(
+            broken_messages(&root),
+            ["Undefined parameter 'app.nowhere'"],
+            "{content}"
+        );
+    }
+}
+
+#[test]
+fn route_files_follow_the_kernel_patterns() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/routes/deep/nested/x.yaml",
+            "deep_x:\n    path: /x\n",
+        ),
+        ("config/routes/y.yml", "yml_y:\n    path: /y\n"),
+        ("config/routes/dev/z.yaml", "dev_z:\n    path: /z\n"),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "dev_z"), ["dev_z"]);
+    assert!(route_files_of(&index, "deep_x").is_empty());
+    assert!(route_files_of(&index, "yml_y").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn route_file_symlink_loops_read_each_file_once() {
+    let (_dir, root) = broken_symfony(&[("config/routes/a.yaml", "a_route:\n    path: /a\n")]);
+    std::os::unix::fs::symlink("..", root.join("config/routes/loop")).unwrap();
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "home"), ["home"]);
+    assert_eq!(route_files_of(&index, "a_route"), ["a_route"]);
+}
+
+#[test]
+fn route_file_updates_read_extensions_in_any_case() {
+    let (_dir, root) = broken_symfony(&[]);
+    let mut index = auto(&root);
+    let upper = root.join("config/routes/A.YAML");
+    fs::create_dir_all(upper.parent().unwrap()).unwrap();
+    fs::write(&upper, "upper_a:\n    path: /a\n").unwrap();
+
+    index.update(&[upper], &[]);
+
+    assert_eq!(route_files_of(&index, "upper_a"), ["upper_a"]);
+}
+
+#[test]
+fn routes_php_is_read_only_without_routes_yaml() {
+    let (_dir, root) = broken_symfony(&[("config/routes.php", PHP_ROUTES)]);
+    assert!(route_files_of(&auto(&root), "php_home").is_empty());
+    fs::remove_file(root.join("config/routes.yaml")).unwrap();
+    assert_eq!(
+        route_files_of(&auto(&root), "php_home"),
+        ["php_home", "run"]
+    );
+}
+
+/// The diagnostics of `broken_symfony` with `files` and the route attribute class.
+fn route_messages(files: &[(&str, &str)]) -> Vec<String> {
+    let mut all = vec![("lib/Route.php", ROUTE_ATTRIBUTE)];
+    all.extend_from_slice(files);
+    let (_dir, root) = broken_symfony(&all);
+    broken_messages(&root)
+}
+
+const CERTAIN: [&str; 2] = [
+    "Undefined route 'missing_route'",
+    "Undefined parameter 'app.nowhere'",
+];
+
+#[test]
+fn prefixed_import_cycles_read_each_file_once() {
+    let (_dir, root) = broken_symfony(&[(
+        "config/routes/a.yaml",
+        "a_route:\n    path: /a\nagain:\n    resource: a.yaml\n    name_prefix: 'x_'\n",
+    )]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "a_route"), ["a_route"]);
+}
+
+#[test]
+fn php_route_files_in_other_forms_silence_route_diagnostics() {
+    for content in [
+        "<?php\nuse Symfony\\Component\\Routing\\Loader\\Configurator\\RoutingConfigurator;\nreturn static function (RoutingConfigurator $routes): void {\n    $routes('inv_home', '/inv');\n};\n",
+        "<?php\nnamespace Symfony\\Component\\Routing\\Loader\\Configurator;\nreturn Routes::config([\n    'arr_home' => ['path' => '/arr'],\n]);\n",
+        "<?php\nuse Symfony\\Component\\Routing\\Route;\nuse Symfony\\Component\\Routing\\RouteCollection;\n$c = new RouteCollection();\n$c->add('n', new Route('/n'));\n$c->addNamePrefix('p_');\nreturn $c;\n",
+        "<?php\nreturn static function ($routes): void {\n    if (true) {\n        $routes->add('cond', '/cond');\n    }\n};\n",
+    ] {
+        let (_dir, root) = broken_symfony(&[("config/routes/app.php", content)]);
+        assert_eq!(
+            broken_messages(&root),
+            ["Undefined parameter 'app.nowhere'"],
+            "{content}"
+        );
+    }
+}
+
+#[test]
+fn unreadable_aliases_silence_route_diagnostics() {
+    let messages = route_messages(&[(
+        "src/Controller/A.php",
+        "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nuse Symfony\\Component\\Routing\\Attribute\\DeprecatedAlias;\nclass A\n{\n    #[Route('/a', name: 'a', alias: [new DeprecatedAlias('old_a', 'pkg', '1.0')])]\n    public function a(): void {}\n}\n",
+    )]);
+
+    assert_eq!(messages, ["Undefined parameter 'app.nowhere'"]);
+}
+
+#[test]
+fn constant_aliases_lead_to_their_route() {
+    let files = [(
+        "src/Controller/B.php",
+        "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass B\n{\n    const OLD = 'old_b';\n    #[Route('/b', name: 'b', alias: self::OLD)]\n    public function b(): void {}\n}\n",
+    )];
+    let mut all = vec![("lib/Route.php", ROUTE_ATTRIBUTE)];
+    all.extend_from_slice(&files);
+    let (_dir, root) = broken_symfony(&all);
+
+    assert_eq!(route_files_of(&auto(&root), "old_b"), ["b"]);
+    assert_eq!(broken_messages(&root), CERTAIN);
+}
+
+#[test]
+fn class_aliases_of_invokable_classes_lead_to_their_route() {
+    let (_dir, root) = broken_symfony(&[
+        ("lib/Route.php", ROUTE_ATTRIBUTE),
+        (
+            "src/Controller/Inv.php",
+            "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\n#[Route('/inv', name: 'inv', alias: 'inv_old')]\nclass Inv\n{\n    public function __invoke(): void {}\n}\n",
+        ),
+    ]);
+
+    assert_eq!(route_files_of(&auto(&root), "inv_old"), ["__invoke"]);
+    assert_eq!(broken_messages(&root), CERTAIN);
+}
+
+#[test]
+fn outer_name_prefixes_reach_nested_imports() {
+    let (_dir, root) = broken_symfony(&[
+        ("lib/Route.php", ROUTE_ATTRIBUTE),
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nblog:\n    resource: ../modules/blog/routes.yaml\n    name_prefix: 'blog_'\n",
+        ),
+        (
+            "modules/blog/routes.yaml",
+            "ctrl:\n    resource: ../../src/Blog/\n    type: attribute\ninner:\n    resource: ../../config/routes/k.yaml\n",
+        ),
+        ("config/routes/k.yaml", "k:\n    path: /k\n"),
+        (
+            "src/Blog/PostController.php",
+            "<?php\nnamespace App\\Blog;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass PostController\n{\n    #[Route('/post', name: 'post')]\n    public function post(): void {}\n}\n",
+        ),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "blog_post"), ["post"]);
+    assert_eq!(route_files_of(&index, "blog_k"), ["k"]);
+    assert_eq!(broken_messages(&root), CERTAIN);
+}
+
+#[test]
+fn directory_imports_read_every_route_file_below() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nlegacy:\n    resource: 'routes/legacy/'\n    type: directory\n",
+        ),
+        ("config/routes/legacy/old/x.yaml", "deep_x:\n    path: /x\n"),
+        ("config/routes/legacy/y.yml", "yml_y:\n    path: /y\n"),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "deep_x"), ["deep_x"]);
+    assert_eq!(route_files_of(&index, "yml_y"), ["yml_y"]);
+    assert_eq!(broken_messages(&root), CERTAIN);
+}
+
+#[test]
+fn directory_imports_with_unread_files_silence_route_diagnostics() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nlegacy:\n    resource: '../modules/legacy/'\n    type: directory\n",
+        ),
+        ("modules/legacy/x.xml", "<routes/>\n"),
+    ]);
+
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'app.nowhere'"]
+    );
+}
+
+#[test]
+fn inherited_routes_read_constants_of_their_declaring_class() {
+    let (_dir, root) = broken_symfony(&[
+        ("lib/Route.php", ROUTE_ATTRIBUTE),
+        (
+            "src/Controller/Base.php",
+            "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nabstract class Base\n{\n    const ROUTE = 'base_r';\n    #[Route('/b', name: self::ROUTE)]\n    public function show(): void {}\n}\n",
+        ),
+        (
+            "src/Controller/Child.php",
+            "<?php\nnamespace App\\Controller;\nclass Child extends Base\n{\n    const ROUTE = 'child_r';\n}\n",
+        ),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "base_r"), ["show"]);
+    assert!(route_files_of(&index, "child_r").is_empty());
+}
+
+#[test]
+fn single_locale_routes_keep_their_class_alias() {
+    let (_dir, root) = broken_symfony(&[
+        ("lib/Route.php", ROUTE_ATTRIBUTE),
+        (
+            "src/Controller/Loc.php",
+            "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass Loc\n{\n    #[Route(path: ['en' => '/about'], name: 'about')]\n    public function about(): void {}\n}\n",
+        ),
+    ]);
+
+    assert_eq!(
+        route_files_of(&auto(&root), "App\\Controller\\Loc::about"),
+        ["about"]
+    );
+}
+
+#[test]
+fn prefixed_aliases_lead_to_their_prefixed_route() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nindex:\n    path: /other\nblog:\n    resource: ../modules/blog/routes.yaml\n    name_prefix: 'blog_'\n",
+        ),
+        (
+            "modules/blog/routes.yaml",
+            "index:\n    path: /blog\nold_index:\n    alias: index\n",
+        ),
+    ]);
+    let index = auto(&root);
+    let symfony = index.framework::<Symfony>().unwrap();
+
+    assert_eq!(
+        symfony.route_targets("blog_old_index"),
+        symfony.route_targets("blog_index")
+    );
+}
+
+#[test]
+fn alias_chains_lead_to_their_route() {
+    let (_dir, root) = broken_symfony(&[(
+        "config/routes/aliases.yaml",
+        "second:\n    alias: first\nfirst:\n    alias: home\n",
+    )]);
+
+    assert_eq!(route_files_of(&auto(&root), "second"), ["home"]);
+    assert_eq!(broken_messages(&root), CERTAIN);
 }

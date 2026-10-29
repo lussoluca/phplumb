@@ -1,18 +1,19 @@
 //! Symfony routes: the names `#[Route]` attributes give, as Symfony's attribute
-//! loader and FrameworkBundle name them, and the routes of YAML route files.
+//! loader and FrameworkBundle name them, and the routes of YAML and PHP route files.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use super::files::{ConfigFiles, Parsed};
+use super::files::ConfigFiles;
 
 use crate::filter::{PathFilter, is_yaml};
 use crate::frameworks::Project;
-use crate::frameworks::attributes::{RouteName, has_route_aliases, route_names};
+use crate::frameworks::attributes::{RouteName, route_names, route_variants};
 use crate::frameworks::yaml::{self, Yaml};
 use crate::index::{Index, Location};
-use crate::summary::{Declaration, Member, MemberKind, SymbolKind};
+use crate::infer::php_routes;
+use crate::metadata::Metadata;
+use crate::summary::{Declaration, Member, MemberKind, SymbolKind, summarize};
 
 /// Where a route name leads, with the text expected at the range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,12 +34,31 @@ const SYMFONY_RESOURCES: [&str; 5] = [
 
 /// What a route import loads, as far as the module knows.
 enum Import {
-    /// Routes the module reads anyway: attribute routes of project code or a route
-    /// file it reads.
+    /// Routes the module reads anyway: attribute routes of project code.
     Read,
+    /// YAML and PHP route files of the project, with the prefix the import and the
+    /// imports leading to it give their names.
+    Files(Vec<PathBuf>, String),
+    /// Attribute routes of project classes in a directory, or of one class, under
+    /// the prefix the import and the imports leading to it give their names.
+    Prefixed(AttributeResource, String),
     /// Routes of one of Symfony's bundles.
     Symfony,
     Unknown,
+}
+
+/// The classes an attribute route import reads.
+enum AttributeResource {
+    Directory(PathBuf),
+    Class(String),
+}
+
+/// What reading route files needs.
+struct Sources<'a> {
+    index: &'a Index,
+    config_files: &'a ConfigFiles,
+    /// The project's `config` directory.
+    config: &'a Path,
 }
 
 #[derive(Default)]
@@ -48,11 +68,21 @@ pub(crate) struct Routes {
     unknown: bool,
     /// Whether Symfony's own routes are imported.
     symfony: bool,
+    /// Aliases of route files: each alias name and the route it stands for.
+    aliases: Vec<(String, String)>,
+    /// Each attribute route with the file and class declaring it, for the imports
+    /// that prefix them.
+    attribute_routes: Vec<(PathBuf, String, String, RouteTarget)>,
+    /// The route files read, by real path, each with the prefix it was read under,
+    /// so a file imported again under the same prefix is read once.
+    read_files: Vec<(PathBuf, String)>,
+    /// The route files being read, by real path, outermost first.
+    reading: Vec<PathBuf>,
 }
 
 impl Routes {
     /// Every route of the project: attribute routes of project classes, then the
-    /// routes of `config/routes.yaml` and the YAML files below `config/routes`.
+    /// route files the kernel loads and the files they import.
     pub(crate) fn read(
         index: &Index,
         filter: &PathFilter,
@@ -77,11 +107,19 @@ impl Routes {
             }
         }
         let config = project.dir.join("config");
-        let files = route_files(&config, filter);
         routes.unknown |= has_unread_route_files(&config);
-        for file in &files {
-            routes.read_yaml(index, config_files.get(file), file, &files, &config);
+        let sources = Sources {
+            index,
+            config_files,
+            config: &config,
+        };
+        let files = php_route_files(&config, filter)
+            .into_iter()
+            .chain(route_files(&config, filter));
+        for file in files {
+            routes.read_file(&sources, &file, "");
         }
+        routes.resolve_aliases();
         routes
     }
 
@@ -111,6 +149,26 @@ impl Routes {
         }
     }
 
+    /// Gives each alias the targets of the route it stands for, also through other
+    /// aliases; an alias of nothing known leaves names unknown.
+    fn resolve_aliases(&mut self) {
+        let mut pending = std::mem::take(&mut self.aliases);
+        loop {
+            let before = pending.len();
+            pending.retain(|(alias, name)| {
+                let targets = self.targets(name).to_vec();
+                for target in &targets {
+                    self.add(alias.clone(), target.clone());
+                }
+                targets.is_empty()
+            });
+            if pending.len() == before {
+                break;
+            }
+        }
+        self.unknown |= !pending.is_empty();
+    }
+
     /// The routes of one class, named as `AttributeClassLoader::load` names them:
     /// abstract classes have none, and inherited methods route on the class.
     fn read_class(&mut self, index: &Index, path: &Path, class: &Declaration) {
@@ -121,8 +179,7 @@ impl Routes {
             return;
         }
         let fqn = &class.fqn;
-        let class_routes = route_names(&shape.metadata);
-        self.unknown |= has_route_aliases(&shape.metadata);
+        let class_routes = route_names(&shape.metadata, index, fqn);
         let prefix = match class_routes.first() {
             Some(RouteName::Literal(prefix)) => prefix.clone(),
             Some(RouteName::Unreadable) => {
@@ -131,92 +188,143 @@ impl Routes {
             }
             Some(RouteName::Missing) | None => String::new(),
         };
-        let target = |(path, member): &(PathBuf, &Member)| RouteTarget {
-            location: Location {
-                path: path.clone(),
-                start: member.name_start,
-                end: member.name_end,
-            },
-            text: member.name.clone(),
-        };
         let methods = methods_of(index, path, class);
         let mut count = 0;
         let mut invoke_routes: Vec<String> = Vec::new();
-        for entry in &methods {
-            let method = entry.1;
-            let attributes = route_names(&method.metadata);
-            self.unknown |= has_route_aliases(&method.metadata);
-            let mut defaults = 0;
-            let mut names = Vec::new();
-            for attribute in &attributes {
-                match attribute {
-                    RouteName::Literal(name) => names.push(format!("{prefix}{name}")),
-                    RouteName::Missing => {
-                        names.push(format!(
-                            "{prefix}{}",
-                            default_name(fqn, &method.name, defaults)
-                        ));
-                        defaults += 1;
-                    }
-                    RouteName::Unreadable => self.unknown = true,
-                }
-            }
-            count += attributes.len();
+        for (file, owner, method) in &methods {
+            let target = method_target(file, method);
+            let attributes = Attributes {
+                metadata: &method.metadata,
+                owner,
+                prefix: &prefix,
+                method: &method.name,
+            };
+            let (added, names) = self.add_routes(index, path, fqn, &attributes, &target);
+            count += added;
             if method.name.eq_ignore_ascii_case("__invoke") {
                 invoke_routes.extend(names.iter().cloned());
             }
-            if attributes.len() == 1 && names.len() == 1 {
-                self.add(format!("{fqn}::{}", method.name), target(entry));
-            }
-            for name in names {
-                self.add(name, target(entry));
+            // Symfony aliases `Class::method` to a method's only route.
+            if added == 1 && names.len() == 1 {
+                self.add(format!("{fqn}::{}", method.name), target);
             }
         }
         let invoke = methods
             .iter()
-            .find(|(_, m)| m.name.eq_ignore_ascii_case("__invoke"));
+            .find(|(_, _, m)| m.name.eq_ignore_ascii_case("__invoke"));
         if count == 0
-            && let Some(invoke) = invoke
+            && let Some((file, _, method)) = invoke
         {
-            let mut defaults = 0;
-            for attribute in &class_routes {
-                count += 1;
-                let name = match attribute {
-                    RouteName::Literal(name) => name.clone(),
-                    RouteName::Missing => {
-                        defaults += 1;
-                        default_name(fqn, &invoke.1.name, defaults - 1)
-                    }
-                    RouteName::Unreadable => {
-                        self.unknown = true;
-                        continue;
-                    }
-                };
-                invoke_routes.push(name.clone());
-                self.add(name, target(invoke));
-            }
+            let attributes = Attributes {
+                metadata: &shape.metadata,
+                owner: fqn,
+                prefix: "",
+                method: &method.name,
+            };
+            let (added, names) =
+                self.add_routes(index, path, fqn, &attributes, &method_target(file, method));
+            count += added;
+            invoke_routes.extend(names);
         }
         if count == 1
             && invoke_routes.len() == 1
-            && let Some(invoke) = invoke
+            && let Some((file, _, method)) = invoke
         {
-            self.add(fqn.clone(), target(invoke));
-            self.add(format!("{fqn}::__invoke"), target(invoke));
+            let target = method_target(file, method);
+            self.add(fqn.clone(), target.clone());
+            self.add(format!("{fqn}::__invoke"), target);
         }
     }
 
-    /// The routes of one YAML route file: top-level keys with a `path`, also inside
-    /// `when@<env>` blocks; imports define none, and say whether the routes they
-    /// load are known. `files` are the route files read, below `config`.
-    fn read_yaml(
+    /// Adds the routes `attributes` give, leading to `target`, for the class `fqn`
+    /// declared in `path`; returns how many routes Symfony adds and the name of each
+    /// attribute's route.
+    fn add_routes(
         &mut self,
         index: &Index,
-        parsed: Option<Arc<Parsed>>,
-        file: &Path,
-        files: &[PathBuf],
-        config: &Path,
-    ) {
-        let Some(parsed) = parsed else {
+        path: &Path,
+        fqn: &str,
+        attributes: &Attributes,
+        target: &RouteTarget,
+    ) -> (usize, Vec<String>) {
+        let Attributes {
+            metadata,
+            owner,
+            prefix,
+            method,
+        } = *attributes;
+        let mut defaults = 0;
+        let mut added = 0;
+        let mut names = Vec::new();
+        let variants = route_variants(metadata, index, owner);
+        for (name, variant) in route_names(metadata, index, owner)
+            .into_iter()
+            .zip(variants)
+        {
+            added += variant.locales.len().max(1);
+            let name = match name {
+                RouteName::Literal(name) => format!("{prefix}{name}"),
+                RouteName::Missing => {
+                    defaults += 1;
+                    format!("{prefix}{}", default_name(fqn, method, defaults - 1))
+                }
+                RouteName::Unreadable => {
+                    self.unknown = true;
+                    continue;
+                }
+            };
+            self.unknown |= variant.unreadable;
+            // A localized route is `name.locale` for each locale; `name` still
+            // generates it in the current locale.
+            let localized = variant
+                .locales
+                .iter()
+                .map(|locale| format!("{name}.{locale}"));
+            let routes: Vec<String> = std::iter::once(name.clone())
+                .chain(localized)
+                .chain(variant.aliases)
+                .collect();
+            for route in routes {
+                self.attribute_routes.push((
+                    path.to_path_buf(),
+                    fqn.to_string(),
+                    route.clone(),
+                    target.clone(),
+                ));
+                self.add(route, target.clone());
+            }
+            names.push(name);
+        }
+        (added, names)
+    }
+
+    /// Reads the route file `file` under `prefix`, once for each prefix. A file that
+    /// imports itself, directly or not, makes Symfony fail, and leaves names unknown.
+    fn read_file(&mut self, sources: &Sources, file: &Path, prefix: &str) {
+        let real = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+        if self.reading.contains(&real) {
+            self.unknown = true;
+            return;
+        }
+        let key = (real.clone(), prefix.to_string());
+        if self.read_files.contains(&key) {
+            return;
+        }
+        self.read_files.push(key);
+        self.reading.push(real);
+        if is_php(file) {
+            self.read_php(sources.index, file, prefix);
+        } else {
+            self.read_yaml(sources, file, prefix);
+        }
+        self.reading.pop();
+    }
+
+    /// The routes of one YAML route file, with `prefix` before their names: top-level
+    /// keys with a `path`, also inside `when@<env>` blocks, and aliases; imports
+    /// define none, and say whether the routes they load are known.
+    fn read_yaml(&mut self, sources: &Sources, file: &Path, prefix: &str) {
+        let Some(parsed) = sources.config_files.get(file) else {
             self.unknown = true;
             return;
         };
@@ -256,11 +364,25 @@ impl Routes {
                 continue;
             };
             if value.get("resource").is_some() {
-                match import(index, file, value, files, config) {
+                match import(sources, file, value, prefix) {
                     Import::Read => {}
                     Import::Symfony => self.symfony = true,
                     Import::Unknown => self.unknown = true,
+                    Import::Files(files, prefix) => {
+                        for imported in &files {
+                            self.read_file(sources, imported, &prefix);
+                        }
+                    }
+                    Import::Prefixed(resource, prefix) => {
+                        self.prefix_attribute_routes(&resource, &prefix)
+                    }
                 }
+                continue;
+            }
+            // A name prefix also prefixes the route an alias stands for.
+            if let Some(alias) = value.get("alias").and_then(Yaml::text) {
+                self.aliases
+                    .push((format!("{prefix}{name}"), format!("{prefix}{alias}")));
                 continue;
             }
             if value.get("alias").is_some() {
@@ -271,8 +393,9 @@ impl Routes {
                 continue;
             }
             let (start, end) = yaml::value_range(text, name, *start, *end);
+            let full = format!("{prefix}{name}");
             self.add(
-                name.clone(),
+                full.clone(),
                 RouteTarget {
                     location: Location {
                         path: file.to_path_buf(),
@@ -286,18 +409,100 @@ impl Routes {
                 .get("controller")
                 .or_else(|| value.get("defaults")?.get("_controller"))
                 .and_then(Yaml::text);
-            if let Some(target) = controller.and_then(|c| controller_target(index, c)) {
-                self.add(name.clone(), target);
+            if let Some(target) = controller.and_then(|c| controller_target(sources.index, c)) {
+                self.add(full, target);
             }
+        }
+    }
+
+    /// The routes and aliases a PHP route file adds through its configurator, with
+    /// `prefix` before their names; an import, a computed name or a file in another
+    /// form leaves route names unknown.
+    fn read_php(&mut self, index: &Index, file: &Path, prefix: &str) {
+        let Ok(source) = std::fs::read(file) else {
+            self.unknown = true;
+            return;
+        };
+        let found = php_routes(&summarize(&source), &source);
+        self.unknown |= found.unknown;
+        for (name, start, end, controller) in found.routes {
+            let full = format!("{prefix}{name}");
+            self.add(
+                full.clone(),
+                RouteTarget {
+                    location: Location {
+                        path: file.to_path_buf(),
+                        start,
+                        end,
+                    },
+                    text: name,
+                },
+            );
+            if let Some(target) = controller.and_then(|c| controller_target(index, &c)) {
+                self.add(full, target);
+            }
+        }
+        self.aliases.extend(
+            found
+                .aliases
+                .into_iter()
+                .map(|(alias, route)| (format!("{prefix}{alias}"), format!("{prefix}{route}"))),
+        );
+    }
+
+    /// Adds `prefix` before the names of the attribute routes `resource` reads.
+    fn prefix_attribute_routes(&mut self, resource: &AttributeResource, prefix: &str) {
+        let prefixed: Vec<(String, RouteTarget)> = self
+            .attribute_routes
+            .iter()
+            .filter(|(path, class, _, _)| match resource {
+                AttributeResource::Directory(dir) => path.starts_with(dir),
+                AttributeResource::Class(fqn) => class.eq_ignore_ascii_case(fqn),
+            })
+            .map(|(_, _, name, target)| (format!("{prefix}{name}"), target.clone()))
+            .collect();
+        for (name, target) in prefixed {
+            self.add(name, target);
         }
     }
 }
 
-/// What the import `value` of the route file `file` loads.
-fn import(index: &Index, file: &Path, value: &Yaml, files: &[PathBuf], config: &Path) -> Import {
-    if value.get("name_prefix").is_some() {
-        return Import::Unknown;
+/// The route attributes of a method, or of an invokable class, as `add_routes`
+/// reads them.
+#[derive(Clone, Copy)]
+struct Attributes<'a> {
+    metadata: &'a [Metadata],
+    /// The class `self::` names in them.
+    owner: &'a str,
+    /// The class route's name, before each route name.
+    prefix: &'a str,
+    /// The method the routes lead to, for default names.
+    method: &'a str,
+}
+
+/// Where a route leads when it runs `method`, declared in `path`.
+fn method_target(path: &Path, method: &Member) -> RouteTarget {
+    RouteTarget {
+        location: Location {
+            path: path.to_path_buf(),
+            start: method.name_start,
+            end: method.name_end,
+        },
+        text: method.name.clone(),
     }
+}
+
+/// What the import `value` of the route file `file`, read under the prefix `outer`,
+/// loads.
+fn import(sources: &Sources, file: &Path, value: &Yaml, outer: &str) -> Import {
+    // A prefix the module cannot read leaves the imported names unknown.
+    let prefix = match value.get("name_prefix") {
+        None => outer.to_string(),
+        Some(prefix) => match prefix.text() {
+            Some(prefix) => format!("{outer}{prefix}"),
+            None => return Import::Unknown,
+        },
+    };
     let resource = value.get("resource");
     let Some(resource) = resource
         .and_then(Yaml::text)
@@ -306,10 +511,18 @@ fn import(index: &Index, file: &Path, value: &Yaml, files: &[PathBuf], config: &
         return Import::Unknown;
     };
     if resource == "routing.controllers" {
-        return Import::Read;
+        return if prefix.is_empty() {
+            Import::Read
+        } else {
+            Import::Unknown
+        };
     }
     if SYMFONY_RESOURCES.iter().any(|r| resource.starts_with(r)) {
-        return Import::Symfony;
+        return if prefix.is_empty() {
+            Import::Symfony
+        } else {
+            Import::Unknown
+        };
     }
     if resource.starts_with('@') || resource.contains(['*', '?', '{', '[']) {
         return Import::Unknown;
@@ -319,35 +532,93 @@ fn import(index: &Index, file: &Path, value: &Yaml, files: &[PathBuf], config: &
     if kind == Some("annotation") {
         return Import::Unknown;
     }
+    let config = sources.config;
+    let project = config.parent().unwrap_or(config);
+    let resolved = normalize(&file.parent().unwrap_or(config).join(resource));
+    let in_project =
+        resolved.starts_with(project) && !resolved.components().any(|c| c.as_os_str() == "vendor");
     if kind == Some("attribute") {
         // Attribute routes of project classes are read wherever they are.
-        if resource.contains('\\') && !resource.contains('/') {
-            let project = index
-                .classes_named(resource.trim_start_matches('\\'))
+        let attributes = if resource.contains('\\') && !resource.contains('/') {
+            let class = resource.trim_start_matches('\\');
+            let project = sources
+                .index
+                .classes_named(class)
                 .iter()
-                .any(|class| index.is_project_code(class.path));
-            return if project {
-                Import::Read
-            } else {
-                Import::Unknown
-            };
-        }
-        let resolved = normalize(&file.parent().unwrap_or(config).join(resource));
-        let outside = config.parent().is_none_or(|dir| !resolved.starts_with(dir))
-            || resolved.components().any(|c| c.as_os_str() == "vendor");
-        return if outside {
-            Import::Unknown
+                .any(|found| sources.index.is_project_code(found.path));
+            if !project {
+                return Import::Unknown;
+            }
+            AttributeResource::Class(class.to_string())
+        } else if in_project {
+            AttributeResource::Directory(resolved)
         } else {
+            return Import::Unknown;
+        };
+        return if prefix.is_empty() {
             Import::Read
+        } else {
+            Import::Prefixed(attributes, prefix)
         };
     }
-    if kind.is_some_and(|k| k != "yaml" && k != "directory") {
+    if !in_project || kind.is_some_and(|k| !matches!(k, "yaml" | "php" | "directory")) {
         return Import::Unknown;
     }
-    let resolved = normalize(&file.parent().unwrap_or(config).join(resource));
-    let read = files.contains(&resolved)
-        || (resolved.is_dir() && resolved.starts_with(config.join("routes")));
-    if read { Import::Read } else { Import::Unknown }
+    if resolved.is_dir() {
+        return route_files_below(&resolved)
+            .map_or(Import::Unknown, |files| Import::Files(files, prefix));
+    }
+    if resolved.is_file() && (is_yaml(&resolved) || is_php(&resolved)) {
+        Import::Files(vec![resolved], prefix)
+    } else {
+        Import::Unknown
+    }
+}
+
+/// The route files below `dir`, as Symfony's directory loader imports them, in path
+/// order and skipping hidden entries; `None` when one is a file the module does not
+/// read.
+fn route_files_below(dir: &Path) -> Option<Vec<PathBuf>> {
+    fn walk(dir: &Path, seen: &mut Vec<PathBuf>, found: &mut Vec<PathBuf>) -> bool {
+        let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if seen.contains(&real) {
+            return true;
+        }
+        seen.push(real);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.'))
+            })
+            .collect();
+        paths.sort();
+        paths.iter().all(|path| {
+            if path.is_dir() {
+                walk(path, seen, found)
+            } else if is_yaml(path) || is_php(path) {
+                found.push(path.clone());
+                true
+            } else {
+                false
+            }
+        })
+    }
+    let mut found = Vec::new();
+    walk(dir, &mut Vec::new(), &mut found).then_some(found)
+}
+
+/// Whether `path` is a PHP file.
+fn is_php(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("php"))
 }
 
 /// `path` with `.` and `..` components resolved without touching the disk.
@@ -365,8 +636,8 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// Whether `config` holds route files the module does not read: `routes.php`, or
-/// PHP or XML files below `config/routes`.
+/// Whether `config` holds route files the module does not read: XML files below
+/// `config/routes`.
 fn has_unread_route_files(config: &Path) -> bool {
     fn below(dir: &Path) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -377,11 +648,11 @@ fn has_unread_route_files(config: &Path) -> bool {
             if path.is_dir() {
                 below(&path)
             } else {
-                matches!(kind, Some("php" | "xml"))
+                matches!(kind, Some("xml"))
             }
         })
     }
-    config.join("routes.php").is_file() || below(&config.join("routes"))
+    below(&config.join("routes"))
 }
 
 /// Whether `class` declares a method named `name`.
@@ -406,11 +677,10 @@ fn has_routes(index: &Index, class: &Declaration, memo: &mut HashMap<String, boo
     let Some(shape) = &class.class else {
         return false;
     };
-    let own = !route_names(&shape.metadata).is_empty()
-        || shape
-            .members
-            .iter()
-            .any(|m| m.kind == MemberKind::Method && !route_names(&m.metadata).is_empty());
+    let own = !route_names(&shape.metadata, index, &class.fqn).is_empty()
+        || shape.members.iter().any(|m| {
+            m.kind == MemberKind::Method && !route_names(&m.metadata, index, &class.fqn).is_empty()
+        });
     let found = own
         || shape.parent.iter().chain(&shape.traits).any(|name| {
             index
@@ -423,17 +693,19 @@ fn has_routes(index: &Index, class: &Declaration, memo: &mut HashMap<String, boo
 }
 
 /// The methods of `class` as reflection lists them: its own, then those of its
-/// traits and parents that it does not redeclare, each with its file.
+/// traits and parents that it does not redeclare, each with its file and the class
+/// `self::` names in it, the declaring class or the class using the trait.
 fn methods_of<'a>(
     index: &'a Index,
     path: &Path,
     class: &'a Declaration,
-) -> Vec<(PathBuf, &'a Member)> {
-    let mut found: Vec<(PathBuf, &Member)> = Vec::new();
+) -> Vec<(PathBuf, String, &'a Member)> {
+    let mut found: Vec<(PathBuf, String, &Member)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    let mut pending: Vec<(PathBuf, &Declaration)> = vec![(path.to_path_buf(), class)];
+    let mut pending: Vec<(PathBuf, &Declaration, String)> =
+        vec![(path.to_path_buf(), class, class.fqn.clone())];
     let mut visited = 0;
-    while let Some((path, declaration)) = pending.pop() {
+    while let Some((path, declaration, owner)) = pending.pop() {
         visited += 1;
         if visited > 16 {
             break;
@@ -449,14 +721,21 @@ fn methods_of<'a>(
             let name = member.name.to_ascii_lowercase();
             if !seen.contains(&name) {
                 seen.push(name);
-                found.push((path.clone(), member));
+                found.push((path.clone(), owner.clone(), member));
             }
         }
-        // Traits first, so the parent comes off the stack last.
-        let ancestors = shape.parent.iter().chain(shape.traits.iter().rev());
-        for name in ancestors {
-            if let Some(ancestor) = index.classes_named(name).into_iter().next() {
-                pending.push((ancestor.path.to_path_buf(), ancestor.declaration));
+        // Traits last, so they come off the stack before the parent.
+        if let Some(parent) = shape
+            .parent
+            .iter()
+            .find_map(|name| index.classes_named(name).into_iter().next())
+        {
+            let owner = parent.declaration.fqn.clone();
+            pending.push((parent.path.to_path_buf(), parent.declaration, owner));
+        }
+        for name in shape.traits.iter().rev() {
+            if let Some(used) = index.classes_named(name).into_iter().next() {
+                pending.push((used.path.to_path_buf(), used.declaration, owner.clone()));
             }
         }
     }
@@ -484,34 +763,71 @@ fn controller_target(index: &Index, controller: &str) -> Option<RouteTarget> {
     })
 }
 
-/// `routes.yaml` (or `.yml`) in `config`, then every YAML file below
-/// `config/routes`, in path order.
-fn route_files(config: &Path, filter: &PathFilter) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = ["routes.yaml", "routes.yml"]
-        .iter()
-        .map(|name| config.join(name))
-        .filter(|path| path.is_file())
-        .collect();
-    let mut below = Vec::new();
-    collect_yaml(&config.join("routes"), &mut below);
-    below.sort();
-    files.extend(below);
-    files.retain(|path| filter.in_scope(path));
-    files
+/// `routes.php` in `config` when there is no `routes.yaml`, then the PHP files the
+/// kernel imports from `config/routes`.
+fn php_route_files(config: &Path, filter: &PathFilter) -> Vec<PathBuf> {
+    let main = config.join("routes.php");
+    let main = (main.is_file() && !config.join("routes.yaml").is_file()).then_some(main);
+    kernel_route_files(config, filter, main, "php")
 }
 
-fn collect_yaml(dir: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// `routes.yaml` in `config`, then the YAML files the kernel imports from
+/// `config/routes`.
+fn route_files(config: &Path, filter: &PathFilter) -> Vec<PathBuf> {
+    let main = config.join("routes.yaml");
+    kernel_route_files(config, filter, main.is_file().then_some(main), "yaml")
+}
+
+/// `main`, then the files with `extension` directly in `config/routes` and in its
+/// environment directories, as `MicroKernelTrait` imports them, each once (by real
+/// path), in path order.
+fn kernel_route_files(
+    config: &Path,
+    filter: &PathFilter,
+    main: Option<PathBuf>,
+    extension: &str,
+) -> Vec<PathBuf> {
+    let routes = config.join("routes");
+    let files_in = |dir: &Path| -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case(extension))
+            })
+            .collect();
+        found.sort();
+        found
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_yaml(&path, found);
-        } else if is_yaml(&path) {
-            found.push(path);
-        }
+    let mut environments: Vec<PathBuf> = std::fs::read_dir(&routes)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    environments.sort();
+    let mut files: Vec<PathBuf> = main.into_iter().collect();
+    files.extend(files_in(&routes));
+    for environment in &environments {
+        files.extend(files_in(environment));
     }
+    let mut seen: Vec<PathBuf> = Vec::new();
+    files.retain(|path| {
+        let real = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if seen.contains(&real) {
+            return false;
+        }
+        seen.push(real);
+        filter.in_scope(path)
+    });
+    files
 }
 
 /// The name Symfony gives the `index`-th unnamed route of `method` (from 0):
