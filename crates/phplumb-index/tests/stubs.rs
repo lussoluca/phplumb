@@ -438,3 +438,33 @@ fn an_empty_stub_directory_is_read_again() {
         vec![stubs.join("x.php")]
     );
 }
+
+#[test]
+fn polyfill_references_are_empty() {
+    let mut index = build(&DiscoverOptions::default());
+    let (path, source, offset) = at(POLYFILL, "Stringable", 0);
+
+    assert!(index.references(&path, &source, offset, false).is_empty());
+}
+
+#[test]
+fn project_classes_with_built_in_names_keep_their_references() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let declaration = root.join("src/Stringable.php");
+    let source = "<?php\nclass Stringable {}\n";
+    std::fs::write(&declaration, source).unwrap();
+    std::fs::write(
+        root.join("src/Uses.php"),
+        "<?php\nfunction uses(\\Stringable $s): void {}\n",
+    )
+    .unwrap();
+    let (mut index, _) = Index::build(&root, &DiscoverOptions::default()).unwrap();
+    let offset = source.find("Stringable").unwrap() as u32;
+
+    let found = index.references(&declaration, source.as_bytes(), offset, false);
+
+    let paths: Vec<PathBuf> = found.into_iter().map(|l| l.path).collect();
+    assert_eq!(paths, vec![root.join("src/Uses.php")]);
+}

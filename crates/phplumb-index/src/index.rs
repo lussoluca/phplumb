@@ -391,7 +391,9 @@ impl Index {
         targets.retain(|target| !self.is_stub(&target.path));
         let mut found: Vec<Location> = Vec::new();
         for target in &targets {
-            if let Some(symbol) = self.symbol_at(target) {
+            if let Some(symbol) = self.symbol_at(target)
+                && self.name_resolves_to(&symbol, target)
+            {
                 found.extend(references::scan(self, &symbol));
             }
         }
@@ -403,6 +405,25 @@ impl Index {
         });
         found.dedup();
         found
+    }
+
+    /// Whether the name of a class, function or constant `symbol` leads to `target`.
+    /// A polyfill of a built-in name loses to its stub, so no use reaches it.
+    fn name_resolves_to(&self, symbol: &Symbol, target: &Location) -> bool {
+        let (kind, fqn) = match symbol {
+            Symbol::Class(fqn) => (SymbolKind::Class, fqn),
+            Symbol::Function(fqn) => (SymbolKind::Function, fqn),
+            Symbol::Constant(fqn) => (SymbolKind::Constant, fqn),
+            Symbol::Member { .. } => return true,
+        };
+        let (holder, entries) = self.entries(kind, &symbol_key(kind, fqn));
+        std::ptr::eq(holder, self)
+            && entries.iter().any(|entry| {
+                entry.start == target.start
+                    && self.files[entry.file as usize]
+                        .as_ref()
+                        .is_some_and(|file| file.path == target.path)
+            })
     }
 
     /// The rules deciding which files belong to the index.
