@@ -2097,9 +2097,12 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         types
     }
 
-    fn function_returns(&self, function: &Expression<'_>) -> TypeExpr {
+    /// What calling `function` returns: a named function's return type, or for any
+    /// other callee, what its object's `__invoke()` returns.
+    fn function_returns(&self, function: &Expression<'_>, at: u32, depth: u32) -> TypeExpr {
         let Expression::Identifier(identifier) = function else {
-            return TypeExpr::Other;
+            let callee = self.expr(function, at, depth);
+            return self.member_type(&callee, MemberKind::Method, "__invoke", None);
         };
         let Some(name) = self
             .names
@@ -2378,7 +2381,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     /// functions keep, or the declared return type.
     fn function_call(&self, call: &FunctionCall<'_>, at: u32, depth: u32) -> TypeExpr {
         let Some(function) = self.builtin_function(call.function) else {
-            return self.function_returns(call.function);
+            return self.function_returns(call.function, at, depth);
         };
         let first = || {
             positional(&call.argument_list, 0)
@@ -2398,7 +2401,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 };
                 hint.map_or(TypeExpr::Other, |hint| array_of(self.hint_type(&hint.hint)))
             }
-            _ => self.function_returns(call.function),
+            _ => self.function_returns(call.function, at, depth),
         }
     }
 

@@ -132,6 +132,11 @@ fn run_with(name: &str, query: impl Fn(&mut Index, &Path, &[u8], u32) -> Vec<Loc
 }
 
 #[test]
+fn calls() {
+    run_fixture("calls");
+}
+
+#[test]
 fn names() {
     run_fixture("names");
 }
