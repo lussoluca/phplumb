@@ -2,6 +2,10 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-29, batch D framework projects
+
+Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #22, #23, #27 and #28. Neither reference project links a module from outside its framework project, so every member access keeps the same targets on both builds, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged. The Drupal warm start measured 1.36 s (1.32 s on `main`) and the update of 1,000 files 0.22 s on both.
+
 ## 2026-10-29, batch C2 generic and element types
 
 Same machine and checkouts, measured with this branch and with `main` back to back, twice each. The batch fixes issues #11, #15, #17, #18, #19 and #20.
