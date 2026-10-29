@@ -208,8 +208,13 @@ impl Index {
         let filter = PathFilter::for_frameworks(dir, &opts, &[])?;
         let mut paths: Vec<PathBuf> = Vec::new();
         let mut pending = vec![filter.root().to_path_buf()];
+        std::fs::read_dir(filter.root())?;
         while let Some(next) = pending.pop() {
-            for entry in std::fs::read_dir(&next)?.flatten() {
+            // An unreadable directory leaves out only its own files.
+            let Ok(entries) = std::fs::read_dir(&next) else {
+                continue;
+            };
+            for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     pending.push(path);
@@ -235,7 +240,9 @@ impl Index {
             stubs: None,
             framework_files: BTreeSet::new(),
         };
-        for file in read_files_with(&paths, crate::stubs::summarize_stub) {
+        // Finding references never reads the stubs, so they need no candidates.
+        for mut file in read_files_with(&paths, crate::stubs::summarize_stub) {
+            file.ref_keys = Vec::new();
             index.insert(file);
         }
         // A name the stubs declare in several files, such as `Ds\Map` in `ds` and
@@ -1246,13 +1253,7 @@ impl Index {
         declarations: bool,
     ) -> Vec<Location> {
         let found = self.resolve(path, source, offset, declarations);
-        let mut stale: Vec<PathBuf> = found
-            .iter()
-            .filter(|(location, name)| !holds_name(location, name))
-            .map(|(location, _)| location.path.clone())
-            .collect();
-        stale.sort();
-        stale.dedup();
+        let stale = self.stale_paths(&found);
         if stale.is_empty() {
             return found.into_iter().map(|(location, _)| location).collect();
         }
@@ -1261,6 +1262,20 @@ impl Index {
             .into_iter()
             .map(|(location, _)| location)
             .collect()
+    }
+
+    /// The files of `found` that no longer hold the expected name at the target's
+    /// range, sorted, each once. Stub files never change, and some of their names,
+    /// such as constants declared with `define()`, never sit at their range.
+    fn stale_paths(&self, found: &[(Location, String)]) -> Vec<PathBuf> {
+        let mut stale: Vec<PathBuf> = found
+            .iter()
+            .filter(|(location, name)| !self.is_stub(&location.path) && !holds_name(location, name))
+            .map(|(location, _)| location.path.clone())
+            .collect();
+        stale.sort();
+        stale.dedup();
+        stale
     }
 
     /// Implementations of what the cursor is on. On a class-like, declared or
@@ -1291,13 +1306,7 @@ impl Index {
             found
         };
         let found = compute(self);
-        let mut stale: Vec<PathBuf> = found
-            .iter()
-            .filter(|(location, name)| !holds_name(location, name))
-            .map(|(location, _)| location.path.clone())
-            .collect();
-        stale.sort();
-        stale.dedup();
+        let stale = self.stale_paths(&found);
         if stale.is_empty() {
             return found.into_iter().map(|(location, _)| location).collect();
         }
@@ -2070,4 +2079,51 @@ fn read_files_with(paths: &[PathBuf], summarize_with: fn(&[u8]) -> FileSummary) 
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn empty_project() -> (TempDir, Index) {
+        let dir = TempDir::new().unwrap();
+        let (index, _) = Index::build(dir.path(), &DiscoverOptions::default()).unwrap();
+        (dir, index)
+    }
+
+    #[test]
+    fn stub_locations_are_never_stale() {
+        let (_dir, index) = empty_project();
+        let stubs = index.stubs.as_ref().expect("the default stubs");
+        let key = symbol_key(SymbolKind::Constant, "pcov\\all");
+        let entry = lookup(&stubs.constants, &key)
+            .first()
+            .expect("pcov\\all in the stubs");
+        let path = stubs.files[entry.file as usize]
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        let location = Location {
+            path,
+            start: entry.start,
+            end: entry.end,
+        };
+        assert!(!holds_name(&location, "all"));
+
+        assert!(
+            index
+                .stale_paths(&[(location, "all".to_string())])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stub_index_has_no_candidates() {
+        let (_dir, index) = empty_project();
+        let stubs = index.stubs.as_ref().expect("the default stubs");
+
+        assert!(stubs.candidates.is_empty());
+    }
 }

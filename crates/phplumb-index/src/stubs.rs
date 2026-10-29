@@ -38,24 +38,25 @@ pub fn default_dir() -> Option<PathBuf> {
         .find(|dir| dir.is_dir())
 }
 
-/// The index of the stubs in `dir`, built once per process and directory; none when
-/// the directory holds no PHP file.
+/// The index of the stubs in `dir`, kept for the process once it is built; none when
+/// the directory cannot be read or holds no PHP file, which the next call tries
+/// again.
 pub(crate) fn load(dir: &Path) -> Option<Arc<Index>> {
-    static LOADED: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<Index>>>>> = OnceLock::new();
+    static LOADED: OnceLock<Mutex<HashMap<PathBuf, Arc<Index>>>> = OnceLock::new();
     let dir = dir.canonicalize().ok()?;
     let mut loaded = LOADED
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    loaded
-        .entry(dir.clone())
-        .or_insert_with(|| {
-            Index::build_stubs(&dir)
-                .ok()
-                .filter(|index| index.declarations().next().is_some())
-                .map(Arc::new)
-        })
-        .clone()
+    if let Some(index) = loaded.get(&dir) {
+        return Some(Arc::clone(index));
+    }
+    let index = Index::build_stubs(&dir)
+        .ok()
+        .filter(|index| index.declarations().next().is_some())
+        .map(Arc::new)?;
+    loaded.insert(dir, Arc::clone(&index));
+    Some(index)
 }
 
 /// The summary of a stub file as PHP `PHP_VERSION` has it: declarations it lacks
