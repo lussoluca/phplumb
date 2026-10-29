@@ -34,9 +34,9 @@ use mago_syntax::cst::{
     ClassLikeConstantSelector, ClassLikeMemberSelector, Closure, CompositeString, DoWhile,
     Expression, For, Foreach, ForeachTarget, Function, FunctionCall, FunctionLikeParameterList,
     Global, Hint, If, IfBody, InterpolatedString, KeyValueArrayElement, Literal, LiteralString,
-    Method, MethodCall, NullSafeMethodCall, NullSafePropertyAccess, PartialArgument, Program,
-    PropertyAccess, Static, StaticItem, StaticMethodCall, StringPart, Switch, TriviaKind, Try,
-    TryCatchClause, Variable, While,
+    Match, MatchArm, Method, MethodCall, NullSafeMethodCall, NullSafePropertyAccess,
+    PartialArgument, Program, PropertyAccess, Static, StaticItem, StaticMethodCall, StringPart,
+    Switch, TriviaKind, Try, TryCatchClause, Variable, While,
 };
 use mago_syntax::parser::parse_file_content;
 use mago_syntax::walker::Walker;
@@ -1437,6 +1437,35 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
                 var,
                 class,
             });
+        }
+    }
+
+    /// In `match (true)`, an arm with one condition narrows its expression as an
+    /// `if` with that condition narrows its body.
+    fn walk_in_match(&self, r#match: &'ast Match<'arena>, f: &mut Facts<'ast, 'arena>) {
+        if !matches!(r#match.expression, Expression::Literal(Literal::True(_))) {
+            return;
+        }
+        for arm in r#match.arms.iter() {
+            let MatchArm::Expression(arm) = arm else {
+                continue;
+            };
+            let [condition] = arm.conditions.as_slice() else {
+                continue;
+            };
+            let mut checks = Vec::new();
+            instanceof_checks(condition, &mut checks);
+            // From the arrow, so the narrowing comes before the arm's first use.
+            let start = arm.arrow.start.offset;
+            let end = arm.expression.span().end.offset;
+            for (var, class) in checks {
+                f.narrowings.push(NarrowFact {
+                    start,
+                    end,
+                    var,
+                    class,
+                });
+            }
         }
     }
 
