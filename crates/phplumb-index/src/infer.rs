@@ -1667,6 +1667,30 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         self.summary.enclosing_class(at).and_then(|c| c.fqn.clone())
     }
 
+    /// `parent`, the parent of the class around `at`, written with the arguments the
+    /// class's `@extends` gives it.
+    fn parent_type(&self, parent: String, at: u32) -> TypeExpr {
+        let args = self.enclosing(at).and_then(|class| {
+            self.summary
+                .declarations
+                .iter()
+                .find(|d| d.fqn == class)?
+                .class
+                .as_ref()?
+                .generic_supertypes
+                .iter()
+                .find(|(supertype, _)| supertype.eq_ignore_ascii_case(&parent))
+                .map(|(_, args)| args.clone())
+        });
+        match args {
+            Some(args) if !args.is_empty() => TypeExpr::Generic {
+                class: parent,
+                args,
+            },
+            _ => TypeExpr::Named(parent),
+        }
+    }
+
     fn enclosing_parent(&self, at: u32) -> Option<String> {
         self.summary.enclosing_class(at)?.parent.clone()
     }
@@ -1774,7 +1798,10 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     }
                     _ => None,
                 };
-                let receiver = TypeExpr::Named(class);
+                let receiver = match call.class {
+                    Expression::Parent(_) => self.parent_type(class, at),
+                    _ => TypeExpr::Named(class),
+                };
                 self.method_call(
                     &receiver,
                     &call.method,

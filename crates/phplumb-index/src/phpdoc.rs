@@ -61,7 +61,8 @@ pub struct DocBlock {
     /// `@template` names, resolved like class names so that they equal the
     /// `Named` types the class's members carry.
     pub templates: Vec<String>,
-    /// The generic types of `@extends` and `@implements`, as class and arguments.
+    /// The generic types of `@extends`, `@implements` and `@use`, as class and
+    /// arguments.
     pub generic_supertypes: Vec<(String, Vec<TypeExpr>)>,
 }
 
@@ -772,7 +773,12 @@ pub fn parse_docblock(text: &str, names: &dyn NameContext) -> DocBlock {
                     templates.push(name);
                 }
             }
-            "extends" | "implements" | "template-extends" | "template-implements" => {
+            "extends"
+            | "implements"
+            | "use"
+            | "template-extends"
+            | "template-implements"
+            | "template-use" => {
                 if let TypeExpr::Generic { class, args } = parse_type(type_text, names) {
                     target.generic_supertypes.push((class, args));
                 }
