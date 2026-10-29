@@ -26,7 +26,7 @@ PHPlumb is built for that review loop. It has its own engine, written in Rust, a
 - **Call hierarchy** with incoming and outgoing calls, and **type hierarchy** with supertypes and subtypes.
 - **Hover** with the resolved type, the signature and the docblock.
 - **Symbol search** across the workspace (Cmd+T) and the outline of the current file.
-- **Broken reference diagnostics.** Classes, functions, methods and constants that exist nowhere are flagged in project code, so code an agent invented stands out. A warning on working code is a bug.
+- **Broken reference diagnostics.** Classes, functions, methods and constants that exist nowhere are flagged in project code, so code an agent invented stands out. A warning on working code is a bug. Members of PHP's built-in classes are never flagged, since the stubs describe one PHP version, except on `UnitEnum` and `BackedEnum`, whose members PHP fixes.
 
 Agents edit files outside the editor, often many at once. PHPlumb follows changes on disk, including a branch switch, without you opening the files. The index is cached, so reopening a project skips files that did not change.
 

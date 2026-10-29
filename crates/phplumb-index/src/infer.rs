@@ -30,13 +30,13 @@ use mago_span::HasSpan;
 use mago_syntax::comments::docblock::get_docblock_before_position;
 use mago_syntax::cst::{
     Access, AnonymousClass, Argument, ArgumentList, ArrayElement, ArrowFunction, Assignment,
-    AssignmentOperator, Attribute, Binary, BinaryOperator, Call, ClassLikeConstantSelector,
-    ClassLikeMemberSelector, Closure, CompositeString, DoWhile, Expression, For, Foreach,
-    ForeachTarget, Function, FunctionCall, FunctionLikeParameterList, Global, Hint, If, IfBody,
-    InterpolatedString, KeyValueArrayElement, Literal, LiteralString, Method, MethodCall,
-    NullSafeMethodCall, NullSafePropertyAccess, PartialArgument, Program, PropertyAccess, Static,
-    StaticItem, StaticMethodCall, StringPart, Switch, TriviaKind, Try, TryCatchClause, Variable,
-    While,
+    AssignmentOperator, Attribute, Binary, BinaryOperator, Call, ClassConstantAccess,
+    ClassLikeConstantSelector, ClassLikeMemberSelector, Closure, CompositeString, DoWhile,
+    Expression, For, Foreach, ForeachTarget, Function, FunctionCall, FunctionLikeParameterList,
+    Global, Hint, If, IfBody, InterpolatedString, KeyValueArrayElement, Literal, LiteralString,
+    Method, MethodCall, NullSafeMethodCall, NullSafePropertyAccess, PartialArgument, Program,
+    PropertyAccess, Static, StaticItem, StaticMethodCall, StringPart, Switch, TriviaKind, Try,
+    TryCatchClause, Variable, While,
 };
 use mago_syntax::parser::parse_file_content;
 use mago_syntax::walker::Walker;
@@ -104,6 +104,7 @@ pub(crate) fn member_at(
     let access = facts
         .accesses
         .iter()
+        .chain(&facts.variable_statics)
         .find(|a| a.start <= offset && offset <= a.end)?;
     let ctx = Ctx::new(index, path, summary, program, source, &facts);
     let receiver = match ctx.anonymous_this(access.object, access.start) {
@@ -672,7 +673,7 @@ pub(crate) fn calls_named(
                 CallRef::Method(c) => ctx.expr(c.object, start, 0),
                 CallRef::NullSafe(c) => ctx.expr(c.object, start, 0),
                 CallRef::Static(c) => ctx
-                    .class_of(c.class, start)
+                    .class_of(c.class, start, 0)
                     .map_or(TypeExpr::Other, TypeExpr::Named),
             };
             let caller =
@@ -1079,6 +1080,9 @@ struct Facts<'ast, 'arena> {
     narrowings: Vec<NarrowFact>,
     branches: Vec<BranchFact>,
     callbacks: Vec<CallbackFact<'ast, 'arena>>,
+    /// Static calls and constants reached through a variable, such as
+    /// `$severity::from()`, with the variable as the object; navigation reads them.
+    variable_statics: Vec<AccessFact<'arena>>,
     /// Every direct variable: name without `$`, start, end.
     variables: Vec<(String, u32, u32)>,
 }
@@ -1188,6 +1192,42 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
         f: &mut Facts<'ast, 'arena>,
     ) {
         f.access(access.object, &access.property, MemberKind::Property);
+    }
+
+    fn walk_in_static_method_call(
+        &self,
+        call: &'ast StaticMethodCall<'arena>,
+        f: &mut Facts<'ast, 'arena>,
+    ) {
+        if let (Expression::Variable(_), ClassLikeMemberSelector::Identifier(name)) =
+            (call.class, &call.method)
+        {
+            f.variable_statics.push(AccessFact {
+                start: name.span.start.offset,
+                end: name.span.end.offset,
+                kind: MemberKind::Method,
+                name: String::from_utf8_lossy(name.value).into_owned(),
+                object: call.class,
+            });
+        }
+    }
+
+    fn walk_in_class_constant_access(
+        &self,
+        access: &'ast ClassConstantAccess<'arena>,
+        f: &mut Facts<'ast, 'arena>,
+    ) {
+        if let (Expression::Variable(_), ClassLikeConstantSelector::Identifier(name)) =
+            (access.class, &access.constant)
+        {
+            f.variable_statics.push(AccessFact {
+                start: name.span.start.offset,
+                end: name.span.end.offset,
+                kind: MemberKind::Constant,
+                name: String::from_utf8_lossy(name.value).into_owned(),
+                object: access.class,
+            });
+        }
     }
 
     fn walk_in_method(&self, method: &'ast Method<'arena>, f: &mut Facts<'ast, 'arena>) {
@@ -1621,7 +1661,9 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     }
 
     /// The class an expression before `::` or after `new` names.
-    fn class_of(&self, expression: &Expression<'_>, at: u32) -> Option<String> {
+    /// The class `expression` names before `::`: a class name, `self`, `static` or
+    /// `parent`, or a variable holding an object of one class.
+    fn class_of(&self, expression: &Expression<'_>, at: u32, depth: u32) -> Option<String> {
         match expression {
             Expression::Identifier(identifier) => self
                 .names
@@ -1630,6 +1672,14 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 .map(|n| n.fqn.clone()),
             Expression::Self_(_) | Expression::Static(_) => self.enclosing(at),
             Expression::Parent(_) => self.enclosing_parent(at),
+            Expression::Variable(Variable::Direct(variable)) => match self.var(
+                &variable_name(variable.name),
+                variable.span.start.offset,
+                depth + 1,
+            ) {
+                TypeExpr::Named(class) | TypeExpr::Tagged { class, .. } => Some(class),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1649,7 +1699,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             Expression::Clone(clone) => self.expr(clone.object, at, depth),
             Expression::Assignment(assignment) => self.expr(assignment.rhs, at, depth),
             Expression::Instantiation(instantiation) => self
-                .class_of(instantiation.class, at)
+                .class_of(instantiation.class, at, depth)
                 .map_or(TypeExpr::Other, TypeExpr::Named),
             Expression::Binary(binary) if binary.operator.is_null_coalesce() => union(vec![
                 self.expr(binary.lhs, at, depth),
@@ -1668,7 +1718,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 self.method_call(&receiver, &call.method, &call.argument_list, at, None)
             }
             Expression::Call(Call::StaticMethod(call)) => {
-                let Some(class) = self.class_of(call.class, at) else {
+                let Some(class) = self.class_of(call.class, at, depth) else {
                     return TypeExpr::Other;
                 };
                 // `self::`, `static::` and `parent::` forward late static binding to
@@ -1702,7 +1752,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 None,
             ),
             Expression::Access(Access::StaticProperty(access)) => {
-                match (self.class_of(access.class, at), &access.property) {
+                match (self.class_of(access.class, at, depth), &access.property) {
                     (Some(class), Variable::Direct(variable)) => self.member_type(
                         &TypeExpr::Named(class),
                         MemberKind::Property,
@@ -1716,7 +1766,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 offset_type(self.index, &self.expr(access.array, at, depth))
             }
             Expression::Access(Access::ClassConstant(access)) => {
-                match (self.class_of(access.class, at), &access.constant) {
+                match (self.class_of(access.class, at, depth), &access.constant) {
                     (Some(class), ClassLikeConstantSelector::Identifier(name)) => {
                         self.enum_case(&class, &String::from_utf8_lossy(name.value))
                     }
@@ -1729,10 +1779,20 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
 
     /// The enum that declares case `name` reached from `class`; any other constant
     /// has no type.
+    /// In a trait that does not declare the case, `self::` reaches the cases of the
+    /// classes using the trait.
     fn enum_case(&self, class: &str, name: &str) -> TypeExpr {
+        let mut found = self.index.find_member(class, MemberKind::Constant, name);
+        if found.is_empty() && self.index.is_trait(class) {
+            found = self
+                .index
+                .trait_users(class)
+                .iter()
+                .flat_map(|user| self.index.find_member(user, MemberKind::Constant, name))
+                .collect();
+        }
         union(
-            self.index
-                .find_member(class, MemberKind::Constant, name)
+            found
                 .into_iter()
                 .filter(|(_, member)| member.kind == MemberKind::EnumCase)
                 .map(|(found, _)| TypeExpr::Named(found.declaration.fqn.clone()))
@@ -1865,7 +1925,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             CallRef::Method(c) => (self.expr(c.object, start, 0), &c.method),
             CallRef::NullSafe(c) => (self.expr(c.object, start, 0), &c.method),
             CallRef::Static(c) => (
-                self.class_of(c.class, start)
+                self.class_of(c.class, start, 0)
                     .map_or(TypeExpr::Other, TypeExpr::Named),
                 &c.method,
             ),
@@ -1917,7 +1977,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 ClassLikeConstantSelector::Identifier(name)
                     if name.value.eq_ignore_ascii_case(b"class") =>
                 {
-                    self.class_of(access.class, at)
+                    self.class_of(access.class, at, 0)
                 }
                 _ => None,
             },

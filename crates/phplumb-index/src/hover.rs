@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::index::{Index, Location};
 use crate::infer;
 use crate::phpdoc::{TypeExpr, parse_docblock};
+use crate::stubs::summarize_stub;
 use crate::summary::{FileSummary, Member, MemberKind, summarize};
 
 /// Markdown for the word at `start..end`.
@@ -32,10 +33,10 @@ pub(crate) fn hover(index: &mut Index, path: &Path, source: &[u8], offset: u32) 
             markdown: code(&format!("{} ${name}", display(&ty))),
         });
     }
-    let blocks: Vec<String> = index
-        .targets(path, source, offset)
+    let targets = index.targets(path, source, offset);
+    let blocks: Vec<String> = targets
         .iter()
-        .filter_map(describe)
+        .filter_map(|target| describe(index, target))
         .collect();
     (!blocks.is_empty()).then(|| Hover {
         start,
@@ -45,10 +46,14 @@ pub(crate) fn hover(index: &mut Index, path: &Path, source: &[u8], offset: u32) 
 }
 
 /// The signature and docblock summary of the declaration at `target`, read from its
-/// file, since the index keeps neither.
-fn describe(target: &Location) -> Option<String> {
+/// file, since the index keeps neither. A stub file is read as the index read it.
+fn describe(index: &Index, target: &Location) -> Option<String> {
     let text = std::fs::read(&target.path).ok()?;
-    let summary = summarize(&text);
+    let summary = if index.is_stub(&target.path) {
+        summarize_stub(&text)
+    } else {
+        summarize(&text)
+    };
     for declaration in &summary.declarations {
         if declaration.name_start == target.start {
             return Some(block(

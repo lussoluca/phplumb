@@ -83,6 +83,18 @@ fn enum_interfaces_include_the_implicit_ones() {
 }
 
 #[test]
+fn implicit_interfaces_are_listed_once() {
+    assert_eq!(
+        interfaces("<?php enum S implements \\UnitEnum {}", "S"),
+        ["UnitEnum"]
+    );
+    assert_eq!(
+        interfaces("<?php enum B: int implements \\BackedEnum {}", "B"),
+        ["BackedEnum", "UnitEnum"]
+    );
+}
+
+#[test]
 fn backed_enum_members_open_their_stub() {
     let mut index = build();
     for (needle, name) in [
@@ -150,4 +162,81 @@ fn self_cases_resolve_inside_the_enum() {
 fn class_constants_get_no_enum_type() {
     let mut index = build();
     assert!(definition(&mut index, "app/Uses.php", "label();", 3).is_empty());
+}
+
+#[test]
+fn static_cases_resolve_inside_the_enum() {
+    let mut index = build();
+    let found = definition(&mut index, "app/Severity.php", "label();", 1);
+    assert_eq!(described(&index, &found), label());
+}
+
+#[test]
+fn pure_enum_cases_have_no_value() {
+    let mut index = build();
+    assert!(definition(&mut index, "app/Uses.php", "value; // pure", 0).is_empty());
+}
+
+#[test]
+fn this_cases_resolve() {
+    let mut index = build();
+    let found = definition(&mut index, "app/Severity.php", "label();", 2);
+    assert_eq!(described(&index, &found), label());
+}
+
+#[test]
+fn variable_classes_resolve() {
+    let mut index = build();
+    let found = definition(&mut index, "app/Uses.php", "label();", 4);
+    assert_eq!(described(&index, &found), label());
+}
+
+#[test]
+fn string_class_names_give_nothing() {
+    let mut index = build();
+    assert!(definition(&mut index, "app/Uses.php", "label();", 5).is_empty());
+}
+
+#[test]
+fn trait_self_cases_reach_the_using_enums() {
+    let mut index = build();
+    let found = definition(&mut index, "app/Labels.php", "label();", 0);
+    assert_eq!(described(&index, &found), label());
+    let case = definition(&mut index, "app/Labels.php", "Low", 0);
+    assert_eq!(described(&index, &case), [pair("app/Severity.php", "Low")]);
+}
+
+#[test]
+fn trait_cycles_through_duplicate_names_end() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    for (file, source) in [
+        (
+            "app/TA.php",
+            "<?php\ntrait A { public function go() { return self::Low->label(); } }\n",
+        ),
+        ("app/CA.php", "<?php\nclass A { use B; }\n"),
+        ("app/TB.php", "<?php\ntrait B {}\n"),
+        ("app/CB.php", "<?php\nclass B { use A; }\n"),
+    ] {
+        std::fs::write(root.join(file), source).unwrap();
+    }
+    let (mut index, _) = Index::build(&root, &DiscoverOptions::default()).unwrap();
+    let path = root.join("app/TA.php");
+    let source = std::fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source).find("label").unwrap() as u32;
+
+    assert!(index.definition(&path, &source, offset).is_empty());
+}
+
+#[test]
+fn members_after_variable_classes_resolve() {
+    let mut index = build();
+    let from = definition(&mut index, "app/Uses.php", "from('low')->label();", 1);
+    assert_eq!(described(&index, &from), [pair("Core/Core_c.php", "from")]);
+    let case = definition(&mut index, "app/Severity.php", "Low->label();", 2);
+    assert_eq!(described(&index, &case), [pair("app/Severity.php", "Low")]);
+    let (path, source, offset) = at("app/Uses.php", "from('low')->label();", 1);
+    assert!(index.hover(&path, &source, offset).is_some());
 }

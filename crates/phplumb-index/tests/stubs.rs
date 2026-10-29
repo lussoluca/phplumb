@@ -438,3 +438,119 @@ fn an_empty_stub_directory_is_read_again() {
         vec![stubs.join("x.php")]
     );
 }
+
+#[test]
+fn polyfill_references_are_empty() {
+    let mut index = build(&DiscoverOptions::default());
+    let (path, source, offset) = at(POLYFILL, "Stringable", 0);
+
+    assert!(index.references(&path, &source, offset, false).is_empty());
+}
+
+#[test]
+fn project_classes_with_built_in_names_keep_their_references() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let declaration = root.join("src/Stringable.php");
+    let source = "<?php\nclass Stringable {}\n";
+    std::fs::write(&declaration, source).unwrap();
+    std::fs::write(
+        root.join("src/Uses.php"),
+        "<?php\nfunction uses(\\Stringable $s): void {}\n",
+    )
+    .unwrap();
+    let (mut index, _) = Index::build(&root, &DiscoverOptions::default()).unwrap();
+    let offset = source.find("Stringable").unwrap() as u32;
+
+    let found = index.references(&declaration, source.as_bytes(), offset, false);
+
+    let paths: Vec<PathBuf> = found.into_iter().map(|l| l.path).collect();
+    assert_eq!(paths, vec![root.join("src/Uses.php")]);
+}
+
+#[test]
+fn hover_shows_language_level_types() {
+    let mut index = build(&DiscoverOptions::default());
+    let (path, source, offset) = at("app/Uses.php", "modify", 0);
+    let hover = index.hover(&path, &source, offset).expect("a hover");
+    assert!(
+        hover
+            .markdown
+            .contains("DateTimeImmutable::modify(string $modifier): DateTimeImmutable"),
+        "{}",
+        hover.markdown
+    );
+    assert!(!hover.markdown.contains("#["), "{}", hover.markdown);
+}
+
+#[test]
+fn stub_signatures_keep_one_type() {
+    let source = stub(
+        "class C {\n\
+         public function f(#[LanguageLevelTypeAware(['8.0' => 'int'], default: '')] int $a, #[\\SensitiveParameter] $b) {}\n\
+         }\n",
+    );
+    let summary = summarize_stub(source.as_bytes());
+    let f = methods(class(&summary.declarations, "C"), "f")[0];
+    assert_eq!(f.signature, "public function f(int $a, $b)");
+}
+
+#[test]
+fn stub_functions_show_language_level_types() {
+    let source = stub(
+        "#[LanguageLevelTypeAware(['8.0' => 'string'], default: 'string|false')]\n\
+         function g(#[LanguageLevelTypeAware(['8.0' => 'array'], default: '')] $list) {}\n",
+    );
+    let summary = summarize_stub(source.as_bytes());
+    let g = summary
+        .declarations
+        .iter()
+        .find(|d| d.fqn == "g")
+        .expect("function g");
+    assert_eq!(g.signature, "function g(array $list): string");
+}
+
+fn stub_function(source: &str, name: &str) -> String {
+    summarize_stub(source.as_bytes())
+        .declarations
+        .into_iter()
+        .find(|d| d.fqn == name)
+        .unwrap_or_else(|| panic!("no function {name}"))
+        .signature
+}
+
+#[test]
+fn stub_signatures_drop_parameters_php_85_lacks() {
+    let source = stub(
+        "function parse_str(string $string, #[PhpStormStubsElementAvailable(from: '5.3', to: '7.4')] &$result = [], #[PhpStormStubsElementAvailable(from: '8.0')] &$result): void {}\n",
+    );
+    assert_eq!(
+        stub_function(&source, "parse_str"),
+        "function parse_str(string $string, &$result): void"
+    );
+    let last = stub(
+        "function close(#[PhpStormStubsElementAvailable(to: '7.4')] $handle = null): void {}\n",
+    );
+    assert_eq!(stub_function(&last, "close"), "function close(): void");
+}
+
+#[test]
+fn stub_signatures_read_aliased_attributes() {
+    let source = "<?php\n\
+use JetBrains\\PhpStorm\\Internal\\LanguageLevelTypeAware as LanguageAware;\n\
+use JetBrains\\PhpStorm\\Internal\\PhpStormStubsElementAvailable as ElementAvailable;\n\
+function h(#[LanguageAware(['8.0' => 'string'], default: '')] $locale, #[ElementAvailable(to: '7.4')] $old) {}\n";
+    assert_eq!(stub_function(source, "h"), "function h(string $locale)");
+}
+
+#[test]
+fn stub_signatures_read_every_attribute_of_a_parameter() {
+    let source = stub(
+        "function q(#[LanguageLevelTypeAware(['8.0' => 'string'], default: '')] #[\\SensitiveParameter] $expression, $x = '#[y]') {}\n",
+    );
+    assert_eq!(
+        stub_function(&source, "q"),
+        "function q(string $expression, $x = '#[y]')"
+    );
+}

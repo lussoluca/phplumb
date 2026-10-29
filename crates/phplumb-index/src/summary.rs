@@ -598,14 +598,17 @@ pub fn summarize(source: &[u8]) -> FileSummary {
                             .collect();
                     }
                 }
+                let mut interfaces: Vec<String> =
+                    shape.interfaces.into_iter().filter_map(fqn_at).collect();
+                // PHP adds an enum's interfaces itself; a stub may also name them.
+                for implicit in shape.implicit {
+                    if !interfaces.iter().any(|i| i.eq_ignore_ascii_case(implicit)) {
+                        interfaces.push(implicit.to_string());
+                    }
+                }
                 ClassShape {
                     parent: shape.parent.and_then(fqn_at),
-                    interfaces: shape
-                        .interfaces
-                        .into_iter()
-                        .filter_map(fqn_at)
-                        .chain(shape.implicit.iter().map(|name| name.to_string()))
-                        .collect(),
+                    interfaces,
                     traits: shape.traits.into_iter().filter_map(fqn_at).collect(),
                     magic: documented_magic || members.iter().any(handles_calls),
                     aliases: shape.aliases,
