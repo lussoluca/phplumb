@@ -8,13 +8,15 @@ Same machine and checkouts, measured with this branch and with `main` back to ba
 
 | Metric                    | Drupal reference                  | Symfony reference                   |
 | ------------------------- | --------------------------------- | ----------------------------------- |
-| Member coverage           | 42,760 (42,731 on `main`)         | 13,147 of 13,211 (13,126 on `main`) |
+| Member coverage           | 42,805 (42,731 on `main`)         | 13,147 of 13,211 (13,126 on `main`) |
 | Warm start from the cache | 1.37 to 1.41 s (1.31 to 1.36 s)   | 0.19 s (0.20 to 0.22 s)             |
 | Update of one file        | 95 to 96 ms (96 to 104 ms)        | 20 to 21 ms (21 to 27 ms)           |
 | Update of 1,000 files     | 0.23 to 0.28 s (0.22 to 0.23 s)   | 82 to 92 ms (81 to 83 ms)           |
 | Peak resident memory      | 677 to 684 MB (675 to 679 MB)     | 270 to 274 MB (257 to 269 MB)       |
 | All cases                 | 85 passed, 9 failed, as on `main` | 31 passed, 0 failed, as on `main`   |
 | Diagnostics               | 94, the same entries as on `main` | 0, as on `main`                     |
+
+A per-access comparison with `main` on both projects finds no target lost or changed. The 74 Drupal gains include closures given to `Crawler::each()`, variables destructured from shapes, and conditional return types such as `access(..., TRUE)`; the coverage row was measured after the final review's fixes.
 
 ## 2026-10-29, batch C1 call types
 
