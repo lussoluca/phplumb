@@ -205,3 +205,27 @@ fn trait_self_cases_reach_the_using_enums() {
     let case = definition(&mut index, "app/Labels.php", "Low", 0);
     assert_eq!(described(&index, &case), [pair("app/Severity.php", "Low")]);
 }
+
+#[test]
+fn trait_cycles_through_duplicate_names_end() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    for (file, source) in [
+        (
+            "app/TA.php",
+            "<?php\ntrait A { public function go() { return self::Low->label(); } }\n",
+        ),
+        ("app/CA.php", "<?php\nclass A { use B; }\n"),
+        ("app/TB.php", "<?php\ntrait B {}\n"),
+        ("app/CB.php", "<?php\nclass B { use A; }\n"),
+    ] {
+        std::fs::write(root.join(file), source).unwrap();
+    }
+    let (mut index, _) = Index::build(&root, &DiscoverOptions::default()).unwrap();
+    let path = root.join("app/TA.php");
+    let source = std::fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source).find("label").unwrap() as u32;
+
+    assert!(index.definition(&path, &source, offset).is_empty());
+}

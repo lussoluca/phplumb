@@ -1742,15 +1742,14 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     /// In a trait that does not declare the case, `self::` reaches the cases of the
     /// classes using the trait.
     fn enum_case(&self, class: &str, name: &str) -> TypeExpr {
-        let found = self.index.find_member(class, MemberKind::Constant, name);
+        let mut found = self.index.find_member(class, MemberKind::Constant, name);
         if found.is_empty() && self.index.is_trait(class) {
-            return union(
-                self.index
-                    .trait_users(class)
-                    .iter()
-                    .map(|user| self.enum_case(user, name))
-                    .collect(),
-            );
+            found = self
+                .index
+                .trait_users(class)
+                .iter()
+                .flat_map(|user| self.index.find_member(user, MemberKind::Constant, name))
+                .collect();
         }
         union(
             found
