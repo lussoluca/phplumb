@@ -18,4 +18,9 @@ enum Severity: string
     {
         return self::Low->label();
     }
+
+    public function lowestLate(): string
+    {
+        return static::Low->label();
+    }
 }

@@ -83,6 +83,18 @@ fn enum_interfaces_include_the_implicit_ones() {
 }
 
 #[test]
+fn implicit_interfaces_are_listed_once() {
+    assert_eq!(
+        interfaces("<?php enum S implements \\UnitEnum {}", "S"),
+        ["UnitEnum"]
+    );
+    assert_eq!(
+        interfaces("<?php enum B: int implements \\BackedEnum {}", "B"),
+        ["BackedEnum", "UnitEnum"]
+    );
+}
+
+#[test]
 fn backed_enum_members_open_their_stub() {
     let mut index = build();
     for (needle, name) in [
@@ -150,4 +162,17 @@ fn self_cases_resolve_inside_the_enum() {
 fn class_constants_get_no_enum_type() {
     let mut index = build();
     assert!(definition(&mut index, "app/Uses.php", "label();", 3).is_empty());
+}
+
+#[test]
+fn static_cases_resolve_inside_the_enum() {
+    let mut index = build();
+    let found = definition(&mut index, "app/Severity.php", "label();", 1);
+    assert_eq!(described(&index, &found), label());
+}
+
+#[test]
+fn pure_enum_cases_have_no_value() {
+    let mut index = build();
+    assert!(definition(&mut index, "app/Uses.php", "value; // pure", 0).is_empty());
 }

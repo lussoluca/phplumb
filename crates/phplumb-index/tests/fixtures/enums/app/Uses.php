@@ -14,4 +14,5 @@ function uses(Severity $severity, Plain $plain): void
     Severity::from('low')->label();
     Severity::tryFrom('low')?->label();
     Severity::LIMIT->label();
+    Plain::One->value; // pure
 }
