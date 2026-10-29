@@ -167,11 +167,11 @@ impl Framework for Drupal {
     /// Reads files and declarations of the Drupal project only.
     fn rebuild(&mut self, index: &Index) {
         let filter = index.filter().scoped(&self.project);
-        self.services = Services::read(&filter);
+        self.services = Services::read(index, &filter);
         self.entities = EntityTypes::read(index, &filter);
         self.hooks = Hooks::read(index, &filter);
         self.plugins = Plugins::read(index, &filter, self.hooks.extensions());
-        self.routes = Routes::read(&filter);
+        self.routes = Routes::read(index, &filter);
         self.routes.read_attributes(index, &filter);
         self.literals = PhpLiterals::read(index, &filter);
     }
@@ -197,12 +197,12 @@ impl Framework for Drupal {
                 .collect()
         };
         let (changed, removed) = (ours(changed), ours(removed));
-        self.services.update(&filter, &changed, &removed);
+        self.services.update(index, &filter, &changed, &removed);
         self.entities = EntityTypes::read(index, &filter);
         self.hooks.update(index, &filter, &changed, &removed);
         self.plugins
             .update(index, &filter, self.hooks.extensions(), &changed, &removed);
-        self.routes.update(&filter, &changed, &removed);
+        self.routes.update(index, &filter, &changed, &removed);
         self.routes.read_attributes(index, &filter);
         self.literals.update(&changed, &removed, index, &filter);
     }
@@ -395,7 +395,7 @@ impl Framework for Drupal {
     ) -> Vec<(Location, String)> {
         let entity_types = |id: &str, storage: Storage| self.has_entity_type(index, id, storage);
         self.hooks
-            .implementation_targets(index, declaration, &entity_types)
+            .implementation_targets(index, &self.project, declaration, &entity_types)
     }
 
     fn as_any(&self) -> &dyn Any {

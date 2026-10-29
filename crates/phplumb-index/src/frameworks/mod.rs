@@ -10,6 +10,7 @@ pub mod symfony;
 pub(crate) mod yaml;
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -39,6 +40,11 @@ pub enum Activation {
 pub struct FrameworkSettings {
     pub drupal: Activation,
     pub symfony: Activation,
+}
+
+/// Whether `path` or one of its ancestors is in `paths`.
+pub(crate) fn under_any(path: &Path, paths: &HashSet<PathBuf>) -> bool {
+    !paths.is_empty() && path.ancestors().any(|ancestor| paths.contains(ancestor))
 }
 
 /// Whether the summary mentions one of `classes`.

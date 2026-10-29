@@ -4,13 +4,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::services::{Tests, drupal_files, in_tests, is_drupal_file};
-use crate::discover::chosen_path;
+use super::services::{Tests, changed_drupal_files, drupal_files, in_tests};
 use crate::filter::PathFilter;
 use crate::frameworks::ancestry::is_a;
 use crate::frameworks::attributes::{RouteName, route_names};
 use crate::frameworks::yaml::{self, Yaml};
-use crate::frameworks::{CallTarget, FrameworkCall};
+use crate::frameworks::{CallTarget, FrameworkCall, under_any};
 use crate::index::{Index, Location};
 use crate::summary::MemberKind;
 
@@ -66,12 +65,12 @@ pub(crate) struct Routes {
 }
 
 impl Routes {
-    pub(crate) fn read(filter: &PathFilter) -> Routes {
+    pub(crate) fn read(index: &Index, filter: &PathFilter) -> Routes {
         let mut routes = Routes {
             root: filter.root().to_path_buf(),
             ..Routes::default()
         };
-        for path in drupal_files(filter, filter.start(), ROUTING, Tests::Include) {
+        for path in drupal_files(index, filter, filter.start(), ROUTING, Tests::Include) {
             routes.insert(path);
         }
         routes.reindex();
@@ -79,26 +78,18 @@ impl Routes {
     }
 
     /// Re-reads changed routing files and directories; drops removed ones.
-    pub(crate) fn update(&mut self, filter: &PathFilter, changed: &[PathBuf], removed: &[PathBuf]) {
-        for path in removed.iter().chain(changed) {
-            self.by_file.retain(|file, _| !file.starts_with(path));
-            self.alias_targets.retain(|file, _| !file.starts_with(path));
-        }
-        for path in changed {
-            let files = if path.is_dir() {
-                drupal_files(filter, path, ROUTING, Tests::Include)
-            } else {
-                chosen_path(filter.root(), path)
-                    .map(|(_, chosen)| chosen)
-                    .filter(|chosen| {
-                        is_drupal_file(filter, chosen, ROUTING, Tests::Include) && chosen.is_file()
-                    })
-                    .into_iter()
-                    .collect()
-            };
-            for file in files {
-                self.insert(file);
-            }
+    pub(crate) fn update(
+        &mut self,
+        index: &Index,
+        filter: &PathFilter,
+        changed: &[PathBuf],
+        removed: &[PathBuf],
+    ) {
+        let gone: HashSet<PathBuf> = removed.iter().chain(changed).cloned().collect();
+        self.by_file.retain(|file, _| !under_any(file, &gone));
+        self.alias_targets.retain(|file, _| !under_any(file, &gone));
+        for file in changed_drupal_files(index, filter, changed, ROUTING, Tests::Include) {
+            self.insert(file);
         }
         self.reindex();
     }

@@ -317,9 +317,8 @@ impl Symfony {
     fn dispatches(&self, index: &Index, handled: &[String]) -> Vec<(Location, String)> {
         let handled: Vec<&str> = handled.iter().map(String::as_str).collect();
         index
-            .calls_named(&["dispatch"])
+            .calls_named(&["dispatch"], &self.project)
             .into_iter()
-            .filter(|call| self.project.contains(&call.location.path))
             .filter(|call| {
                 let found = FrameworkCall {
                     targets: &call.targets,

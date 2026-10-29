@@ -404,11 +404,12 @@ impl Index {
     }
 
     /// Instance, null-safe and static calls to methods named one of `names`, in
-    /// every candidate file, sorted by path and offset.
-    pub fn calls_named(&self, names: &[&str]) -> Vec<FoundCall> {
+    /// every candidate file inside `project`, sorted by path and offset.
+    pub fn calls_named(&self, names: &[&str], project: &Project) -> Vec<FoundCall> {
         let mut files: Vec<PathBuf> = names
             .iter()
             .flat_map(|name| self.candidate_files(&RefKey::Member(name.to_string())))
+            .filter(|path| project.contains(path))
             .map(Path::to_path_buf)
             .collect();
         files.sort();

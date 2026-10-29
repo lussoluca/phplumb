@@ -1924,3 +1924,82 @@ fn off_modules_give_only_php() {
         Vec::<&str>::new()
     );
 }
+
+const LATE_FILES: [(&str, &str); 4] = [
+    (
+        "modules/custom/late/late.info.yml",
+        "name: Late\ntype: module\n",
+    ),
+    (
+        "modules/custom/late/late.services.yml",
+        "services:\n  late.svc:\n    class: App\\Foo\n",
+    ),
+    (
+        "modules/custom/late/late.routing.yml",
+        "late.page:\n  path: '/late'\n",
+    ),
+    (
+        "modules/custom/late/late.module",
+        "<?php\nfunction late_cron() {}\n",
+    ),
+];
+
+#[test]
+fn drupal_registries_follow_a_new_module_directory() {
+    let (_dir, root, mut index) = temp_drupal(&[("src/Foo.php", FOO)]);
+    assert!(classes(&index, "late.svc").is_empty());
+
+    for (path, content) in LATE_FILES {
+        write(&root, path, content);
+    }
+    index.update(&[root.join("modules/custom/late")], &[]);
+
+    assert_eq!(classes(&index, "late.svc"), vec!["App\\Foo"]);
+    assert_eq!(
+        route_keys(&index, &root, "late.page"),
+        vec!["modules/custom/late/late.routing.yml: late.page"]
+    );
+    assert_eq!(
+        implementations(&index, &root, "cron"),
+        vec!["modules/custom/late/late.module late_cron late"]
+    );
+}
+
+#[test]
+fn drupal_registries_drop_deleted_files() {
+    let mut files = vec![("src/Foo.php", FOO)];
+    files.extend(LATE_FILES);
+    let (_dir, root, mut index) = temp_drupal(&files);
+    assert_eq!(classes(&index, "late.svc"), vec!["App\\Foo"]);
+
+    let services = root.join("modules/custom/late/late.services.yml");
+    let routing = root.join("modules/custom/late/late.routing.yml");
+    fs::remove_file(&services).unwrap();
+    fs::remove_file(&routing).unwrap();
+    index.update(&[], &[services, routing]);
+
+    assert!(classes(&index, "late.svc").is_empty());
+    assert!(route_keys(&index, &root, "late.page").is_empty());
+}
+
+#[test]
+fn excluded_services_files_are_not_read() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    write(&root, "src/Foo.php", FOO);
+    for (path, content) in LATE_FILES {
+        write(&root, path, content);
+    }
+    let opts = DiscoverOptions {
+        exclude: vec!["modules/custom/late/*.services.yml".to_string()],
+        frameworks: FrameworkSettings {
+            drupal: Activation::On,
+            ..FrameworkSettings::default()
+        },
+        ..DiscoverOptions::default()
+    };
+    let index = Index::build(&root, &opts).unwrap().0;
+
+    assert!(classes(&index, "late.svc").is_empty());
+    assert_eq!(route_keys(&index, &root, "late.page").len(), 1);
+}
