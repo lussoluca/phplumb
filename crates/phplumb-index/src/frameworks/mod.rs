@@ -42,9 +42,14 @@ pub struct FrameworkSettings {
     pub symfony: Activation,
 }
 
-/// Whether `path` or one of its ancestors is in `paths`.
+/// Whether `path` or one of its ancestors is in `paths`. A few paths are compared
+/// directly, which costs less than hashing every ancestor.
 pub(crate) fn under_any(path: &Path, paths: &HashSet<PathBuf>) -> bool {
-    !paths.is_empty() && path.ancestors().any(|ancestor| paths.contains(ancestor))
+    if paths.len() <= 16 {
+        paths.iter().any(|known| path.starts_with(known))
+    } else {
+        path.ancestors().any(|ancestor| paths.contains(ancestor))
+    }
 }
 
 /// Whether the summary mentions a member named one of `names`.
@@ -374,6 +379,22 @@ mod tests {
 
         assert!(detection.frameworks().is_empty());
         assert_eq!(detection.php_extensions(), vec!["php"]);
+    }
+
+    #[test]
+    fn under_any_matches_whole_components_for_few_and_many_paths() {
+        let few: HashSet<PathBuf> = [PathBuf::from("/p/a")].into();
+        let many: HashSet<PathBuf> = (0..40)
+            .map(|i| PathBuf::from(format!("/q/{i}")))
+            .chain([PathBuf::from("/p/a")])
+            .collect();
+        for paths in [&few, &many] {
+            assert!(under_any(Path::new("/p/a"), paths));
+            assert!(under_any(Path::new("/p/a/b.php"), paths));
+            assert!(!under_any(Path::new("/p/ab.php"), paths));
+            assert!(!under_any(Path::new("/p"), paths));
+        }
+        assert!(!under_any(Path::new("/p/a"), &HashSet::new()));
     }
 
     #[test]
