@@ -396,6 +396,14 @@ impl Symfony {
         if let Some(name) = config::parameter_at(raw, (offset - start) as usize) {
             return targets_of(self.parameter_targets(&name));
         }
+        // A template name, such as a `form_themes` entry, also when it starts with `@`.
+        if value.to_ascii_lowercase().ends_with(".twig") {
+            return self
+                .template_file(value)
+                .into_iter()
+                .map(file_start)
+                .collect();
+        }
         if let Some(reference) = value.strip_prefix('@') {
             // `@?id` is optional, `@=` an expression and `@@` an escaped `@`.
             if reference.starts_with('=') || reference.starts_with('@') {
@@ -665,9 +673,10 @@ impl Framework for Symfony {
         None
     }
 
-    /// In YAML configuration, a parameter, a service reference or a class name leads
-    /// to its definition; in a Doctrine mapping, a class or property name opens it;
-    /// in a Twig template, a template name opens its file, and a route name in
+    /// In YAML configuration, a parameter, a template name, a service reference or a
+    /// class name leads to its definition; in a Doctrine mapping, a class or
+    /// property name opens it; in a Twig template, a template name opens its file,
+    /// and a route name in
     /// `path()` or `url()` leads to the route.
     fn file_targets(
         &self,
