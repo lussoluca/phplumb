@@ -2,6 +2,10 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-29, batch F1 template names
+
+Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #39 and #40. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged. Template names stay certain on the Symfony reference, and the sweep of `src`, `templates` and `config` still finds no broken template name with the new forms read.
+
 ## 2026-10-29, batch E2 route references
 
 Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #33, #35 and #36. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged.
