@@ -4,16 +4,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::config::top_blocks;
 use super::files::ConfigFiles;
 
 use crate::filter::{PathFilter, is_yaml};
 use crate::frameworks::Project;
+use crate::frameworks::ancestry::is_a;
 use crate::frameworks::attributes::{RouteName, route_names, route_variants};
 use crate::frameworks::yaml::{self, Yaml};
 use crate::index::{Index, Location};
 use crate::infer::php_routes;
 use crate::metadata::Metadata;
-use crate::summary::{Declaration, Member, MemberKind, SymbolKind, summarize};
+use crate::summary::{Declaration, Member, MemberKind, NameKind, SymbolKind, summarize};
 
 /// Where a route name leads, with the text expected at the range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,13 +26,20 @@ pub struct RouteTarget {
 
 /// Route resources of Symfony's bundles, whose routes all have names starting
 /// with `_`.
-const SYMFONY_RESOURCES: [&str; 5] = [
+const SYMFONY_RESOURCES: [&str; 4] = [
     "@FrameworkBundle/",
     "@WebProfilerBundle/",
     "@SecurityBundle/",
     "@TwigBundle/",
-    "security.route_loader.logout",
 ];
+
+/// The route loader of the security firewalls' logout paths.
+const LOGOUT_LOADER: &str = "security.route_loader.logout";
+
+/// Symfony's bundle classes, whose `getPath()` is the class's directory, or its
+/// parent for an `AbstractBundle`.
+const BUNDLE: &str = "Symfony\\Component\\HttpKernel\\Bundle\\Bundle";
+const ABSTRACT_BUNDLE: &str = "Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle";
 
 /// What a route import loads, as far as the module knows.
 enum Import {
@@ -42,8 +51,10 @@ enum Import {
     /// Attribute routes of project classes in a directory, or of one class, under
     /// the prefix the import and the imports leading to it give their names.
     Prefixed(AttributeResource, String),
-    /// Routes of one of Symfony's bundles.
+    /// Routes of one of Symfony's bundles the module cannot read.
     Symfony,
+    /// The logout routes of the security firewalls.
+    Logout,
     Unknown,
 }
 
@@ -59,6 +70,8 @@ struct Sources<'a> {
     config_files: &'a ConfigFiles,
     /// The project's `config` directory.
     config: &'a Path,
+    /// The configuration files of the project.
+    configuration: &'a [PathBuf],
 }
 
 #[derive(Default)]
@@ -82,12 +95,14 @@ pub(crate) struct Routes {
 
 impl Routes {
     /// Every route of the project: attribute routes of project classes, then the
-    /// route files the kernel loads and the files they import.
+    /// route files the kernel loads and the files they import. `configuration` are
+    /// the configuration files of the project.
     pub(crate) fn read(
         index: &Index,
         filter: &PathFilter,
         project: &Project,
         config_files: &ConfigFiles,
+        configuration: &[PathBuf],
     ) -> Routes {
         let mut routes = Routes::default();
         let mut routed: HashMap<String, bool> = HashMap::new();
@@ -112,6 +127,7 @@ impl Routes {
             index,
             config_files,
             config: &config,
+            configuration,
         };
         let files = php_route_files(&config, filter)
             .into_iter()
@@ -367,6 +383,11 @@ impl Routes {
                 match import(sources, file, value, prefix) {
                     Import::Read => {}
                     Import::Symfony => self.symfony = true,
+                    Import::Logout => {
+                        // Other firewalls may come from configuration not read.
+                        self.symfony = true;
+                        self.read_logout(sources);
+                    }
                     Import::Unknown => self.unknown = true,
                     Import::Files(files, prefix) => {
                         for imported in &files {
@@ -450,6 +471,55 @@ impl Routes {
         );
     }
 
+    /// The route `_logout_<firewall>` of each firewall with a `logout` setting in the
+    /// configuration files, leading to that setting.
+    fn read_logout(&mut self, sources: &Sources) {
+        for file in sources.configuration {
+            let Some(parsed) = sources.config_files.get(file) else {
+                continue;
+            };
+            let (text, Some(root)) = (parsed.text.as_str(), &parsed.yaml) else {
+                continue;
+            };
+            for block in top_blocks(root) {
+                let firewalls = block.get("security").and_then(|s| s.get("firewalls"));
+                let Some(Yaml::Map(firewalls)) = firewalls else {
+                    continue;
+                };
+                for (firewall, settings) in firewalls {
+                    let (Some(firewall), Yaml::Map(settings)) = (firewall.text(), settings) else {
+                        continue;
+                    };
+                    for (key, value) in settings {
+                        let Yaml::Scalar {
+                            value: name,
+                            start,
+                            end,
+                        } = key
+                        else {
+                            continue;
+                        };
+                        if name != "logout" || value.text() == Some("false") {
+                            continue;
+                        }
+                        let (start, end) = yaml::value_range(text, name, *start, *end);
+                        self.add(
+                            format!("_logout_{firewall}"),
+                            RouteTarget {
+                                location: Location {
+                                    path: file.clone(),
+                                    start,
+                                    end,
+                                },
+                                text: name.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Adds `prefix` before the names of the attribute routes `resource` reads.
     fn prefix_attribute_routes(&mut self, resource: &AttributeResource, prefix: &str) {
         let prefixed: Vec<(String, RouteTarget)> = self
@@ -517,17 +587,42 @@ fn import(sources: &Sources, file: &Path, value: &Yaml, outer: &str) -> Import {
             Import::Unknown
         };
     }
-    if SYMFONY_RESOURCES.iter().any(|r| resource.starts_with(r)) {
+    if resource == LOGOUT_LOADER {
         return if prefix.is_empty() {
-            Import::Symfony
+            Import::Logout
         } else {
             Import::Unknown
         };
     }
-    if resource.starts_with('@') || resource.contains(['*', '?', '{', '[']) {
+    let kind = value.get("type").and_then(Yaml::text);
+    if let Some(bundled) = resource.strip_prefix('@') {
+        // A bundle's routes the module cannot read: unknown, or Symfony's `_` names.
+        let symfony = SYMFONY_RESOURCES.iter().any(|r| resource.starts_with(r));
+        let unprefixed = prefix.is_empty();
+        let unread = || {
+            if symfony && unprefixed {
+                Import::Symfony
+            } else {
+                Import::Unknown
+            }
+        };
+        if resource.contains(['*', '?', '{', '['])
+            || kind.is_some_and(|k| !matches!(k, "yaml" | "php" | "directory"))
+        {
+            return unread();
+        }
+        let Some((bundle, path)) = bundled.split_once('/') else {
+            return unread();
+        };
+        let Some(dir) = bundle_dir(sources, bundle) else {
+            return unread();
+        };
+        return resource_files(&normalize(&dir.join(path)))
+            .map_or_else(unread, |files| Import::Files(files, prefix));
+    }
+    if resource.contains(['*', '?', '{', '[']) {
         return Import::Unknown;
     }
-    let kind = value.get("type").and_then(Yaml::text);
     // Routes in docblock annotations are not read.
     if kind == Some("annotation") {
         return Import::Unknown;
@@ -564,14 +659,47 @@ fn import(sources: &Sources, file: &Path, value: &Yaml, outer: &str) -> Import {
     if !in_project || kind.is_some_and(|k| !matches!(k, "yaml" | "php" | "directory")) {
         return Import::Unknown;
     }
-    if resolved.is_dir() {
-        return route_files_below(&resolved)
-            .map_or(Import::Unknown, |files| Import::Files(files, prefix));
+    resource_files(&resolved).map_or(Import::Unknown, |files| Import::Files(files, prefix))
+}
+
+/// The route files a resource resolved to `path` loads: the file, or those below a
+/// directory; none when one is a file the module does not read.
+fn resource_files(path: &Path) -> Option<Vec<PathBuf>> {
+    if path.is_dir() {
+        return route_files_below(path);
     }
-    if resolved.is_file() && (is_yaml(&resolved) || is_php(&resolved)) {
-        Import::Files(vec![resolved], prefix)
+    (path.is_file() && (is_yaml(path) || is_php(path))).then(|| vec![path.to_path_buf()])
+}
+
+/// The directory of the bundle `name`, as `getPath()` gives it: that of the class
+/// with that short name registered in `config/bundles.php`, or its parent for an
+/// `AbstractBundle`. None when the bundle sets its own path.
+fn bundle_dir(sources: &Sources, name: &str) -> Option<PathBuf> {
+    let source = std::fs::read(sources.config.join("bundles.php")).ok()?;
+    let summary = summarize(&source);
+    let fqn = summary
+        .names
+        .iter()
+        .filter(|found| found.kind == NameKind::ClassLike)
+        .map(|found| found.fqn.as_str())
+        .find(|fqn| fqn.rsplit('\\').next() == Some(name))?;
+    let index = sources.index;
+    let class = index.classes_named(fqn).into_iter().next()?;
+    let own_path = index
+        .find_member(fqn, MemberKind::Method, "getPath")
+        .first()
+        .is_some_and(|(owner, _)| {
+            let owner = &owner.declaration.fqn;
+            !owner.eq_ignore_ascii_case(BUNDLE) && !owner.eq_ignore_ascii_case(ABSTRACT_BUNDLE)
+        });
+    if own_path {
+        return None;
+    }
+    let dir = class.path.parent()?;
+    if is_a(index, fqn, &[ABSTRACT_BUNDLE]) {
+        dir.parent().map(Path::to_path_buf)
     } else {
-        Import::Unknown
+        Some(dir.to_path_buf())
     }
 }
 
