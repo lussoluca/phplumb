@@ -137,6 +137,11 @@ fn calls() {
 }
 
 #[test]
+fn generics() {
+    run_fixture("generics");
+}
+
+#[test]
 fn names() {
     run_fixture("names");
 }

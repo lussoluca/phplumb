@@ -227,6 +227,17 @@ impl TypeParser<'_> {
             Some(b'(') => {
                 self.pos += 1;
                 let inner = self.union();
+                // `(Subject is [not] Type ? A : B)` is either branch.
+                if self.keyword("is") {
+                    self.keyword("not");
+                    self.union();
+                    self.eat(b'?');
+                    let yes = self.union();
+                    self.eat(b':');
+                    let no = self.union();
+                    self.eat(b')');
+                    return merge(vec![yes, no]);
+                }
                 self.eat(b')');
                 inner
             }
@@ -312,6 +323,20 @@ impl TypeParser<'_> {
                 }
             }
         })
+    }
+
+    /// Consumes `word` when it comes next as a whole word.
+    fn keyword(&mut self, word: &str) -> bool {
+        self.skip_spaces();
+        let rest = &self.text[self.pos..];
+        let whole = rest.starts_with(word.as_bytes())
+            && rest
+                .get(word.len())
+                .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        if whole {
+            self.pos += word.len();
+        }
+        whole
     }
 
     fn generic_args(&mut self) -> Vec<Parsed> {
@@ -857,6 +882,17 @@ mod tests {
             "",
         ] {
             assert_eq!(ty(text), TypeExpr::Other, "{text}");
+        }
+    }
+
+    #[test]
+    fn conditional_types_give_both_branches() {
+        for text in [
+            "(T is null ? Foo : Bar)",
+            "($x is string ? Foo : Bar)",
+            "(T is not null ? Foo : Bar)",
+        ] {
+            assert_eq!(ty(text), ty("Foo|Bar"), "{text}");
         }
     }
 
