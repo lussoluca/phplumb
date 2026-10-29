@@ -561,7 +561,15 @@ impl Server<'_> {
             .unwrap_or_else(|| frameworks::detect(&root, &self.opts.frameworks));
         let (index, stats) =
             Index::build_with(&root, &self.opts, self.cache.as_deref(), &detection)?;
-        let frameworks = index.active_frameworks();
+        // A module that reads a folder below the root is logged with it.
+        let frameworks: Vec<String> = index
+            .framework_projects()
+            .into_iter()
+            .map(|(name, dir)| match dir.as_os_str().is_empty() {
+                true => name.to_string(),
+                false => format!("{name} ({})", dir.display()),
+            })
+            .collect();
         self.index = Some(index);
         let summary = summary_message(&stats);
         let frameworks = match frameworks.is_empty() {

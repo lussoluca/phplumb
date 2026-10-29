@@ -102,11 +102,15 @@ impl PathFilter {
         }
     }
 
-    /// Where walks start: the project directory, or the root without a project.
-    pub(crate) fn start(&self) -> &Path {
-        self.scope
-            .as_ref()
-            .map_or(&self.root, |project| &project.dir)
+    /// Where walks of the project's files start: its directory and the directories
+    /// symlinks inside it lead to, or the root without a project.
+    pub(crate) fn starts(&self) -> Vec<&Path> {
+        match &self.scope {
+            Some(project) => std::iter::once(project.dir.as_path())
+                .chain(project.linked.iter().map(PathBuf::as_path))
+                .collect(),
+            None => vec![&self.root],
+        }
     }
 
     /// Whether `path`, under the canonical root, is inside the project, if any.

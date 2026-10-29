@@ -42,7 +42,7 @@ impl Services {
             root: filter.root().to_path_buf(),
             ..Services::default()
         };
-        for path in drupal_files(index, filter, filter.start(), SERVICES, Tests::Include) {
+        for path in project_drupal_files(index, filter, SERVICES, Tests::Include) {
             services.by_file.insert(path.clone(), parse_file(&path));
         }
         services.reindex();
@@ -214,6 +214,21 @@ pub(super) fn drupal_files(
         .framework_files_under(start)
         .filter(|path| is_drupal_file(filter, path, suffix, tests))
         .map(Path::to_path_buf)
+        .collect()
+}
+
+/// The files named `*{suffix}` of the whole project, the directories symlinks
+/// inside it lead to included.
+pub(super) fn project_drupal_files(
+    index: &Index,
+    filter: &PathFilter,
+    suffix: &str,
+    tests: Tests,
+) -> Vec<PathBuf> {
+    filter
+        .starts()
+        .into_iter()
+        .flat_map(|start| drupal_files(index, filter, start, suffix, tests))
         .collect()
 }
 

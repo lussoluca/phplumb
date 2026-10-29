@@ -165,6 +165,7 @@ fn found_calls(
     let project = phplumb_index::frameworks::Project {
         dir: root.clone(),
         excluded: Vec::new(),
+        linked: Vec::new(),
     };
     let found = index.calls_named(names, &project);
     (dir, found)

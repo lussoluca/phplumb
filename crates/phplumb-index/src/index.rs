@@ -139,6 +139,8 @@ impl Index {
             .unwrap_or_default();
         let walked = discover_with(&mut filter);
         let paths = walked.php;
+        let mut active = active;
+        link_projects(&mut active, &walked.links, filter.root());
 
         let stamps: Vec<Option<(u64, u64)>> = paths.par_iter().map(|p| stamp(p)).collect();
         let mut files: Vec<Option<CachedFile>> = Vec::with_capacity(paths.len());
@@ -458,11 +460,17 @@ impl Index {
         found
     }
 
-    /// The classes an annotation name of `summary` may be: the class a qualified or
-    /// imported name names; for an unimported name on a class whose annotations a
-    /// framework's discovery reads, what that framework reads it as; otherwise the
-    /// class of the file's namespace, as Doctrine reads it.
-    pub(crate) fn annotation_classes(&self, summary: &FileSummary, name: &NameRef) -> Vec<String> {
+    /// The classes an annotation name of `summary`, the file at `path`, may be: the
+    /// class a qualified or imported name names; for an unimported name on a class
+    /// whose annotations the discovery of a module of the file reads, what that
+    /// module reads it as; otherwise the class of the file's namespace, as Doctrine
+    /// reads it.
+    pub(crate) fn annotation_classes(
+        &self,
+        path: &Path,
+        summary: &FileSummary,
+        name: &NameRef,
+    ) -> Vec<String> {
         if name.qualified || name.imported {
             return vec![name.fqn.clone()];
         }
@@ -478,15 +486,11 @@ impl Index {
                 })
             })
             .map(|d| d.fqn.as_str());
+        // The modules of the file decide, so a file the index does not hold, or
+        // leaves out, reads its annotations as discovery does.
         let discovered: Vec<Vec<String>> = class
             .map(|class| {
-                self.frameworks
-                    .iter()
-                    .filter(|f| {
-                        self.classes_named(class)
-                            .iter()
-                            .any(|c| f.project().contains(c.path))
-                    })
+                self.frameworks_for(path)
                     .filter_map(|f| f.annotation_classes(self, class, name))
                     .collect()
             })
@@ -538,6 +542,19 @@ impl Index {
             .iter()
             .find(|f| f.name() == name)
             .map(|f| f.project())
+    }
+
+    /// Each active framework module with its project directory relative to the
+    /// root, empty when the project is the root.
+    pub fn framework_projects(&self) -> Vec<(&'static str, PathBuf)> {
+        self.frameworks
+            .iter()
+            .map(|f| {
+                let dir = &f.project().dir;
+                let relative = dir.strip_prefix(self.filter.root()).unwrap_or(dir);
+                (f.name(), relative.to_path_buf())
+            })
+            .collect()
     }
 
     /// The names of the framework modules active for this project.
@@ -1812,7 +1829,7 @@ impl Index {
             name_at(&summary.names, offset).or_else(|| name_at(&summary.doc_names, offset))
         else {
             return name_at(&summary.annotation_names, offset)
-                .map(|name| self.class_targets(&self.annotation_classes(&summary, name)))
+                .map(|name| self.class_targets(&self.annotation_classes(path, &summary, name)))
                 .unwrap_or_default();
         };
         let (key, holder, entries): (String, &Index, &[Entry]) = match name.kind {
@@ -2005,6 +2022,49 @@ impl Index {
             SymbolKind::Constant => &mut self.constants,
             _ => &mut self.classes,
         }
+    }
+}
+
+/// Gives each framework project the directories that symlinks inside it lead to
+/// elsewhere under the root, as a Composer path repository links a module, and
+/// leaves them out of the other projects unless those link them too. Links inside
+/// `vendor` install libraries, not modules, and a link to another project's folder
+/// (or a folder holding it) is not followed.
+fn link_projects(frameworks: &mut [Box<dyn Framework>], links: &[(PathBuf, PathBuf)], root: &Path) {
+    let mut projects: Vec<Project> = frameworks.iter().map(|f| f.project().clone()).collect();
+    let dirs: Vec<PathBuf> = projects.iter().map(|p| p.dir.clone()).collect();
+    let in_vendor = |link: &Path| {
+        link.strip_prefix(root)
+            .is_ok_and(|relative| relative.components().any(|c| c.as_os_str() == "vendor"))
+    };
+    for project in projects.iter_mut() {
+        for (link, target) in links {
+            let linkable = target.starts_with(root)
+                && !in_vendor(link)
+                && project.contains(link)
+                && !project.contains(target)
+                && !dirs.iter().any(|dir| dir.starts_with(target));
+            if linkable && !project.linked.contains(target) {
+                project.linked.push(target.clone());
+            }
+        }
+    }
+    let linked: Vec<Vec<PathBuf>> = projects.iter().map(|p| p.linked.clone()).collect();
+    for (owner, targets) in linked.iter().enumerate() {
+        for target in targets {
+            for (i, project) in projects.iter_mut().enumerate() {
+                if i != owner
+                    && !project.linked.contains(target)
+                    && project.contains(target)
+                    && !project.excluded.contains(target)
+                {
+                    project.excluded.push(target.clone());
+                }
+            }
+        }
+    }
+    for (framework, project) in frameworks.iter_mut().zip(projects) {
+        framework.set_project(project);
     }
 }
 

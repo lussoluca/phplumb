@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::services::{Tests, changed_drupal_files, drupal_files, in_tests};
+use super::services::{Tests, changed_drupal_files, in_tests, project_drupal_files};
 use crate::filter::PathFilter;
 use crate::frameworks::ancestry::is_a;
 use crate::frameworks::attributes::{RouteName, route_names};
@@ -70,7 +70,7 @@ impl Routes {
             root: filter.root().to_path_buf(),
             ..Routes::default()
         };
-        for path in drupal_files(index, filter, filter.start(), ROUTING, Tests::Include) {
+        for path in project_drupal_files(index, filter, ROUTING, Tests::Include) {
             routes.insert(path);
         }
         routes.reindex();

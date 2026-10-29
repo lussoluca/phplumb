@@ -116,3 +116,33 @@ fn hover_over_stdio() {
     );
     client.shutdown();
 }
+
+#[test]
+fn logs_the_folder_of_each_framework_module() {
+    let (_dir, root_uri) = workspace(&[
+        ("src/A.php", "<?php\nclass A {}\n"),
+        (
+            "composer.lock",
+            r#"{"packages": [{"name": "symfony/framework-bundle"}]}"#,
+        ),
+        (
+            "codebase/drupal/composer.lock",
+            r#"{"packages": [{"name": "drupal/core"}]}"#,
+        ),
+    ]);
+
+    let mut client = Client::start();
+    client.initialize(json!({
+        "processId": null,
+        "capabilities": {},
+        "workspaceFolders": [{"uri": root_uri, "name": "test"}],
+    }));
+    let log = client.wait_for_notification("window/logMessage");
+
+    let message = log["params"]["message"].as_str().unwrap();
+    assert!(
+        message.ends_with("; frameworks: drupal (codebase/drupal), symfony)"),
+        "{message}"
+    );
+    client.shutdown();
+}

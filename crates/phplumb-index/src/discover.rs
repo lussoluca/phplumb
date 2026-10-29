@@ -60,6 +60,8 @@ pub(crate) struct Walked {
     /// The YAML, Twig and Doctrine XML files only the frameworks read, outside
     /// `vendor`.
     pub framework: Vec<PathBuf>,
+    /// Each symlinked directory met, with its canonical target.
+    pub links: Vec<(PathBuf, PathBuf)>,
 }
 
 /// A file or a symlinked directory a walk thread met.
@@ -188,9 +190,15 @@ pub(crate) fn walk(filter: &mut PathFilter, start: &Path) -> Walked {
         files.sort();
         files
     };
+    let mut links: Vec<(PathBuf, PathBuf)> = links
+        .into_iter()
+        .filter_map(|link| Some((link.to_path_buf(), link.canonicalize().ok()?)))
+        .collect();
+    links.sort();
     Walked {
         php: sorted(php),
         framework: sorted(framework),
+        links,
     }
 }
 

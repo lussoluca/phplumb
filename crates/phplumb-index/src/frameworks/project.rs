@@ -13,17 +13,35 @@ use crate::filter::SKIPPED_DIR_NAMES;
 const LOCK_DEPTH: usize = 4;
 
 /// A framework module's project: a directory, without the projects of other active
-/// modules inside it. Paths are canonical.
+/// modules inside it, with the directories symlinks inside it lead to elsewhere
+/// under the root, as a Composer path repository links a module. Paths are
+/// canonical.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Project {
     pub dir: PathBuf,
     pub excluded: Vec<PathBuf>,
+    pub linked: Vec<PathBuf>,
 }
 
 impl Project {
-    /// Whether `path` is inside the project, comparing whole path components.
+    /// Whether `path` is inside the project, comparing whole path components. A
+    /// linked directory wins over a wider excluded one that holds it.
     pub fn contains(&self, path: &Path) -> bool {
-        path.starts_with(&self.dir) && !self.excluded.iter().any(|dir| path.starts_with(dir))
+        let depth = |dirs: &[PathBuf]| {
+            dirs.iter()
+                .filter(|dir| path.starts_with(dir))
+                .map(|dir| dir.components().count())
+                .max()
+        };
+        let linked = depth(&self.linked);
+        if !path.starts_with(&self.dir) && linked.is_none() {
+            return false;
+        }
+        match (linked, depth(&self.excluded)) {
+            (_, None) => true,
+            (Some(linked), Some(excluded)) => linked > excluded,
+            (None, Some(_)) => false,
+        }
     }
 }
 
