@@ -19,14 +19,47 @@ pub(crate) enum RouteName {
     Missing,
 }
 
-/// Whether a route attribute in `metadata` gives its route aliases.
-pub(crate) fn has_route_aliases(metadata: &[Metadata]) -> bool {
-    metadata.iter().any(|m| {
+/// The locales of a route attribute whose path is a map from locale to path, and the
+/// aliases it gives its route, each list in attribute order like `route_names`.
+pub(crate) fn route_variants(metadata: &[Metadata]) -> Vec<(Vec<String>, Vec<String>)> {
+    route_attributes(metadata)
+        .map(|attribute| {
+            let path = attribute.argument("path").or_else(|| {
+                attribute
+                    .arguments
+                    .first()
+                    .filter(|(key, _)| key.is_none())
+                    .map(|(_, value)| value)
+            });
+            let locales = match path {
+                Some(MetaValue::List(entries)) => {
+                    entries.iter().filter_map(|(key, _)| key.clone()).collect()
+                }
+                _ => Vec::new(),
+            };
+            let aliases = match attribute.argument("alias") {
+                Some(MetaValue::String(alias)) => vec![alias.clone()],
+                Some(MetaValue::List(entries)) => entries
+                    .iter()
+                    .filter_map(|(_, value)| match value {
+                        MetaValue::String(alias) => Some(alias.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (locales, aliases)
+        })
+        .collect()
+}
+
+/// The route attributes in `metadata`.
+fn route_attributes(metadata: &[Metadata]) -> impl Iterator<Item = &Metadata> {
+    metadata.iter().filter(|m| {
         !m.annotation
             && ROUTE_ATTRIBUTES
                 .iter()
                 .any(|a| m.name.eq_ignore_ascii_case(a))
-            && m.argument("alias").is_some()
     })
 }
 
@@ -34,14 +67,7 @@ pub(crate) fn has_route_aliases(metadata: &[Metadata]) -> bool {
 /// position 1. A class constant gives its string value, read through the index;
 /// `self::` is `class`. A `null` name is missing.
 pub(crate) fn route_names(metadata: &[Metadata], index: &Index, class: &str) -> Vec<RouteName> {
-    metadata
-        .iter()
-        .filter(|m| {
-            !m.annotation
-                && ROUTE_ATTRIBUTES
-                    .iter()
-                    .any(|a| m.name.eq_ignore_ascii_case(a))
-        })
+    route_attributes(metadata)
         .map(|attribute| {
             let name = attribute.argument("name").or_else(|| {
                 attribute

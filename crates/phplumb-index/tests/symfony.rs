@@ -1144,3 +1144,33 @@ fn class_routes_named_null_have_no_prefix() {
         [pair("src/Controller/PanelController.php", "home")]
     );
 }
+
+#[test]
+fn route_aliases_lead_to_their_route() {
+    let index = build();
+    assert_eq!(
+        routes(&index, "old_aliased"),
+        [pair("src/Controller/LocalizedController.php", "aliased")]
+    );
+    assert_eq!(routes(&index, "legacy_home"), routes(&index, "home"));
+    assert!(!routes(&index, "home").is_empty());
+}
+
+#[test]
+fn localized_routes_have_a_name_per_locale() {
+    let index = build();
+    for name in ["about_us", "about_us.en", "about_us.it"] {
+        assert_eq!(
+            routes(&index, name),
+            [pair("src/Controller/LocalizedController.php", "about")],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn localized_methods_get_no_class_alias() {
+    let index = build();
+    assert!(routes(&index, "App\\Controller\\LocalizedController::about").is_empty());
+    assert!(!routes(&index, "App\\Controller\\LocalizedController::aliased").is_empty());
+}

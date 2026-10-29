@@ -9,7 +9,7 @@ use super::files::{ConfigFiles, Parsed};
 
 use crate::filter::{PathFilter, is_yaml};
 use crate::frameworks::Project;
-use crate::frameworks::attributes::{RouteName, has_route_aliases, route_names};
+use crate::frameworks::attributes::{RouteName, route_names, route_variants};
 use crate::frameworks::yaml::{self, Yaml};
 use crate::index::{Index, Location};
 use crate::summary::{Declaration, Member, MemberKind, SymbolKind};
@@ -48,6 +48,8 @@ pub(crate) struct Routes {
     unknown: bool,
     /// Whether Symfony's own routes are imported.
     symfony: bool,
+    /// YAML aliases: each alias name and the route it stands for.
+    aliases: Vec<(String, String)>,
 }
 
 impl Routes {
@@ -81,6 +83,16 @@ impl Routes {
         routes.unknown |= has_unread_route_files(&config);
         for file in &files {
             routes.read_yaml(index, config_files.get(file), file, &files, &config);
+        }
+        // An alias leads where its route does; an alias of nothing known is unread.
+        for (alias, name) in std::mem::take(&mut routes.aliases) {
+            let targets = routes.targets(&name).to_vec();
+            if targets.is_empty() {
+                routes.unknown = true;
+            }
+            for target in targets {
+                routes.add(alias.clone(), target);
+            }
         }
         routes
     }
@@ -122,7 +134,6 @@ impl Routes {
         }
         let fqn = &class.fqn;
         let class_routes = route_names(&shape.metadata, index, fqn);
-        self.unknown |= has_route_aliases(&shape.metadata);
         let prefix = match class_routes.first() {
             Some(RouteName::Literal(prefix)) => prefix.clone(),
             Some(RouteName::Unreadable) => {
@@ -145,30 +156,38 @@ impl Routes {
         for entry in &methods {
             let method = entry.1;
             let attributes = route_names(&method.metadata, index, fqn);
-            self.unknown |= has_route_aliases(&method.metadata);
+            let variants = route_variants(&method.metadata);
             let mut defaults = 0;
             let mut names = Vec::new();
-            for attribute in &attributes {
-                match attribute {
-                    RouteName::Literal(name) => names.push(format!("{prefix}{name}")),
+            let mut extra = Vec::new();
+            let mut localized = false;
+            for (attribute, (locales, aliases)) in attributes.iter().zip(&variants) {
+                let name = match attribute {
+                    RouteName::Literal(name) => format!("{prefix}{name}"),
                     RouteName::Missing => {
-                        names.push(format!(
-                            "{prefix}{}",
-                            default_name(fqn, &method.name, defaults)
-                        ));
                         defaults += 1;
+                        format!("{prefix}{}", default_name(fqn, &method.name, defaults - 1))
                     }
-                    RouteName::Unreadable => self.unknown = true,
-                }
+                    RouteName::Unreadable => {
+                        self.unknown = true;
+                        continue;
+                    }
+                };
+                // A localized route is `name.locale` for each locale; `name` still
+                // generates it in the current locale.
+                localized |= !locales.is_empty();
+                extra.extend(locales.iter().map(|locale| format!("{name}.{locale}")));
+                extra.extend(aliases.iter().cloned());
+                names.push(name);
             }
             count += attributes.len();
             if method.name.eq_ignore_ascii_case("__invoke") {
                 invoke_routes.extend(names.iter().cloned());
             }
-            if attributes.len() == 1 && names.len() == 1 {
+            if attributes.len() == 1 && names.len() == 1 && !localized {
                 self.add(format!("{fqn}::{}", method.name), target(entry));
             }
-            for name in names {
+            for name in names.into_iter().chain(extra) {
                 self.add(name, target(entry));
             }
         }
@@ -261,6 +280,10 @@ impl Routes {
                     Import::Symfony => self.symfony = true,
                     Import::Unknown => self.unknown = true,
                 }
+                continue;
+            }
+            if let Some(alias) = value.get("alias").and_then(Yaml::text) {
+                self.aliases.push((name.clone(), alias.to_string()));
                 continue;
             }
             if value.get("alias").is_some() {

@@ -4,3 +4,6 @@ controllers:
 legacy_page:
     path: /legacy
     controller: App\Controller\LegacyController::show
+
+legacy_home:
+    alias: home
