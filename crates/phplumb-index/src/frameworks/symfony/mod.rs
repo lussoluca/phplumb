@@ -439,7 +439,7 @@ impl Symfony {
         self.services = config::read_services(&files, &self.config_files);
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
-        self.templates = Templates::read(&self.project, &self.config_files);
+        self.templates = Templates::read(index, &self.project, &self.config_files);
         self.handlers = Handlers::read(index, &filter);
     }
 }
