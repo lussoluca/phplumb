@@ -956,3 +956,66 @@ fn links_to_another_project_leave_it_alone() {
     assert!(index.framework_project("symfony").unwrap().contains(&file));
     assert!(!index.framework_project("drupal").unwrap().contains(&file));
 }
+
+fn route_files_of(index: &Index, name: &str) -> Vec<String> {
+    index
+        .framework::<Symfony>()
+        .unwrap()
+        .route_targets(name)
+        .iter()
+        .map(|target| target.text.clone())
+        .collect()
+}
+
+const ROUTE_ATTRIBUTE: &str = "<?php\nnamespace Symfony\\Component\\Routing\\Attribute;\n#[\\Attribute]\nclass Route\n{\n    public function __construct(string $path = '', ?string $name = null) {}\n}\n";
+
+#[test]
+fn name_prefix_imports_prefix_their_attribute_routes() {
+    let (_dir, root) = broken_symfony(&[
+        ("lib/Route.php", ROUTE_ATTRIBUTE),
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\ncontrollers:\n    resource: ../src/Controller/\n    type: attribute\nadmin:\n    resource: ../src/Admin/\n    type: attribute\n    name_prefix: 'admin_'\n",
+        ),
+        (
+            "src/Admin/PanelController.php",
+            "<?php\nnamespace App\\Admin;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass PanelController\n{\n    #[Route('/panel', name: 'panel')]\n    public function panel(): void {}\n}\n",
+        ),
+        (
+            "src/Controller/HomeController.php",
+            "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass HomeController\n{\n    #[Route('/start', name: 'start')]\n    public function start(): void {}\n}\n",
+        ),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "admin_panel"), ["panel"]);
+    assert!(route_files_of(&index, "admin_start").is_empty());
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+}
+
+#[test]
+fn route_files_imported_from_outside_config_routes_are_read() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nblog:\n    resource: ../modules/blog/routes.yaml\n",
+        ),
+        ("modules/blog/routes.yaml", "blog_index:\n    path: /blog\n"),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "blog_index"), ["blog_index"]);
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+}

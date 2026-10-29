@@ -3,9 +3,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use super::files::{ConfigFiles, Parsed};
+use super::files::ConfigFiles;
 
 use crate::filter::{PathFilter, is_yaml};
 use crate::frameworks::Project;
@@ -36,9 +35,21 @@ enum Import {
     /// Routes the module reads anyway: attribute routes of project code or a route
     /// file it reads.
     Read,
+    /// A YAML route file of the project the module reads only through this import,
+    /// with the prefix the import gives its names.
+    File(PathBuf, String),
+    /// Attribute routes of project classes in a directory, or of one class, under
+    /// the prefix the import gives their names.
+    Prefixed(AttributeResource, String),
     /// Routes of one of Symfony's bundles.
     Symfony,
     Unknown,
+}
+
+/// The classes an attribute route import reads.
+enum AttributeResource {
+    Directory(PathBuf),
+    Class(String),
 }
 
 #[derive(Default)]
@@ -50,6 +61,12 @@ pub(crate) struct Routes {
     symfony: bool,
     /// YAML aliases: each alias name and the route it stands for.
     aliases: Vec<(String, String)>,
+    /// Each attribute route with the file and class declaring it, for the imports
+    /// that prefix them.
+    attribute_routes: Vec<(PathBuf, String, String, RouteTarget)>,
+    /// The YAML route files read, each with the prefix it was read under, so an
+    /// import cycle reads each once.
+    read_files: Vec<(PathBuf, String)>,
 }
 
 impl Routes {
@@ -81,8 +98,11 @@ impl Routes {
         let config = project.dir.join("config");
         let files = route_files(&config, filter);
         routes.unknown |= has_unread_route_files(&config);
+        routes
+            .read_files
+            .extend(files.iter().map(|file| (file.clone(), String::new())));
         for file in &files {
-            routes.read_yaml(index, config_files.get(file), file, &files, &config);
+            routes.read_yaml(index, config_files, file, &files, &config, "");
         }
         // An alias leads where its route does; an alias of nothing known is unread.
         for (alias, name) in std::mem::take(&mut routes.aliases) {
@@ -188,6 +208,12 @@ impl Routes {
                 self.add(format!("{fqn}::{}", method.name), target(entry));
             }
             for name in names.into_iter().chain(extra) {
+                self.attribute_routes.push((
+                    path.to_path_buf(),
+                    fqn.clone(),
+                    name.clone(),
+                    target(entry),
+                ));
                 self.add(name, target(entry));
             }
         }
@@ -212,6 +238,12 @@ impl Routes {
                     }
                 };
                 invoke_routes.push(name.clone());
+                self.attribute_routes.push((
+                    path.to_path_buf(),
+                    fqn.clone(),
+                    name.clone(),
+                    target(invoke),
+                ));
                 self.add(name, target(invoke));
             }
         }
@@ -230,12 +262,13 @@ impl Routes {
     fn read_yaml(
         &mut self,
         index: &Index,
-        parsed: Option<Arc<Parsed>>,
+        config_files: &ConfigFiles,
         file: &Path,
         files: &[PathBuf],
         config: &Path,
+        prefix: &str,
     ) {
-        let Some(parsed) = parsed else {
+        let Some(parsed) = config_files.get(file) else {
             self.unknown = true;
             return;
         };
@@ -279,11 +312,23 @@ impl Routes {
                     Import::Read => {}
                     Import::Symfony => self.symfony = true,
                     Import::Unknown => self.unknown = true,
+                    Import::File(imported, added) => {
+                        let prefix = format!("{prefix}{added}");
+                        let key = (imported.clone(), prefix.clone());
+                        if !self.read_files.contains(&key) {
+                            self.read_files.push(key);
+                            self.read_yaml(index, config_files, &imported, files, config, &prefix);
+                        }
+                    }
+                    Import::Prefixed(resource, added) => {
+                        self.prefix_attribute_routes(&resource, &format!("{prefix}{added}"))
+                    }
                 }
                 continue;
             }
             if let Some(alias) = value.get("alias").and_then(Yaml::text) {
-                self.aliases.push((name.clone(), alias.to_string()));
+                self.aliases
+                    .push((format!("{prefix}{name}"), alias.to_string()));
                 continue;
             }
             if value.get("alias").is_some() {
@@ -294,8 +339,9 @@ impl Routes {
                 continue;
             }
             let (start, end) = yaml::value_range(text, name, *start, *end);
+            let full = format!("{prefix}{name}");
             self.add(
-                name.clone(),
+                full.clone(),
                 RouteTarget {
                     location: Location {
                         path: file.to_path_buf(),
@@ -310,17 +356,38 @@ impl Routes {
                 .or_else(|| value.get("defaults")?.get("_controller"))
                 .and_then(Yaml::text);
             if let Some(target) = controller.and_then(|c| controller_target(index, c)) {
-                self.add(name.clone(), target);
+                self.add(full, target);
             }
+        }
+    }
+
+    /// Adds `prefix` before the names of the attribute routes `resource` reads.
+    fn prefix_attribute_routes(&mut self, resource: &AttributeResource, prefix: &str) {
+        let prefixed: Vec<(String, RouteTarget)> = self
+            .attribute_routes
+            .iter()
+            .filter(|(path, class, _, _)| match resource {
+                AttributeResource::Directory(dir) => path.starts_with(dir),
+                AttributeResource::Class(fqn) => class.eq_ignore_ascii_case(fqn),
+            })
+            .map(|(_, _, name, target)| (format!("{prefix}{name}"), target.clone()))
+            .collect();
+        for (name, target) in prefixed {
+            self.add(name, target);
         }
     }
 }
 
 /// What the import `value` of the route file `file` loads.
 fn import(index: &Index, file: &Path, value: &Yaml, files: &[PathBuf], config: &Path) -> Import {
-    if value.get("name_prefix").is_some() {
-        return Import::Unknown;
-    }
+    // A prefix the module cannot read leaves the imported names unknown.
+    let prefix = match value.get("name_prefix") {
+        None => None,
+        Some(prefix) => match prefix.text() {
+            Some(prefix) => Some(prefix.to_string()),
+            None => return Import::Unknown,
+        },
+    };
     let resource = value.get("resource");
     let Some(resource) = resource
         .and_then(Yaml::text)
@@ -329,10 +396,10 @@ fn import(index: &Index, file: &Path, value: &Yaml, files: &[PathBuf], config: &
         return Import::Unknown;
     };
     if resource == "routing.controllers" {
-        return Import::Read;
+        return prefix.map_or(Import::Read, |_| Import::Unknown);
     }
     if SYMFONY_RESOURCES.iter().any(|r| resource.starts_with(r)) {
-        return Import::Symfony;
+        return prefix.map_or(Import::Symfony, |_| Import::Unknown);
     }
     if resource.starts_with('@') || resource.contains(['*', '?', '{', '[']) {
         return Import::Unknown;
@@ -342,35 +409,49 @@ fn import(index: &Index, file: &Path, value: &Yaml, files: &[PathBuf], config: &
     if kind == Some("annotation") {
         return Import::Unknown;
     }
+    let project = config.parent().unwrap_or(config);
+    let resolved = normalize(&file.parent().unwrap_or(config).join(resource));
+    let in_project =
+        resolved.starts_with(project) && !resolved.components().any(|c| c.as_os_str() == "vendor");
     if kind == Some("attribute") {
         // Attribute routes of project classes are read wherever they are.
         if resource.contains('\\') && !resource.contains('/') {
+            let class = resource.trim_start_matches('\\');
             let project = index
-                .classes_named(resource.trim_start_matches('\\'))
+                .classes_named(class)
                 .iter()
-                .any(|class| index.is_project_code(class.path));
-            return if project {
-                Import::Read
-            } else {
-                Import::Unknown
+                .any(|found| index.is_project_code(found.path));
+            return match (project, prefix) {
+                (false, _) => Import::Unknown,
+                (true, None) => Import::Read,
+                (true, Some(prefix)) => {
+                    Import::Prefixed(AttributeResource::Class(class.to_string()), prefix)
+                }
             };
         }
-        let resolved = normalize(&file.parent().unwrap_or(config).join(resource));
-        let outside = config.parent().is_none_or(|dir| !resolved.starts_with(dir))
-            || resolved.components().any(|c| c.as_os_str() == "vendor");
-        return if outside {
-            Import::Unknown
-        } else {
-            Import::Read
+        return match (in_project, prefix) {
+            (false, _) => Import::Unknown,
+            (true, None) => Import::Read,
+            (true, Some(prefix)) => {
+                Import::Prefixed(AttributeResource::Directory(resolved), prefix)
+            }
         };
     }
     if kind.is_some_and(|k| k != "yaml" && k != "directory") {
         return Import::Unknown;
     }
-    let resolved = normalize(&file.parent().unwrap_or(config).join(resource));
-    let read = files.contains(&resolved)
-        || (resolved.is_dir() && resolved.starts_with(config.join("routes")));
-    if read { Import::Read } else { Import::Unknown }
+    if resolved.is_dir() {
+        let read = resolved.starts_with(config.join("routes")) && prefix.is_none();
+        return if read { Import::Read } else { Import::Unknown };
+    }
+    match prefix {
+        None if files.contains(&resolved) => Import::Read,
+        // A route file read only through this import, or again under a prefix.
+        prefix if in_project && is_yaml(&resolved) && resolved.is_file() => {
+            Import::File(resolved, prefix.unwrap_or_default())
+        }
+        _ => Import::Unknown,
+    }
 }
 
 /// `path` with `.` and `..` components resolved without touching the disk.
