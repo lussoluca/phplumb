@@ -468,3 +468,45 @@ fn project_classes_with_built_in_names_keep_their_references() {
     let paths: Vec<PathBuf> = found.into_iter().map(|l| l.path).collect();
     assert_eq!(paths, vec![root.join("src/Uses.php")]);
 }
+
+#[test]
+fn hover_shows_language_level_types() {
+    let mut index = build(&DiscoverOptions::default());
+    let (path, source, offset) = at("app/Uses.php", "modify", 0);
+    let hover = index.hover(&path, &source, offset).expect("a hover");
+    assert!(
+        hover
+            .markdown
+            .contains("DateTimeImmutable::modify(string $modifier): DateTimeImmutable"),
+        "{}",
+        hover.markdown
+    );
+    assert!(!hover.markdown.contains("#["), "{}", hover.markdown);
+}
+
+#[test]
+fn stub_signatures_keep_one_type() {
+    let source = stub(
+        "class C {\n\
+         public function f(#[LanguageLevelTypeAware(['8.0' => 'int'], default: '')] int $a, #[\\SensitiveParameter] $b) {}\n\
+         }\n",
+    );
+    let summary = summarize_stub(source.as_bytes());
+    let f = methods(class(&summary.declarations, "C"), "f")[0];
+    assert_eq!(f.signature, "public function f(int $a, $b)");
+}
+
+#[test]
+fn stub_functions_show_language_level_types() {
+    let source = stub(
+        "#[LanguageLevelTypeAware(['8.0' => 'string'], default: 'string|false')]\n\
+         function g(#[LanguageLevelTypeAware(['8.0' => 'array'], default: '')] $list) {}\n",
+    );
+    let summary = summarize_stub(source.as_bytes());
+    let g = summary
+        .declarations
+        .iter()
+        .find(|d| d.fqn == "g")
+        .expect("function g");
+    assert_eq!(g.signature, "function g(array $list): string");
+}

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use crate::index::Index;
 use crate::metadata::{MetaValue, Metadata};
 use crate::phpdoc::{self, NameContext, TypeExpr};
-use crate::summary::{Declaration, FileSummary, SymbolKind, pick_type, summarize};
+use crate::summary::{Declaration, FileSummary, MemberKind, SymbolKind, pick_type, summarize};
 
 /// The PHP version whose declarations the stubs give.
 pub const PHP_VERSION: (u32, u32) = (8, 5);
@@ -61,7 +61,7 @@ pub(crate) fn load(dir: &Path) -> Option<Arc<Index>> {
 
 /// The summary of a stub file as PHP `PHP_VERSION` has it: declarations it lacks
 /// are dropped, each function and member is kept once (its last declaration), and
-/// return types follow `LanguageLevelTypeAware`.
+/// return types and signatures follow `LanguageLevelTypeAware`.
 pub fn summarize_stub(source: &[u8]) -> FileSummary {
     let mut summary = summarize(source);
     summary.declarations.retain(|declaration| {
@@ -87,6 +87,12 @@ fn apply_versions(declaration: &mut Declaration) {
     if let Some(ty) = language_level_type(&declaration.metadata, &names) {
         declaration.returns = pick_type(doc_returns(declaration.doc.as_deref(), &names), Some(ty));
     }
+    if declaration.kind == SymbolKind::Function {
+        declaration.signature = plain_signature(
+            &declaration.signature,
+            language_level_text(&declaration.metadata).as_deref(),
+        );
+    }
     let Some(shape) = &mut declaration.class else {
         return;
     };
@@ -94,6 +100,12 @@ fn apply_versions(declaration: &mut Declaration) {
     for member in &mut shape.members {
         if let Some(ty) = language_level_type(&member.metadata, &names) {
             member.ty = pick_type(doc_returns(member.doc.as_deref(), &names), Some(ty));
+        }
+        if member.kind == MemberKind::Method {
+            member.signature = plain_signature(
+                &member.signature,
+                language_level_text(&member.metadata).as_deref(),
+            );
         }
     }
     keep_last(&mut shape.members, |member| {
@@ -113,9 +125,15 @@ fn available(metadata: &[Metadata]) -> bool {
         })
 }
 
-/// The type `LanguageLevelTypeAware` in `metadata` gives in `PHP_VERSION`: the entry
-/// of the newest version not above it, else the default; none when that is empty.
+/// The type `LanguageLevelTypeAware` in `metadata` gives in `PHP_VERSION`.
 fn language_level_type(metadata: &[Metadata], names: &StubNames) -> Option<TypeExpr> {
+    language_level_text(metadata).map(|text| phpdoc::parse_type(&text, names))
+}
+
+/// The type text `LanguageLevelTypeAware` in `metadata` gives in `PHP_VERSION`: the
+/// entry of the newest version not above it, else the default; none when that is
+/// empty.
+fn language_level_text(metadata: &[Metadata]) -> Option<String> {
     let meta = metadata
         .iter()
         .find(|meta| meta.name.eq_ignore_ascii_case(TYPE_AWARE))?;
@@ -131,8 +149,87 @@ fn language_level_type(metadata: &[Metadata], names: &StubNames) -> Option<TypeE
             .map(|(_, text)| text),
         _ => None,
     };
-    let text = by_version.or_else(|| argument_text(meta, "default"))?;
-    (!text.trim().is_empty()).then(|| phpdoc::parse_type(text, names))
+    let text = by_version
+        .or_else(|| argument_text(meta, "default"))?
+        .trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// A function or method signature as PHP `PHP_VERSION` declares it: parameter
+/// attributes are dropped, `LanguageLevelTypeAware` leaves its type before an
+/// untyped parameter, and `returns` is added when the signature declares no
+/// return type.
+fn plain_signature(signature: &str, returns: Option<&str>) -> String {
+    let mut out = String::new();
+    let mut rest = signature;
+    while let Some(start) = rest.find("#[") {
+        out.push_str(&rest[..start]);
+        let Some(len) = attribute_group_len(&rest[start..]) else {
+            break;
+        };
+        let group = &rest[start..start + len];
+        rest = rest[start + len..].trim_start();
+        if rest.starts_with(['$', '&', '.'])
+            && let Some(ty) = attribute_type(group)
+        {
+            out.push_str(&ty);
+            out.push(' ');
+        }
+    }
+    out.push_str(rest);
+    match returns {
+        Some(returns) if out.trim_end().ends_with(')') => {
+            format!("{}: {returns}", out.trim_end())
+        }
+        _ => out,
+    }
+}
+
+/// The length of the attribute group `#[...]` that `text` starts with, quotes and
+/// nested brackets included; none when it is not closed.
+fn attribute_group_len(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for (i, byte) in text.bytes().enumerate().skip(1) {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == open {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The type a `LanguageLevelTypeAware` attribute group gives in `PHP_VERSION`, read
+/// by summarizing the group on a function of its own.
+fn attribute_type(group: &str) -> Option<String> {
+    if !group.contains("LanguageLevelTypeAware") {
+        return None;
+    }
+    let source = format!("<?php\nuse {TYPE_AWARE};\n{group}\nfunction phplumb_attribute() {{}}\n");
+    let summary = summarize(source.as_bytes());
+    let function = summary
+        .declarations
+        .iter()
+        .find(|d| d.fqn == "phplumb_attribute")?;
+    language_level_text(&function.metadata)
 }
 
 /// The `@return` type of `doc`.

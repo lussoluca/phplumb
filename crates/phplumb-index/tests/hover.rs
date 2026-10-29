@@ -83,3 +83,25 @@ fn hover_on_a_static_property_shows_the_property_not_a_local() {
 
     assert!(markdown.contains("Lib\\Holder::$prop"), "{markdown}");
 }
+
+#[test]
+fn project_parameter_attributes_stay_in_hover() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let source =
+        "<?php\nfunction secret(#[\\SensitiveParameter] string $p): void {}\nsecret('x');\n";
+    fs::write(root.join("Use.php"), source).unwrap();
+    let mut index = Index::build(&root, &DiscoverOptions::default()).unwrap().0;
+    let path = root.join("Use.php");
+    let offset = source.rfind("secret").unwrap() as u32;
+
+    let markdown = index
+        .hover(&path, source.as_bytes(), offset)
+        .unwrap()
+        .markdown;
+
+    assert!(
+        markdown.contains("function secret(#[\\SensitiveParameter] string $p): void"),
+        "{markdown}"
+    );
+}
