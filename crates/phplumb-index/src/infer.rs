@@ -2045,7 +2045,16 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     ) -> TypeExpr {
         let mut types = Vec::new();
         for (class, args) in classes_with_args(receiver) {
-            let static_class = static_class.unwrap_or(&class);
+            // `static` is the receiver with its arguments, unless late static binding
+            // is forwarded from another class.
+            let static_type = match static_class {
+                Some(forwarded) => TypeExpr::Named(forwarded.to_string()),
+                None if !args.is_empty() => TypeExpr::Generic {
+                    class: class.clone(),
+                    args: args.clone(),
+                },
+                None => TypeExpr::Named(class.clone()),
+            };
             for (found, member) in self.index.find_member(&class, kind, name) {
                 let typed = match &member.ty {
                     Some(_) => Some((found, member)),
@@ -2076,7 +2085,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     }
                     _ => ty.clone(),
                 };
-                types.push(bind(&ty, static_class, self_class, parent));
+                types.push(bind(&ty, &static_type, self_class, parent));
             }
             if kind == MemberKind::Property {
                 types.extend(self.assigned_types(&class, name));
@@ -2275,7 +2284,12 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         match self.enclosing(at) {
             Some(class) => {
                 let parent = self.enclosing_parent(at);
-                bind(&ty, &class, &class, parent.as_deref())
+                bind(
+                    &ty,
+                    &TypeExpr::Named(class.clone()),
+                    &class,
+                    parent.as_deref(),
+                )
             }
             None => ty,
         }
@@ -2544,27 +2558,27 @@ fn is_plain_value(expression: &Expression<'_>) -> bool {
     }
 }
 
-/// Replaces `static`/`$this` with `static_class`, `self` with `self_class` and
+/// Replaces `static`/`$this` with `static_type`, `self` with `self_class` and
 /// `parent` with `parent`.
-fn bind(ty: &TypeExpr, static_class: &str, self_class: &str, parent: Option<&str>) -> TypeExpr {
+fn bind(ty: &TypeExpr, static_type: &TypeExpr, self_class: &str, parent: Option<&str>) -> TypeExpr {
     match ty {
-        TypeExpr::StaticType => TypeExpr::Named(static_class.to_string()),
+        TypeExpr::StaticType => static_type.clone(),
         TypeExpr::SelfType => TypeExpr::Named(self_class.to_string()),
         TypeExpr::ParentType => parent.map_or(TypeExpr::Other, |p| TypeExpr::Named(p.to_string())),
         TypeExpr::ArrayOf(element) => {
-            TypeExpr::ArrayOf(Box::new(bind(element, static_class, self_class, parent)))
+            TypeExpr::ArrayOf(Box::new(bind(element, static_type, self_class, parent)))
         }
         TypeExpr::Generic { class, args } => TypeExpr::Generic {
             class: class.clone(),
             args: args
                 .iter()
-                .map(|arg| bind(arg, static_class, self_class, parent))
+                .map(|arg| bind(arg, static_type, self_class, parent))
                 .collect(),
         },
         TypeExpr::Union(members) => union(
             members
                 .iter()
-                .map(|m| bind(m, static_class, self_class, parent))
+                .map(|m| bind(m, static_type, self_class, parent))
                 .collect(),
         ),
         other => other.clone(),
