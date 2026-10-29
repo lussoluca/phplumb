@@ -169,9 +169,14 @@ impl Templates {
             let Some(dir) = dir else {
                 return TemplateStatus::Unknown;
             };
+            // The operating system resolves `.` and `..`, as for Twig's `is_file()`.
             let path = dir.join(&rest);
             if path.is_file() {
-                return TemplateStatus::Found(path);
+                let relative = rest.split('/').any(|part| part == "." || part == "..");
+                return TemplateStatus::Found(match relative {
+                    true => path.canonicalize().unwrap_or(path),
+                    false => path,
+                });
             }
         }
         if configured && !self.unknown && !(namespace.is_none() && self.main_unknown) {
@@ -240,19 +245,21 @@ fn has_unread_twig_configuration(packages: &Path, config_files: &ConfigFiles) ->
     })
 }
 
-/// `name` with empty and `.` parts dropped and each `..` taking off the part before
-/// it, as PHP resolves the path Twig's loader builds; none when a `..` climbs above
-/// the start or nothing is left.
+/// `name` with runs of `/` collapsed, as Twig's loader normalizes it; none when a
+/// `..` climbs above the start, which `FilesystemLoader::validateName` refuses.
 fn normalize(name: &str) -> Option<String> {
+    let mut level = 0;
     let mut parts: Vec<&str> = Vec::new();
-    for part in name.split('/') {
+    for part in name.split('/').filter(|part| !part.is_empty()) {
         match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            part => parts.push(part),
+            ".." => level -= 1,
+            "." => {}
+            _ => level += 1,
         }
+        if level < 0 {
+            return None;
+        }
+        parts.push(part);
     }
     (!parts.is_empty()).then(|| parts.join("/"))
 }

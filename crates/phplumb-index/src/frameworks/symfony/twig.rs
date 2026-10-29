@@ -55,8 +55,9 @@ fn is_route_argument(source: &[u8], literal: &Literal) -> bool {
 }
 
 /// The template name under `offset`: the whole first argument of `include(` or
-/// `source(`, or the template a tag names, as an element of a list for `extends`
-/// and `include`.
+/// `source(` or an element of a list there, the second argument of `block(`, the
+/// template a tag names (also an element of a list for `extends` and `include`, or
+/// a branch of a conditional), or a `form_theme` theme.
 pub(crate) fn template_name_at(source: &[u8], offset: u32) -> Option<(String, u32, u32)> {
     let literal = literal_at(source, offset as usize)?;
     template_use(source, &literal).map(|_| literal.value(source))
@@ -65,9 +66,10 @@ pub(crate) fn template_name_at(source: &[u8], offset: u32) -> Option<(String, u3
 /// Whether the literal names a template, and whether that template must exist:
 /// one of a list, or a branch of a conditional, may be missing.
 fn template_use(source: &[u8], literal: &Literal) -> Option<bool> {
-    if is_function_argument(source, literal, &["include", "source"])
-        || is_second_argument(source, literal, "block")
-    {
+    // `{% include('a') %}` is the tag, whose argument goes on past the parenthesis.
+    let function = is_function_argument(source, literal, &["include", "source"])
+        && !is_tag_parenthesis(source, literal);
+    if function || is_second_argument(source, literal, "block") {
         return Some(true);
     }
     if is_function_list_element(source, literal, &["include"]) {
@@ -84,7 +86,8 @@ fn template_use(source: &[u8], literal: &Literal) -> Option<bool> {
 
 /// Every route name and template name `source` writes as a whole literal argument,
 /// with its range inside the quotes. Names a template may lack, in an element of a
-/// list or with `ignore missing`, are left out, as is text inside `verbatim`.
+/// list, a branch of a conditional or with `ignore missing`, are left out, as is
+/// text inside `verbatim`.
 pub(crate) fn names(source: &[u8]) -> Vec<(TwigName, String, u32, u32)> {
     let mut found = Vec::new();
     let mut i = 0;
@@ -440,16 +443,12 @@ fn is_tag_argument(source: &[u8], literal: &Literal) -> bool {
     if !literal.tag {
         return false;
     }
-    let (start, end) = literal.block;
+    let end = literal.block.1;
     let tag = tag_name(source, literal.block);
     if !TEMPLATE_TAGS.contains(&tag) {
         return false;
     }
-    let mut i = skip_spaces(source, start, end);
-    if i < end && matches!(source[i], b'-' | b'~') {
-        i = skip_spaces(source, i + 1, end);
-    }
-    let argument = skip_spaces(source, i + tag.len(), end);
+    let argument = tag_argument(source, literal.block);
     if argument == literal.quote {
         return !continues(source, literal.close + 1, end);
     }
@@ -498,17 +497,37 @@ fn is_tag_argument(source: &[u8], literal: &Literal) -> bool {
 }
 
 /// Whether the expression goes on at `from`, past spaces, before `end`: a `~`,
-/// `|`, `.`, `+`, `[` or `(`, except a `~` that only trims the whitespace after the
-/// tag.
+/// `|`, `.`, `+`, `[` or `(`, except a `~` that trims the whitespace after the tag.
 fn continues(source: &[u8], from: usize, end: usize) -> bool {
     let next = skip_spaces(source, from, end);
-    if next >= end {
+    !at_end(source, next, end) && b"~|.+[(".contains(&source[next])
+}
+
+/// Whether `at` is the end of the block: its closing delimiter, or the `-` or `~`
+/// right before it that trims the whitespace after it.
+fn at_end(source: &[u8], at: usize, end: usize) -> bool {
+    at >= end || (matches!(source[at], b'-' | b'~') && at + 1 == end)
+}
+
+/// Where the argument of the tag between `start` and `end` starts, past its name.
+fn tag_argument(source: &[u8], (start, end): (usize, usize)) -> usize {
+    let mut i = skip_spaces(source, start, end);
+    if i < end && matches!(source[i], b'-' | b'~') {
+        i = skip_spaces(source, i + 1, end);
+    }
+    let tag = tag_name(source, (start, end));
+    skip_spaces(source, i + tag.len(), end)
+}
+
+/// Whether the literal is right inside a parenthesis that opens a template tag's
+/// argument, as in `{% include('a') %}`.
+fn is_tag_parenthesis(source: &[u8], literal: &Literal) -> bool {
+    if !literal.tag || !TEMPLATE_TAGS.contains(&tag_name(source, literal.block)) {
         return false;
     }
-    if source[next] == b'~' && skip_spaces(source, next + 1, end) == end {
-        return false;
-    }
-    b"~|.+[(".contains(&source[next])
+    let argument = tag_argument(source, literal.block);
+    source.get(argument) == Some(&b'(')
+        && skip_spaces(source, argument + 1, literal.block.1) == literal.quote
 }
 
 /// Where the group opened at `open` closes, past nested groups and strings.
@@ -605,9 +624,9 @@ fn is_conditional_branch(source: &[u8], literal: &Literal) -> bool {
     enclosing_open(source, block, literal.quote).is_none()
         && before > block
         && matches!(source[before - 1], b'?' | b':')
-        && (after >= end
+        && (at_end(source, after, end)
             || source[after] == b':'
-            || (source[after].is_ascii_alphabetic() && !continues(source, after, end)))
+            || source[after].is_ascii_alphabetic())
 }
 
 /// Whether the literal is a theme of a `form_theme` tag, and whether it must exist:
@@ -628,16 +647,12 @@ fn form_theme(source: &[u8], literal: &Literal) -> Option<bool> {
         return in_themes.then_some(false);
     }
     // Past the form: a theme ends its own expression.
-    let mut i = skip_spaces(source, block, end);
-    if i < end && matches!(source[i], b'-' | b'~') {
-        i = skip_spaces(source, i + 1, end);
-    }
-    let first = skip_spaces(source, i + "form_theme".len(), end);
+    let first = tag_argument(source, literal.block);
     let operator = b"~|.+-*/%=<>?:(,[{".contains(&source[before - 1]);
     let after = skip_spaces(source, literal.close + 1, end);
-    let ends = after >= end
+    let ends = at_end(source, after, end)
         || matches!(source[after], b'\'' | b'"')
-        || (source[after].is_ascii_alphabetic() && !continues(source, after, end));
+        || source[after].is_ascii_alphabetic();
     (literal.quote != first && !operator && ends).then_some(true)
 }
 
@@ -682,6 +697,10 @@ mod tests {
             ("{% form_theme form 'x' 'a' %}", "'a'"),
             ("{% form_theme form with 'a' %}", "'a'"),
             ("{% form_theme form with ['x', 'a'] %}", "'a'"),
+            ("{% form_theme form 'a' -%}", "'a'"),
+            ("{% form_theme form with 'a' ~%}", "'a'"),
+            ("{% extends x ? 'b' : 'a' -%}", "'a'"),
+            ("{% include ('a') %}", "'a'"),
         ] {
             assert_eq!(template(source, needle), Some("a".into()), "{source}");
         }
@@ -694,6 +713,9 @@ mod tests {
             ("{% form_theme form with {a: 'b'} %}", "'b'"),
             ("{{ include(['a'] ~ b) }}", "'a'"),
             ("{{ x.include(['a']) }}", "'a'"),
+            ("{% include('a') ~ b %}", "'a'"),
+            ("{% include ('a') ~ b %}", "'a'"),
+            ("{% include 'a' ~ %}", "'a'"),
         ] {
             assert_eq!(template(source, needle), None, "{source} {needle}");
         }

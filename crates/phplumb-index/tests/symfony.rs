@@ -1374,15 +1374,16 @@ fn messages(index: &Index, path: &Path) -> Vec<String> {
 #[test]
 fn normalized_template_names_open_their_file() {
     let (_dir, root, mut index) = copied();
+    add_file(&mut index, &root, "templates/sub/keep.html.twig", "keep\n");
     let path = add_file(
         &mut index,
         &root,
         "templates/normalized.html.twig",
-        "{% include 'x/../page.html.twig' %}\n{% include './/page.html.twig' %}\n{% include '../page.html.twig' %}\n",
+        "{% include 'sub/../page.html.twig' %}\n{% include './/page.html.twig' %}\n{% include '../page.html.twig' %}\n{% include 'nope/../page.html.twig' %}\n",
     );
 
     assert_eq!(
-        opened(&mut index, &path, "'x/../"),
+        opened(&mut index, &path, "'sub/../"),
         ["templates/page.html.twig"]
     );
     assert_eq!(
@@ -1390,7 +1391,12 @@ fn normalized_template_names_open_their_file() {
         ["templates/page.html.twig"]
     );
     assert!(opened(&mut index, &path, "'../").is_empty());
-    assert!(messages(&index, &path).is_empty());
+    // The operating system resolves `..` after a directory that must exist.
+    assert!(opened(&mut index, &path, "'nope/").is_empty());
+    assert_eq!(
+        messages(&index, &path),
+        ["Undefined template 'nope/../page.html.twig'"]
+    );
 }
 
 #[test]
