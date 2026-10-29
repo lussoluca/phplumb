@@ -127,6 +127,19 @@ fn display(ty: &TypeExpr) -> String {
             args.iter().map(display).collect::<Vec<_>>().join(", ")
         ),
         TypeExpr::ClassString(class) => format!("class-string<{}>", display(class)),
+        TypeExpr::Scalar(name) => name.clone(),
+        TypeExpr::Shape(entries) => format!(
+            "array{{{}}}",
+            entries
+                .iter()
+                .map(|(key, ty)| format!("{key}: {}", display(ty)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypeExpr::Callable(params) => format!(
+            "callable({})",
+            params.iter().map(display).collect::<Vec<_>>().join(", ")
+        ),
         TypeExpr::Union(members) => members.iter().map(display).collect::<Vec<_>>().join("|"),
         TypeExpr::Other => "mixed".to_string(),
     }

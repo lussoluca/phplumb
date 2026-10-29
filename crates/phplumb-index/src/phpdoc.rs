@@ -21,6 +21,13 @@ pub enum TypeExpr {
         class: String,
         args: Vec<TypeExpr>,
     },
+    /// `array{key: A, B}`: each entry's key, the position for unkeyed ones, and type.
+    Shape(Vec<(String, TypeExpr)>),
+    /// `callable(A, B): R` or `Closure(A, B): R`: the parameter types.
+    Callable(Vec<TypeExpr>),
+    /// A scalar or pseudo-type written as a generic argument, such as the `int` of
+    /// `Collection<int, Item>`, kept for display; read like `Other` elsewhere.
+    Scalar(String),
     /// `class-string<T>`: the name of a class, not an object of it.
     ClassString(Box<TypeExpr>),
     /// Unions and intersections: navigation treats both as "any of these".
@@ -58,7 +65,8 @@ pub struct DocBlock {
     /// `@template` names, resolved like class names so that they equal the
     /// `Named` types the class's members carry.
     pub templates: Vec<String>,
-    /// The generic types of `@extends` and `@implements`, as class and arguments.
+    /// The generic types of `@extends`, `@implements` and `@use`, as class and
+    /// arguments.
     pub generic_supertypes: Vec<(String, Vec<TypeExpr>)>,
 }
 
@@ -114,6 +122,7 @@ pub fn parse_type(text: &str, names: &dyn NameContext) -> TypeExpr {
         pos: 0,
         names,
         found: Vec::new(),
+        generic_depth: 0,
     };
     finish(parser.union())
 }
@@ -127,6 +136,7 @@ fn type_class_names(text: &str, names: &dyn NameContext) -> Vec<(usize, usize, S
         pos: 0,
         names,
         found: Vec::new(),
+        generic_depth: 0,
     };
     parser.union();
     parser
@@ -155,6 +165,8 @@ struct TypeParser<'a> {
     names: &'a dyn NameContext,
     /// The byte range and name of each class the type names.
     found: Vec<(usize, usize, String)>,
+    /// How many generic argument lists the parser is inside.
+    generic_depth: usize,
 }
 
 impl TypeParser<'_> {
@@ -227,6 +239,17 @@ impl TypeParser<'_> {
             Some(b'(') => {
                 self.pos += 1;
                 let inner = self.union();
+                // `(Subject is [not] Type ? A : B)` is either branch.
+                if self.keyword("is") {
+                    self.keyword("not");
+                    self.union();
+                    self.eat(b'?');
+                    let yes = self.union();
+                    self.eat(b':');
+                    let no = self.union();
+                    self.eat(b')');
+                    return merge(vec![yes, no]);
+                }
                 self.eat(b')');
                 inner
             }
@@ -254,6 +277,26 @@ impl TypeParser<'_> {
     fn named(&mut self) -> Parsed {
         let start = self.pos;
         let word = self.word();
+        // `Foo::BAR` and `Foo::BAR_*` are constant values, not objects of `Foo`.
+        if self.text[self.pos..].starts_with(b"::") {
+            let end = self.pos;
+            let lower = word.to_ascii_lowercase();
+            if !matches!(lower.as_str(), "self" | "static" | "parent") {
+                let fqn = match word.strip_prefix('\\') {
+                    Some(qualified) => qualified.to_string(),
+                    None => self.names.resolve_class(&word),
+                };
+                self.found.push((start, end, fqn));
+            }
+            self.pos += 2;
+            while self
+                .peek()
+                .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'*')
+            {
+                self.pos += 1;
+            }
+            return Parsed::Type(TypeExpr::Other);
+        }
         let end = self.pos;
         let recorded = self.found.len();
         self.skip_spaces();
@@ -263,15 +306,26 @@ impl TypeParser<'_> {
                 Some(self.generic_args())
             }
             Some(b'{') => {
+                if ARRAY_LIKE.contains(&word.to_ascii_lowercase().as_str()) {
+                    self.pos += 1;
+                    return Parsed::Type(TypeExpr::Shape(self.shape_entries()));
+                }
                 self.skip_balanced(b'{', b'}');
                 return Parsed::Type(TypeExpr::Other);
             }
             Some(b'(') => {
-                self.skip_balanced(b'(', b')');
+                let lower = word.trim_start_matches('\\').to_ascii_lowercase();
+                let params = if lower == "callable" || lower == "closure" {
+                    self.pos += 1;
+                    Some(self.callable_params())
+                } else {
+                    self.skip_balanced(b'(', b')');
+                    None
+                };
                 if self.eat(b':') {
                     self.postfix();
                 }
-                return Parsed::Type(TypeExpr::Other);
+                return Parsed::Type(params.map_or(TypeExpr::Other, TypeExpr::Callable));
             }
             _ => None,
         };
@@ -296,6 +350,10 @@ impl TypeParser<'_> {
                 Some((1, Some(Parsed::Type(class)))) => TypeExpr::ClassString(Box::new(class)),
                 _ => TypeExpr::Other,
             },
+            // A generic argument keeps its scalar as written, for display.
+            _ if NON_CLASS.contains(&lower.as_str()) && self.generic_depth > 0 => {
+                TypeExpr::Scalar(word.clone())
+            }
             _ if NON_CLASS.contains(&lower.as_str()) => TypeExpr::Other,
             _ => {
                 let fqn = match word.strip_prefix('\\') {
@@ -314,12 +372,127 @@ impl TypeParser<'_> {
         })
     }
 
+    /// The parameter types of `callable(A, B $name, ...)`, after its `(`, up to and
+    /// including its `)`.
+    fn callable_params(&mut self) -> Vec<TypeExpr> {
+        let mut params = Vec::new();
+        loop {
+            self.skip_spaces();
+            if self.peek().is_none() || self.eat(b')') {
+                return params;
+            }
+            params.push(finish(self.union()));
+            // A name, a variadic or by-reference marker, or a default marker.
+            self.skip_spaces();
+            while matches!(self.peek(), Some(b'$' | b'.' | b'&' | b'=')) {
+                if self.peek() == Some(b'$') {
+                    self.word();
+                } else {
+                    self.pos += 1;
+                }
+                self.skip_spaces();
+            }
+            if !self.eat(b',') {
+                self.eat(b')');
+                return params;
+            }
+        }
+    }
+
+    /// The entries of `array{key: A, B, ...}` after its `{`, up to and including its
+    /// `}`: keyed entries under their key, the others under their position.
+    fn shape_entries(&mut self) -> Vec<(String, TypeExpr)> {
+        let mut entries = Vec::new();
+        let mut position = 0;
+        loop {
+            self.skip_spaces();
+            if self.peek().is_none() || self.eat(b'}') {
+                return entries;
+            }
+            // An unsealed shape, `...` or `...<K, V>`, says nothing more.
+            if self.text[self.pos..].starts_with(b"...") {
+                self.pos += 3;
+                while self.peek().is_some_and(|b| b != b'}') {
+                    if self.peek() == Some(b'<') {
+                        self.skip_balanced(b'<', b'>');
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+                self.eat(b'}');
+                return entries;
+            }
+            let key = self.shape_key().unwrap_or_else(|| {
+                position += 1;
+                (position - 1).to_string()
+            });
+            entries.push((key, finish(self.union())));
+            if !self.eat(b',') {
+                self.eat(b'}');
+                return entries;
+            }
+        }
+    }
+
+    /// A shape key followed by `:` or `?:`, consumed; nothing consumed when the
+    /// entry has no key.
+    fn shape_key(&mut self) -> Option<String> {
+        let start = self.pos;
+        let key = match self.peek() {
+            Some(quote @ (b'\'' | b'"')) => {
+                let end = self.text[start + 1..]
+                    .iter()
+                    .position(|b| *b == quote)
+                    .map(|i| start + 1 + i)?;
+                self.pos = end + 1;
+                String::from_utf8_lossy(&self.text[start + 1..end]).into_owned()
+            }
+            Some(b) if b.is_ascii_alphanumeric() || b == b'_' => {
+                while self
+                    .peek()
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                {
+                    self.pos += 1;
+                }
+                String::from_utf8_lossy(&self.text[start..self.pos]).into_owned()
+            }
+            _ => return None,
+        };
+        self.skip_spaces();
+        if self.peek() == Some(b'?') {
+            self.pos += 1;
+            self.skip_spaces();
+        }
+        if self.peek() == Some(b':') && self.text.get(self.pos + 1) != Some(&b':') {
+            self.pos += 1;
+            return Some(key);
+        }
+        self.pos = start;
+        None
+    }
+
+    /// Consumes `word` when it comes next as a whole word.
+    fn keyword(&mut self, word: &str) -> bool {
+        self.skip_spaces();
+        let rest = &self.text[self.pos..];
+        let whole = rest.starts_with(word.as_bytes())
+            && rest
+                .get(word.len())
+                .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        if whole {
+            self.pos += word.len();
+        }
+        whole
+    }
+
     fn generic_args(&mut self) -> Vec<Parsed> {
+        self.generic_depth += 1;
         let mut args = vec![self.union()];
         while self.eat(b',') {
             args.push(self.union());
         }
         self.eat(b'>');
+        self.generic_depth -= 1;
         args
     }
 
@@ -404,7 +577,10 @@ fn split_type(text: &str) -> (&str, &str) {
         match c {
             '<' | '{' | '(' | '[' => depth += 1,
             '>' | '}' | ')' | ']' => depth -= 1,
-            c if c.is_whitespace() && depth <= 0 => return (&text[..i], text[i..].trim_start()),
+            // The return type of `callable(T): R` follows its colon.
+            c if c.is_whitespace() && depth <= 0 && !text[..i].ends_with("):") => {
+                return (&text[..i], text[i..].trim_start());
+            }
             _ => {}
         }
     }
@@ -734,7 +910,12 @@ pub fn parse_docblock(text: &str, names: &dyn NameContext) -> DocBlock {
                     templates.push(name);
                 }
             }
-            "extends" | "implements" | "template-extends" | "template-implements" => {
+            "extends"
+            | "implements"
+            | "use"
+            | "template-extends"
+            | "template-implements"
+            | "template-use" => {
                 if let TypeExpr::Generic { class, args } = parse_type(type_text, names) {
                     target.generic_supertypes.push((class, args));
                 }
@@ -846,18 +1027,60 @@ mod tests {
 
     #[test]
     fn scalars_and_shapes_are_other() {
-        for text in [
-            "int",
-            "array",
-            "array{a: int}",
-            "callable(int): void",
-            "mixed",
-            "string|int",
-            "class-string",
-            "",
-        ] {
+        for text in ["int", "array", "mixed", "string|int", "class-string", ""] {
             assert_eq!(ty(text), TypeExpr::Other, "{text}");
         }
+    }
+
+    #[test]
+    fn conditional_types_give_both_branches() {
+        for text in [
+            "(T is null ? Foo : Bar)",
+            "($x is string ? Foo : Bar)",
+            "(T is not null ? Foo : Bar)",
+        ] {
+            assert_eq!(ty(text), ty("Foo|Bar"), "{text}");
+        }
+    }
+
+    #[test]
+    fn callables_keep_their_parameter_types() {
+        assert_eq!(
+            ty("Closure(T, int): bool"),
+            TypeExpr::Callable(vec![named("App\\T"), TypeExpr::Other])
+        );
+        assert_eq!(
+            ty("callable(Foo $item): void"),
+            TypeExpr::Callable(vec![named("App\\Foo")])
+        );
+        assert_eq!(ty("\\Closure"), named("Closure"));
+    }
+
+    #[test]
+    fn callable_params_keep_their_names() {
+        let doc = parse_docblock("/**\n * @param Closure(T): bool $p\n */", &Names);
+        assert_eq!(
+            doc.params,
+            [("p".to_string(), TypeExpr::Callable(vec![named("App\\T")]))]
+        );
+    }
+
+    #[test]
+    fn shapes_keep_their_entries() {
+        assert_eq!(
+            ty("array{startedAt: \\DateTimeImmutable, id?: int}"),
+            TypeExpr::Shape(vec![
+                ("startedAt".to_string(), named("DateTimeImmutable")),
+                ("id".to_string(), TypeExpr::Other),
+            ])
+        );
+        assert_eq!(
+            ty("list{Foo, 'x'}"),
+            TypeExpr::Shape(vec![
+                ("0".to_string(), named("App\\Foo")),
+                ("1".to_string(), TypeExpr::Other),
+            ])
+        );
     }
 
     #[test]
@@ -881,7 +1104,7 @@ mod tests {
             ty("\\Lib\\Map<string, Foo>"),
             TypeExpr::Generic {
                 class: "Lib\\Map".to_string(),
-                args: vec![TypeExpr::Other, named("App\\Foo")],
+                args: vec![TypeExpr::Scalar("string".to_string()), named("App\\Foo")],
             }
         );
     }

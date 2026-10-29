@@ -791,9 +791,16 @@ fn to_fqn(name: &[u8]) -> String {
 /// PHPDoc wins when it names a class; otherwise the declared type, when it names
 /// anything navigable.
 pub(crate) fn pick_type(doc: Option<TypeExpr>, declared: Option<TypeExpr>) -> Option<TypeExpr> {
+    let declared = declared.filter(|ty| *ty != TypeExpr::Other);
     match doc {
         Some(doc) if names_a_class(&doc) => Some(doc),
-        _ => declared.filter(|ty| *ty != TypeExpr::Other),
+        // A documented callable keeps its parameter types beside the declared class,
+        // such as `Closure`.
+        Some(TypeExpr::Callable(params)) => Some(match declared {
+            Some(declared) => TypeExpr::Union(vec![declared, TypeExpr::Callable(params)]),
+            None => TypeExpr::Callable(params),
+        }),
+        _ => declared,
     }
 }
 
@@ -806,8 +813,9 @@ fn names_a_class(ty: &TypeExpr) -> bool {
         | TypeExpr::StaticType
         | TypeExpr::ParentType => true,
         TypeExpr::ArrayOf(element) | TypeExpr::ClassString(element) => names_a_class(element),
+        TypeExpr::Shape(entries) => entries.iter().any(|(_, ty)| names_a_class(ty)),
         TypeExpr::Union(members) => members.iter().any(names_a_class),
-        TypeExpr::Other => false,
+        TypeExpr::Scalar(_) | TypeExpr::Callable(_) | TypeExpr::Other => false,
     }
 }
 
@@ -837,6 +845,8 @@ type MembersFound = (
     Vec<u32>,
     Vec<String>,
     Vec<(u32, Vec<PendingMeta>)>,
+    // The generic traits that `@use` docblocks give arguments.
+    Vec<(String, Vec<TypeExpr>)>,
 );
 
 /// Parent, interfaces and traits as offsets of names the resolver resolved.
@@ -1267,7 +1277,7 @@ impl Collector<'_> {
     }
 
     fn class_like(&mut self, head: ClassHead, members: &Sequence<'_, ClassLikeMember<'_>>) {
-        let (members, traits, aliases, member_attributes) =
+        let (members, traits, aliases, member_attributes, generic_uses) =
             self.members(members, head.kind == SymbolKind::Interface);
         let annotations =
             get_docblock_before_position(self.program.trivia.as_slice(), head.node_start)
@@ -1302,7 +1312,11 @@ impl Collector<'_> {
                 annotations,
                 member_attributes,
                 templates: tags.templates,
-                generic_supertypes: tags.generic_supertypes,
+                generic_supertypes: tags
+                    .generic_supertypes
+                    .into_iter()
+                    .chain(generic_uses)
+                    .collect(),
             }),
         });
     }
@@ -1316,10 +1330,16 @@ impl Collector<'_> {
         let mut traits = Vec::new();
         let mut aliases = Vec::new();
         let mut attributes = Vec::new();
+        let mut generic_uses = Vec::new();
         for member in members.iter() {
             match member {
                 ClassLikeMember::TraitUse(trait_use) => {
                     traits.extend(trait_use.trait_names.iter().map(|n| n.span().start.offset));
+                    let start = trait_use.span().start.offset;
+                    generic_uses.extend(
+                        self.doc_tags(self.doc(start).as_deref(), start)
+                            .generic_supertypes,
+                    );
                     if let TraitUseSpecification::Concrete(specification) = &trait_use.specification
                     {
                         for adaptation in specification.adaptations.iter() {
@@ -1392,7 +1412,7 @@ impl Collector<'_> {
                 }
             }
         }
-        (out, traits, aliases, attributes)
+        (out, traits, aliases, attributes, generic_uses)
     }
 
     fn property(&self, property: &Property<'_>, out: &mut Vec<Member>) {
@@ -1753,7 +1773,7 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Collector<'arena>> for SyntaxVisitor {
         c: &mut Collector<'arena>,
     ) {
         let span = class.span();
-        let (members, _, _, _) = c.members(&class.members, false);
+        let (members, _, _, _, _) = c.members(&class.members, false);
         c.anonymous.push(PendingAnonymous {
             start: span.start.offset,
             end: span.end.offset,

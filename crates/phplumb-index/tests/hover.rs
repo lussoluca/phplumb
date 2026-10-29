@@ -105,3 +105,30 @@ fn project_parameter_attributes_stay_in_hover() {
         "{markdown}"
     );
 }
+
+#[test]
+fn hover_shows_scalar_generic_arguments() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join("lib")).unwrap();
+    fs::write(
+        root.join("lib/Collection.php"),
+        "<?php\nnamespace Lib;\n/**\n * @template K\n * @template V\n */\nclass Collection {}\n",
+    )
+    .unwrap();
+    let source = "<?php\nnamespace App;\nuse Lib\\Collection;\nclass Item {}\nfunction f(): void\n{\n    /** @var Collection<int, Item> $items */\n    $items = g();\n    $items;\n}\n";
+    fs::write(root.join("Use.php"), source).unwrap();
+    let mut index = Index::build(&root, &DiscoverOptions::default()).unwrap().0;
+    let path = root.join("Use.php");
+    let offset = source.rfind("$items").unwrap() as u32 + 1;
+
+    let markdown = index
+        .hover(&path, source.as_bytes(), offset)
+        .unwrap()
+        .markdown;
+
+    assert!(
+        markdown.contains("\\Lib\\Collection<int, \\App\\Item> $items"),
+        "{markdown}"
+    );
+}

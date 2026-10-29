@@ -84,7 +84,7 @@ fn generic_doc_types_keep_their_arguments() {
         property.ty,
         Some(TypeExpr::Generic {
             class: "Lib\\Collection".to_string(),
-            args: vec![TypeExpr::Other, named("App\\Item")],
+            args: vec![TypeExpr::Scalar("int".to_string()), named("App\\Item")],
         })
     );
 }
@@ -119,7 +119,7 @@ fn hover_shows_generic_arguments() {
     assert!(
         hover
             .markdown
-            .contains("\\Lib\\Collection<mixed, \\App\\Item> $c"),
+            .contains("\\Lib\\Collection<int, \\App\\Item> $c"),
         "{}",
         hover.markdown
     );

@@ -43,7 +43,7 @@ use mago_syntax::walker::Walker;
 
 use crate::calls::{self, CallKind};
 use crate::frameworks::{AttributeString, CallTarget, FoundCall, Framework, FrameworkCall};
-use crate::generics::{array_element, element_type, offset_type, substitute, supertype_args};
+use crate::generics::{array_element, element_type, entry_type, substitute, supertype_args};
 use crate::index::{Index, Location};
 use crate::phpdoc::{TypeExpr, array_of, parse_docblock, parse_type};
 use crate::summary::{
@@ -1017,6 +1017,9 @@ struct AssignFact<'arena> {
     end: u32,
     var: String,
     rhs: Option<&'arena Expression<'arena>>,
+    /// For a destructured variable, the keys from `rhs` to its value; `None` for a
+    /// key that is not a literal.
+    path: Vec<Option<String>>,
 }
 
 /// `$object->name = rhs` or `$object->name ??= rhs`.
@@ -1033,6 +1036,8 @@ struct ForeachFact<'arena> {
     start: u32,
     body_start: u32,
     value: Option<String>,
+    /// Variables a destructured value assigns, with the keys from the value to each.
+    entries: Vec<(String, Vec<Option<String>>)>,
     unknown: Vec<String>,
     iterable: &'arena Expression<'arena>,
 }
@@ -1069,6 +1074,15 @@ struct CallbackFact<'ast, 'arena> {
     position: usize,
 }
 
+/// A closure or arrow function given positionally to a method call.
+struct MethodCallbackFact<'ast, 'arena> {
+    /// Where the closure starts, as its scope does.
+    start: u32,
+    object: &'arena Expression<'arena>,
+    method: &'ast ClassLikeMemberSelector<'arena>,
+    position: usize,
+}
+
 #[derive(Default)]
 struct Facts<'ast, 'arena> {
     accesses: Vec<AccessFact<'arena>>,
@@ -1080,6 +1094,7 @@ struct Facts<'ast, 'arena> {
     narrowings: Vec<NarrowFact>,
     branches: Vec<BranchFact>,
     callbacks: Vec<CallbackFact<'ast, 'arena>>,
+    method_callbacks: Vec<MethodCallbackFact<'ast, 'arena>>,
     /// Static calls and constants reached through a variable, such as
     /// `$severity::from()`, with the variable as the object; navigation reads them.
     variable_statics: Vec<AccessFact<'arena>>,
@@ -1101,6 +1116,31 @@ impl<'ast, 'arena> Facts<'ast, 'arena> {
                 kind,
                 name: String::from_utf8_lossy(name.value).into_owned(),
                 object,
+            });
+        }
+    }
+
+    /// Records each closure or arrow function given positionally to a method call.
+    fn method_callbacks(
+        &mut self,
+        object: &'arena Expression<'arena>,
+        method: &'ast ClassLikeMemberSelector<'arena>,
+        arguments: &'ast ArgumentList<'arena>,
+    ) {
+        for (position, argument) in arguments.arguments.iter().enumerate() {
+            let Argument::Positional(argument) = argument else {
+                continue;
+            };
+            let start = match argument.value {
+                Expression::Closure(closure) => closure.span().start.offset,
+                Expression::ArrowFunction(arrow) => arrow.span().start.offset,
+                _ => continue,
+            };
+            self.method_callbacks.push(MethodCallbackFact {
+                start,
+                object,
+                method,
+                position,
             });
         }
     }
@@ -1141,6 +1181,7 @@ impl<'ast, 'arena> Facts<'ast, 'arena> {
             end,
             var,
             rhs: None,
+            path: Vec::new(),
         });
     }
 }
@@ -1168,6 +1209,7 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
 
     fn walk_in_method_call(&self, call: &'ast MethodCall<'arena>, f: &mut Facts<'ast, 'arena>) {
         f.access(call.object, &call.method, MemberKind::Method);
+        f.method_callbacks(call.object, &call.method, &call.argument_list);
     }
 
     fn walk_in_null_safe_method_call(
@@ -1176,6 +1218,7 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
         f: &mut Facts<'ast, 'arena>,
     ) {
         f.access(call.object, &call.method, MemberKind::Method);
+        f.method_callbacks(call.object, &call.method, &call.argument_list);
     }
 
     fn walk_in_property_access(
@@ -1301,11 +1344,18 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
                     end,
                     var: variable_name(variable.name),
                     rhs: Some(assignment.rhs),
+                    path: Vec::new(),
                 });
             }
             destructuring => {
-                for var in destructured(destructuring) {
-                    f.unknown(start, end, var);
+                for (var, path) in destructured_paths(destructuring) {
+                    f.assignments.push(AssignFact {
+                        start,
+                        end,
+                        var,
+                        rhs: Some(assignment.rhs),
+                        path,
+                    });
                 }
             }
         }
@@ -1344,18 +1394,18 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
             ForeachTarget::Value(target) => (None, target.value),
             ForeachTarget::KeyValue(target) => (Some(target.key), target.value),
         };
-        let mut unknown: Vec<String> = key.into_iter().flat_map(destructured).collect();
-        let value = match value {
-            Expression::Variable(Variable::Direct(variable)) => Some(variable_name(variable.name)),
-            destructuring => {
-                unknown.extend(destructured(destructuring));
-                None
+        let unknown: Vec<String> = key.into_iter().flat_map(destructured).collect();
+        let (value, entries) = match value {
+            Expression::Variable(Variable::Direct(variable)) => {
+                (Some(variable_name(variable.name)), Vec::new())
             }
+            destructuring => (None, destructured_paths(destructuring)),
         };
         f.foreaches.push(ForeachFact {
             start: foreach.span().start.offset,
             body_start: foreach.right_parenthesis.end.offset,
             value,
+            entries,
             unknown,
             iterable: foreach.expression,
         });
@@ -1480,6 +1530,53 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
     }
 }
 
+/// Each direct variable a destructuring target assigns, with the keys that lead
+/// from the destructured value to it: `[$a, $b]` gives `$a` key `0` and `$b` key
+/// `1`, `['k' => $c]` gives `$c` key `k`; a key that is not a literal is `None`.
+fn destructured_paths(target: &Expression<'_>) -> Vec<(String, Vec<Option<String>>)> {
+    let elements = match target {
+        Expression::Variable(Variable::Direct(variable)) => {
+            return vec![(variable_name(variable.name), Vec::new())];
+        }
+        Expression::Array(array) => &array.elements,
+        Expression::List(list) => &list.elements,
+        Expression::LegacyArray(array) => &array.elements,
+        _ => return Vec::new(),
+    };
+    let mut found = Vec::new();
+    let mut position = 0;
+    for element in elements.iter() {
+        let (key, value) = match element {
+            ArrayElement::KeyValue(element) => (literal_key(element.key), element.value),
+            ArrayElement::Value(element) => {
+                position += 1;
+                (Some((position - 1).to_string()), element.value)
+            }
+            ArrayElement::Missing(_) => {
+                position += 1;
+                continue;
+            }
+            _ => continue,
+        };
+        for (var, mut path) in destructured_paths(value) {
+            path.insert(0, key.clone());
+            found.push((var, path));
+        }
+    }
+    found
+}
+
+/// A string or integer literal used as an array key, as text.
+fn literal_key(expression: &Expression<'_>) -> Option<String> {
+    match expression {
+        Expression::Literal(Literal::String(literal)) => literal
+            .value
+            .map(|v| String::from_utf8_lossy(v).into_owned()),
+        Expression::Literal(Literal::Integer(literal)) => literal.value.map(|v| v.to_string()),
+        _ => None,
+    }
+}
+
 /// The direct variables a destructuring target (`[$a, $b]`, `list($a)`, nested)
 /// assigns, or a lone variable.
 fn destructured(target: &Expression<'_>) -> Vec<String> {
@@ -1549,6 +1646,8 @@ enum Binding<'f, 'ast, 'arena> {
     Param(&'f ScopeFact<'ast, 'arena>, usize),
     Assign(&'f AssignFact<'arena>),
     ForeachValue(&'f ForeachFact<'arena>),
+    /// A variable a destructured `foreach` value assigns, with the keys to it.
+    ForeachEntry(&'f ForeachFact<'arena>, &'f [Option<String>]),
     Unknown,
     Catch(&'f CatchFact<'ast, 'arena>),
     Narrow(u32),
@@ -1566,7 +1665,7 @@ enum State {
 impl State {
     fn of(ty: TypeExpr) -> State {
         match ty {
-            TypeExpr::Other => State::Unknown,
+            TypeExpr::Other | TypeExpr::Scalar(_) => State::Unknown,
             ty => State::Known(ty),
         }
     }
@@ -1665,6 +1764,37 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     /// The named class enclosing `at`; nothing inside an anonymous class.
     fn enclosing(&self, at: u32) -> Option<String> {
         self.summary.enclosing_class(at).and_then(|c| c.fqn.clone())
+    }
+
+    /// `parent`, the parent of the class around `at`, written with the arguments the
+    /// class's `@extends` gives it.
+    fn parent_type(&self, parent: String, at: u32) -> TypeExpr {
+        // The class's own templates are unknown inside it.
+        let args = self.enclosing(at).and_then(|class| {
+            let shape = self
+                .summary
+                .declarations
+                .iter()
+                .find(|d| d.fqn == class)?
+                .class
+                .as_ref()?;
+            shape
+                .generic_supertypes
+                .iter()
+                .find(|(supertype, _)| supertype.eq_ignore_ascii_case(&parent))
+                .map(|(_, args)| {
+                    args.iter()
+                        .map(|arg| substitute(arg, &shape.templates, &[]))
+                        .collect::<Vec<_>>()
+                })
+        });
+        match args {
+            Some(args) if !args.is_empty() => TypeExpr::Generic {
+                class: parent,
+                args,
+            },
+            _ => TypeExpr::Named(parent),
+        }
     }
 
     fn enclosing_parent(&self, at: u32) -> Option<String> {
@@ -1774,7 +1904,10 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     }
                     _ => None,
                 };
-                let receiver = TypeExpr::Named(class);
+                let receiver = match call.class {
+                    Expression::Parent(_) => self.parent_type(class, at),
+                    _ => TypeExpr::Named(class),
+                };
                 self.method_call(
                     &receiver,
                     &call.method,
@@ -1810,7 +1943,12 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 }
             }
             Expression::ArrayAccess(access) => {
-                offset_type(self.index, &self.expr(access.array, at, depth))
+                let key = literal_key(access.index);
+                entry_type(
+                    self.index,
+                    &self.expr(access.array, at, depth),
+                    key.as_deref(),
+                )
             }
             Expression::Access(Access::ClassConstant(access)) => {
                 match (self.class_of(access.class, at, depth), &access.constant) {
@@ -2089,7 +2227,11 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             };
             for (found, member) in self.index.find_member(&class, kind, name) {
                 let typed = match &member.ty {
-                    Some(_) => Some((found, member)),
+                    Some(ty) if !names_no_class(ty) => Some((found, member)),
+                    Some(_) => self
+                        .index
+                        .typed_ancestor(&found.declaration.fqn, kind, name)
+                        .or(Some((found, member))),
                     None => self
                         .index
                         .typed_ancestor(&found.declaration.fqn, kind, name),
@@ -2315,6 +2457,8 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             let mode = self.mode(foreach.start, at);
             if foreach.value.as_deref() == Some(name) {
                 bindings.push((foreach.start, mode, Binding::ForeachValue(foreach)));
+            } else if let Some((_, path)) = foreach.entries.iter().find(|(v, _)| v == name) {
+                bindings.push((foreach.start, mode, Binding::ForeachEntry(foreach, path)));
             } else if foreach.unknown.iter().any(|v| v == name) {
                 bindings.push((foreach.start, mode, Binding::Unknown));
             }
@@ -2406,6 +2550,13 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     fn binding_state(&self, binding: &Binding<'_, '_, '_>, depth: u32) -> State {
         match binding {
             Binding::Param(scope, i) => State::of(self.param_type(scope, *i, depth)),
+            Binding::Assign(assignment) if !assignment.path.is_empty() => match assignment.rhs {
+                Some(rhs) => State::of(self.entry_at(
+                    self.expr(rhs, assignment.start, depth + 1),
+                    &assignment.path,
+                )),
+                None => State::Unknown,
+            },
             Binding::Assign(assignment) => {
                 if let Some(ty) = self.assignment_doc(assignment) {
                     return State::of(ty);
@@ -2416,6 +2567,13 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     None => State::Unknown,
                 }
             }
+            Binding::ForeachEntry(foreach, path) => State::of(self.entry_at(
+                element_type(
+                    self.index,
+                    &self.expr(foreach.iterable, foreach.start, depth + 1),
+                ),
+                path,
+            )),
             Binding::ForeachValue(foreach) => State::of(element_type(
                 self.index,
                 &self.expr(foreach.iterable, foreach.start, depth + 1),
@@ -2473,6 +2631,12 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         own
     }
 
+    /// The value `keys` lead to inside a value of type `ty`.
+    fn entry_at(&self, ty: TypeExpr, keys: &[Option<String>]) -> TypeExpr {
+        keys.iter()
+            .fold(ty, |ty, key| entry_type(self.index, &ty, key.as_deref()))
+    }
+
     /// The type an ancestor's declaration of the method at `scope` gives its
     /// parameter `i`, as an interface documents it for its implementations.
     /// Closures, arrow functions and constructors are not tied to an ancestor's
@@ -2500,11 +2664,69 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         self.index.ancestor_param(fqn, &method.name, i)
     }
 
+    /// The type a method's callable parameter gives parameter `i` of a closure
+    /// written at that argument, such as `T` of `Closure(T): bool` with the
+    /// receiver's argument for `T`.
+    fn method_callback_param(&self, scope: &ScopeFact<'_, '_>, i: usize, depth: u32) -> TypeExpr {
+        let Some(callback) = self
+            .facts
+            .method_callbacks
+            .iter()
+            .find(|c| c.start == scope.start)
+        else {
+            return TypeExpr::Other;
+        };
+        let ClassLikeMemberSelector::Identifier(name) = callback.method else {
+            return TypeExpr::Other;
+        };
+        let name = String::from_utf8_lossy(name.value);
+        let receiver = self.expr(callback.object, callback.start, depth + 1);
+        let mut types = Vec::new();
+        for (class, args) in classes_with_args(&receiver) {
+            for (found, member) in self.index.find_member(&class, MemberKind::Method, &name) {
+                let Some((_, Some(ty))) = member.params.get(callback.position) else {
+                    continue;
+                };
+                let Some(param) = callable_params(ty).and_then(|params| params.get(i)) else {
+                    continue;
+                };
+                let declaration = found.declaration;
+                // The method's own templates are unknown here; the class's take the
+                // receiver's arguments.
+                let param = substitute(param, &member.templates, &[]);
+                let param = match &declaration.class {
+                    Some(shape) if !shape.templates.is_empty() => {
+                        let given = supertype_args(self.index, &class, &args, &declaration.fqn)
+                            .unwrap_or_default();
+                        substitute(&param, &shape.templates, &given)
+                    }
+                    _ => param,
+                };
+                let static_type = if args.is_empty() {
+                    TypeExpr::Named(class.clone())
+                } else {
+                    TypeExpr::Generic {
+                        class: class.clone(),
+                        args: args.clone(),
+                    }
+                };
+                let self_class = if declaration.kind == SymbolKind::Trait {
+                    class.as_str()
+                } else {
+                    declaration.fqn.as_str()
+                };
+                let parent = declaration.class.as_ref().and_then(|s| s.parent.as_deref());
+                types.push(bind(&param, &static_type, self_class, parent));
+            }
+        }
+        union(types)
+    }
+
     /// The element type that PHP passes to parameter `i` of a callback written at
     /// a positional argument of a built-in array function.
     fn callback_param(&self, scope: &ScopeFact<'_, '_>, i: usize, depth: u32) -> TypeExpr {
         let Some(callback) = self.facts.callbacks.iter().find(|c| c.start == scope.start) else {
-            return TypeExpr::Other;
+            return self.method_callback_param(scope, i, depth);
         };
         let Some(function) = self.builtin_function(callback.call.function) else {
             return TypeExpr::Other;
@@ -2518,8 +2740,16 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             ("array_walk" | "array_find" | "array_find_key" | "array_any" | "array_all", 1, 0) => 0,
             _ => return TypeExpr::Other,
         };
-        match positional(arguments, array) {
-            Some(value) => array_element(&self.expr(value, value.span().start.offset, depth + 1)),
+        if let Some(value) = positional(arguments, array) {
+            return array_element(&self.expr(value, value.span().start.offset, depth + 1));
+        }
+        // `...$lists` unpacks an array of arrays into the array arguments.
+        match spread_covering(arguments, array) {
+            Some(value) => array_element(&array_element(&self.expr(
+                value,
+                value.span().start.offset,
+                depth + 1,
+            ))),
             None => TypeExpr::Other,
         }
     }
@@ -2595,6 +2825,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         .find(|(var, _)| var.as_deref().is_none_or(|v| v == assignment.var))
         .map(|(_, ty)| ty)
         .and_then(|ty| pick_type(Some(ty), None))
+        .filter(|ty| !names_no_class(ty))
     }
 }
 
@@ -2692,10 +2923,20 @@ fn is_plain_value(expression: &Expression<'_>) -> bool {
     }
 }
 
+/// The parameter types of the callable in `ty`, alone or in a union.
+fn callable_params(ty: &TypeExpr) -> Option<&Vec<TypeExpr>> {
+    match ty {
+        TypeExpr::Callable(params) => Some(params),
+        TypeExpr::Union(members) => members.iter().find_map(callable_params),
+        _ => None,
+    }
+}
+
 /// Whether `ty` says nothing about classes: unknown, or an array of nothing known.
 pub(crate) fn names_no_class(ty: &TypeExpr) -> bool {
     match ty {
-        TypeExpr::Other => true,
+        TypeExpr::Other | TypeExpr::Scalar(_) | TypeExpr::Callable(_) => true,
+        TypeExpr::Shape(entries) => entries.iter().all(|(_, ty)| names_no_class(ty)),
         TypeExpr::ArrayOf(element) => names_no_class(element),
         TypeExpr::Union(members) => members.iter().all(names_no_class),
         _ => false,
@@ -2725,6 +2966,21 @@ fn bind(ty: &TypeExpr, static_type: &TypeExpr, self_class: &str, parent: Option<
                 .map(|m| bind(m, static_type, self_class, parent))
                 .collect(),
         ),
+        TypeExpr::Shape(entries) => TypeExpr::Shape(
+            entries
+                .iter()
+                .map(|(key, ty)| (key.clone(), bind(ty, static_type, self_class, parent)))
+                .collect(),
+        ),
+        TypeExpr::Callable(params) => TypeExpr::Callable(
+            params
+                .iter()
+                .map(|param| bind(param, static_type, self_class, parent))
+                .collect(),
+        ),
+        TypeExpr::ClassString(class) => {
+            TypeExpr::ClassString(Box::new(bind(class, static_type, self_class, parent)))
+        }
         other => other.clone(),
     }
 }
@@ -2782,6 +3038,24 @@ pub(crate) fn union(types: Vec<TypeExpr>) -> TypeExpr {
 /// The value of the argument at `position`, when it and every argument before it
 /// are positional and none is spread. PHP puts every positional argument before
 /// the named ones.
+/// The value of the spread argument whose elements fill `position`: the first
+/// spread at or before it, after positional arguments only.
+fn spread_covering<'a, 'arena>(
+    arguments: &'a ArgumentList<'arena>,
+    position: usize,
+) -> Option<&'a Expression<'arena>> {
+    for argument in arguments.arguments.iter().take(position + 1) {
+        match argument {
+            Argument::Positional(argument) if argument.ellipsis.is_some() => {
+                return Some(argument.value);
+            }
+            Argument::Positional(_) => {}
+            Argument::Named(_) => return None,
+        }
+    }
+    None
+}
+
 fn positional<'a, 'arena>(
     arguments: &'a ArgumentList<'arena>,
     position: usize,
