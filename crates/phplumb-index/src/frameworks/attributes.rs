@@ -19,9 +19,23 @@ pub(crate) enum RouteName {
     Missing,
 }
 
-/// The locales of a route attribute whose path is a map from locale to path, and the
-/// aliases it gives its route, each list in attribute order like `route_names`.
-pub(crate) fn route_variants(metadata: &[Metadata]) -> Vec<(Vec<String>, Vec<String>)> {
+/// What a route attribute gives besides its name.
+pub(crate) struct RouteVariant {
+    /// The locales of a path written as a map from locale to path.
+    pub locales: Vec<String>,
+    /// The aliases it gives its route.
+    pub aliases: Vec<String>,
+    /// Whether an alias is not a string the module reads.
+    pub unreadable: bool,
+}
+
+/// The locales and aliases of the route attributes in `metadata`, in attribute order
+/// like `route_names`, with class constants read as `route_names` reads them.
+pub(crate) fn route_variants(
+    metadata: &[Metadata],
+    index: &Index,
+    class: &str,
+) -> Vec<RouteVariant> {
     route_attributes(metadata)
         .map(|attribute| {
             let path = attribute.argument("path").or_else(|| {
@@ -37,20 +51,42 @@ pub(crate) fn route_variants(metadata: &[Metadata]) -> Vec<(Vec<String>, Vec<Str
                 }
                 _ => Vec::new(),
             };
-            let aliases = match attribute.argument("alias") {
-                Some(MetaValue::String(alias)) => vec![alias.clone()],
-                Some(MetaValue::List(entries)) => entries
-                    .iter()
-                    .filter_map(|(_, value)| match value {
-                        MetaValue::String(alias) => Some(alias.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
+            let values: Vec<&MetaValue> = match attribute.argument("alias") {
+                None => Vec::new(),
+                Some(MetaValue::List(entries)) => entries.iter().map(|(_, value)| value).collect(),
+                Some(value) => vec![value],
             };
-            (locales, aliases)
+            let mut variant = RouteVariant {
+                locales,
+                aliases: Vec::new(),
+                unreadable: false,
+            };
+            for value in values {
+                match literal(value, index, class) {
+                    RouteName::Literal(alias) => variant.aliases.push(alias),
+                    _ => variant.unreadable = true,
+                }
+            }
+            variant
         })
         .collect()
+}
+
+/// The string `value` stands for: a literal, or a class constant's value read
+/// through the index, `self::` being `class`.
+fn literal(value: &MetaValue, index: &Index, class: &str) -> RouteName {
+    match value {
+        MetaValue::String(value) => RouteName::Literal(value.clone()),
+        MetaValue::Constant { class: owner, name } => {
+            let owner = if owner == "self" { class } else { owner };
+            index
+                .find_member(owner, MemberKind::Constant, name)
+                .first()
+                .and_then(|(_, member)| member.value.clone())
+                .map_or(RouteName::Unreadable, RouteName::Literal)
+        }
+        _ => RouteName::Unreadable,
+    }
 }
 
 /// The route attributes in `metadata`.
@@ -77,17 +113,8 @@ pub(crate) fn route_names(metadata: &[Metadata], index: &Index, class: &str) -> 
                     .map(|(_, value)| value)
             });
             match name {
-                Some(MetaValue::String(name)) => RouteName::Literal(name.clone()),
-                Some(MetaValue::Constant { class: owner, name }) => {
-                    let owner = if owner == "self" { class } else { owner };
-                    index
-                        .find_member(owner, MemberKind::Constant, name)
-                        .first()
-                        .and_then(|(_, member)| member.value.clone())
-                        .map_or(RouteName::Unreadable, RouteName::Literal)
-                }
                 Some(MetaValue::Null) | None => RouteName::Missing,
-                Some(_) => RouteName::Unreadable,
+                Some(name) => literal(name, index, class),
             }
         })
         .collect()

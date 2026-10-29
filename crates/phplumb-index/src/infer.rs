@@ -34,9 +34,9 @@ use mago_syntax::cst::{
     ClassLikeConstantSelector, ClassLikeMemberSelector, Closure, CompositeString, DoWhile,
     Expression, For, Foreach, ForeachTarget, Function, FunctionCall, FunctionLikeParameterList,
     Global, Hint, If, IfBody, InterpolatedString, KeyValueArrayElement, Literal, LiteralString,
-    Match, MatchArm, Method, MethodCall, NullSafeMethodCall, NullSafePropertyAccess,
-    PartialArgument, Program, PropertyAccess, Static, StaticItem, StaticMethodCall, StringPart,
-    Switch, TriviaKind, Try, TryCatchClause, Variable, While,
+    Match, MatchArm, Method, MethodCall, NamespaceBody, NullSafeMethodCall, NullSafePropertyAccess,
+    PartialArgument, Program, PropertyAccess, Statement, Static, StaticItem, StaticMethodCall,
+    StringPart, Switch, TriviaKind, Try, TryCatchClause, Variable, While,
 };
 use mago_syntax::parser::parse_file_content;
 use mago_syntax::walker::Walker;
@@ -638,8 +638,6 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Vec<&'ast KeyValueArrayElement<'arena>>>
     }
 }
 
-/// The method calls in a file named one of `names`, case-insensitively, in source
-/// order, with what they target and their literal arguments.
 /// What a Symfony PHP route file defines through its `RoutingConfigurator`.
 #[derive(Default)]
 pub(crate) struct PhpRoutes {
@@ -648,14 +646,119 @@ pub(crate) struct PhpRoutes {
     pub routes: Vec<(String, u32, u32, Option<String>)>,
     /// Each `alias('alias', 'route')`.
     pub aliases: Vec<(String, String)>,
-    /// Whether the file imports routes or names one the module cannot read.
+    /// Whether the file imports routes, names one the module cannot read, or is not
+    /// a closure the module reads.
     pub unknown: bool,
 }
 
-/// The routes, aliases and imports of a PHP route file.
+/// The configurator methods a PHP route file's closure may call: those adding routes
+/// and aliases, and those setting what a route matches or leads to.
+const CONFIGURATOR_METHODS: [&str; 15] = [
+    "add",
+    "alias",
+    "condition",
+    "controller",
+    "defaults",
+    "deprecate",
+    "format",
+    "host",
+    "locale",
+    "methods",
+    "options",
+    "requirements",
+    "schemes",
+    "stateless",
+    "utf8",
+];
+
+/// Whether `statements` declare names and return a closure whose statements only
+/// call `CONFIGURATOR_METHODS` through its first parameter.
+fn returns_configurator<'s, 'arena: 's>(
+    statements: impl IntoIterator<Item = &'s Statement<'arena>>,
+) -> bool {
+    for statement in statements {
+        match statement {
+            Statement::OpeningTag(_)
+            | Statement::ClosingTag(_)
+            | Statement::Use(_)
+            | Statement::Declare(_)
+            | Statement::Noop(_) => {}
+            Statement::Namespace(namespace) => {
+                return match &namespace.body {
+                    NamespaceBody::Implicit(body) => returns_configurator(body.statements.iter()),
+                    NamespaceBody::BraceDelimited(block) => {
+                        returns_configurator(block.statements.iter())
+                    }
+                };
+            }
+            Statement::Return(returned) => {
+                let Some(Expression::Closure(closure)) = returned.value else {
+                    return false;
+                };
+                let Some(parameter) = closure.parameter_list.parameters.iter().next() else {
+                    return false;
+                };
+                let configurator = parameter.variable.name;
+                return closure
+                    .body
+                    .statements
+                    .iter()
+                    .all(|statement| match statement {
+                        Statement::Expression(statement) => {
+                            configures(statement.expression, configurator)
+                        }
+                        Statement::Return(returned) => returned.value.is_none(),
+                        Statement::Noop(_) => true,
+                        _ => false,
+                    });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether `expression` is a chain of `CONFIGURATOR_METHODS` calls on the variable
+/// `configurator`.
+fn configures(mut expression: &Expression<'_>, configurator: &[u8]) -> bool {
+    loop {
+        match expression {
+            Expression::Call(Call::Method(call)) => {
+                let ClassLikeMemberSelector::Identifier(method) = &call.method else {
+                    return false;
+                };
+                if !CONFIGURATOR_METHODS
+                    .iter()
+                    .any(|known| known.as_bytes().eq_ignore_ascii_case(method.value))
+                {
+                    return false;
+                }
+                expression = call.object;
+            }
+            Expression::Variable(Variable::Direct(variable)) => {
+                return variable.name == configurator;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The routes, aliases and imports of a PHP route file; a file in another form
+/// gives nothing and leaves route names unknown.
 pub(crate) fn php_routes(summary: &FileSummary, source: &[u8]) -> PhpRoutes {
     let arena = LocalArena::new();
     let program = parse_file_content(&arena, FileId::zero(), source);
+    if !returns_configurator(program.statements.iter()) {
+        return PhpRoutes {
+            unknown: !program.statements.iter().all(|s| {
+                matches!(
+                    s,
+                    Statement::OpeningTag(_) | Statement::ClosingTag(_) | Statement::Noop(_)
+                )
+            }),
+            ..PhpRoutes::default()
+        };
+    }
     let mut calls: Vec<CallRef<'_, '_>> = Vec::new();
     CallsWithArguments.walk_program(program, &mut calls);
     let class_at = |offset: u32| {
@@ -769,6 +872,8 @@ pub(crate) fn php_routes(summary: &FileSummary, source: &[u8]) -> PhpRoutes {
     found
 }
 
+/// The method calls in a file named one of `names`, case-insensitively, in source
+/// order, with what they target and their literal arguments.
 pub(crate) fn calls_named(
     index: &Index,
     path: &Path,
