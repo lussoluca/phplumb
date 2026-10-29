@@ -15,7 +15,8 @@ pub(crate) struct Parsed {
     pub yaml: Option<Yaml>,
 }
 
-/// The YAML and XML files read so far, by path.
+/// The YAML and XML files read so far, by canonical path, so an edit reported at a
+/// symlink's target reaches the file read through the link.
 #[derive(Default)]
 pub(crate) struct ConfigFiles {
     read: Mutex<HashMap<PathBuf, Option<Arc<Parsed>>>>,
@@ -24,8 +25,9 @@ pub(crate) struct ConfigFiles {
 impl ConfigFiles {
     /// The file at `path`, read on first use; none when it cannot be read.
     pub(crate) fn get(&self, path: &Path) -> Option<Arc<Parsed>> {
+        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let mut read = self.read.lock().unwrap_or_else(PoisonError::into_inner);
-        read.entry(path.to_path_buf())
+        read.entry(key)
             .or_insert_with(|| {
                 let text = std::fs::read_to_string(path).ok()?;
                 let yaml = if is_yaml(path) {
