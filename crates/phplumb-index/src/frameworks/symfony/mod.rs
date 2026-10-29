@@ -46,7 +46,7 @@ const ROUTE_METHODS: [(&str, &[&str]); 2] = [
 ];
 
 /// Methods whose argument 0 is a template name, by the class that declares them.
-const TEMPLATE_METHODS: [(&str, &[&str]); 2] = [
+const TEMPLATE_METHODS: [(&str, &[&str]); 3] = [
     (
         "Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController",
         &[
@@ -58,6 +58,10 @@ const TEMPLATE_METHODS: [(&str, &[&str]); 2] = [
         ],
     ),
     ("Twig\\Environment", &["render", "display", "load"]),
+    (
+        "Symfony\\Bridge\\Twig\\Mime\\TemplatedEmail",
+        &["htmlTemplate", "textTemplate"],
+    ),
 ];
 
 /// The method whose argument 0 is a parameter name.

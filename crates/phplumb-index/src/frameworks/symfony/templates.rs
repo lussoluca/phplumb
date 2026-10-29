@@ -126,17 +126,18 @@ impl Templates {
 
     /// Whether `name` resolves to a file, as Twig's loader looks for it.
     pub(crate) fn status(&self, name: &str) -> TemplateStatus {
+        let name = name.replace('\\', "/");
         let (namespace, rest) = match name.strip_prefix('@') {
             Some(named) => match named.split_once('/') {
                 Some((namespace, rest)) => (Some(namespace), rest),
                 None => return TemplateStatus::Unknown,
             },
-            None => (None, name),
+            None => (None, name.as_str()),
         };
-        let rest = rest.trim_start_matches('/');
-        if rest.is_empty() || rest.split('/').any(|part| part == "..") {
+        // Twig refuses a name that climbs above its directory.
+        let Some(rest) = normalize(rest) else {
             return TemplateStatus::Unknown;
-        }
+        };
         let mut configured = false;
         for (_, dir) in self
             .paths
@@ -148,7 +149,7 @@ impl Templates {
             let Some(dir) = dir else {
                 return TemplateStatus::Unknown;
             };
-            let path = dir.join(rest);
+            let path = dir.join(&rest);
             if path.is_file() {
                 return TemplateStatus::Found(path);
             }
@@ -210,6 +211,23 @@ fn has_unread_twig_configuration(packages: &Path, config_files: &ConfigFiles) ->
             })
         })
     })
+}
+
+/// `name` with empty and `.` parts dropped and each `..` taking off the part before
+/// it, as PHP resolves the path Twig's loader builds; none when a `..` climbs above
+/// the start or nothing is left.
+fn normalize(name: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in name.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// A configured path with the project directory filled in; relative paths are
