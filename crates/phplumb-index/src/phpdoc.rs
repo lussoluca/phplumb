@@ -277,6 +277,26 @@ impl TypeParser<'_> {
     fn named(&mut self) -> Parsed {
         let start = self.pos;
         let word = self.word();
+        // `Foo::BAR` and `Foo::BAR_*` are constant values, not objects of `Foo`.
+        if self.text[self.pos..].starts_with(b"::") {
+            let end = self.pos;
+            let lower = word.to_ascii_lowercase();
+            if !matches!(lower.as_str(), "self" | "static" | "parent") {
+                let fqn = match word.strip_prefix('\\') {
+                    Some(qualified) => qualified.to_string(),
+                    None => self.names.resolve_class(&word),
+                };
+                self.found.push((start, end, fqn));
+            }
+            self.pos += 2;
+            while self
+                .peek()
+                .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'*')
+            {
+                self.pos += 1;
+            }
+            return Parsed::Type(TypeExpr::Other);
+        }
         let end = self.pos;
         let recorded = self.found.len();
         self.skip_spaces();
@@ -558,7 +578,7 @@ fn split_type(text: &str) -> (&str, &str) {
             '<' | '{' | '(' | '[' => depth += 1,
             '>' | '}' | ')' | ']' => depth -= 1,
             // The return type of `callable(T): R` follows its colon.
-            c if c.is_whitespace() && depth <= 0 && !text[..i].ends_with(':') => {
+            c if c.is_whitespace() && depth <= 0 && !text[..i].ends_with("):") => {
                 return (&text[..i], text[i..].trim_start());
             }
             _ => {}

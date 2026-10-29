@@ -1665,7 +1665,7 @@ enum State {
 impl State {
     fn of(ty: TypeExpr) -> State {
         match ty {
-            TypeExpr::Other => State::Unknown,
+            TypeExpr::Other | TypeExpr::Scalar(_) => State::Unknown,
             ty => State::Known(ty),
         }
     }
@@ -1769,17 +1769,24 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     /// `parent`, the parent of the class around `at`, written with the arguments the
     /// class's `@extends` gives it.
     fn parent_type(&self, parent: String, at: u32) -> TypeExpr {
+        // The class's own templates are unknown inside it.
         let args = self.enclosing(at).and_then(|class| {
-            self.summary
+            let shape = self
+                .summary
                 .declarations
                 .iter()
                 .find(|d| d.fqn == class)?
                 .class
-                .as_ref()?
+                .as_ref()?;
+            shape
                 .generic_supertypes
                 .iter()
                 .find(|(supertype, _)| supertype.eq_ignore_ascii_case(&parent))
-                .map(|(_, args)| args.clone())
+                .map(|(_, args)| {
+                    args.iter()
+                        .map(|arg| substitute(arg, &shape.templates, &[]))
+                        .collect::<Vec<_>>()
+                })
         });
         match args {
             Some(args) if !args.is_empty() => TypeExpr::Generic {
@@ -2220,7 +2227,11 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             };
             for (found, member) in self.index.find_member(&class, kind, name) {
                 let typed = match &member.ty {
-                    Some(_) => Some((found, member)),
+                    Some(ty) if !names_no_class(ty) => Some((found, member)),
+                    Some(_) => self
+                        .index
+                        .typed_ancestor(&found.declaration.fqn, kind, name)
+                        .or(Some((found, member))),
                     None => self
                         .index
                         .typed_ancestor(&found.declaration.fqn, kind, name),
@@ -2680,15 +2691,32 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     continue;
                 };
                 let declaration = found.declaration;
+                // The method's own templates are unknown here; the class's take the
+                // receiver's arguments.
+                let param = substitute(param, &member.templates, &[]);
                 let param = match &declaration.class {
                     Some(shape) if !shape.templates.is_empty() => {
                         let given = supertype_args(self.index, &class, &args, &declaration.fqn)
                             .unwrap_or_default();
-                        substitute(param, &shape.templates, &given)
+                        substitute(&param, &shape.templates, &given)
                     }
-                    _ => param.clone(),
+                    _ => param,
                 };
-                types.push(param);
+                let static_type = if args.is_empty() {
+                    TypeExpr::Named(class.clone())
+                } else {
+                    TypeExpr::Generic {
+                        class: class.clone(),
+                        args: args.clone(),
+                    }
+                };
+                let self_class = if declaration.kind == SymbolKind::Trait {
+                    class.as_str()
+                } else {
+                    declaration.fqn.as_str()
+                };
+                let parent = declaration.class.as_ref().and_then(|s| s.parent.as_deref());
+                types.push(bind(&param, &static_type, self_class, parent));
             }
         }
         union(types)
@@ -2797,6 +2825,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         .find(|(var, _)| var.as_deref().is_none_or(|v| v == assignment.var))
         .map(|(_, ty)| ty)
         .and_then(|ty| pick_type(Some(ty), None))
+        .filter(|ty| !names_no_class(ty))
     }
 }
 
@@ -2937,6 +2966,21 @@ fn bind(ty: &TypeExpr, static_type: &TypeExpr, self_class: &str, parent: Option<
                 .map(|m| bind(m, static_type, self_class, parent))
                 .collect(),
         ),
+        TypeExpr::Shape(entries) => TypeExpr::Shape(
+            entries
+                .iter()
+                .map(|(key, ty)| (key.clone(), bind(ty, static_type, self_class, parent)))
+                .collect(),
+        ),
+        TypeExpr::Callable(params) => TypeExpr::Callable(
+            params
+                .iter()
+                .map(|param| bind(param, static_type, self_class, parent))
+                .collect(),
+        ),
+        TypeExpr::ClassString(class) => {
+            TypeExpr::ClassString(Box::new(bind(class, static_type, self_class, parent)))
+        }
         other => other.clone(),
     }
 }

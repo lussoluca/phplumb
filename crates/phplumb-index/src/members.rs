@@ -60,7 +60,12 @@ fn typed_above<'a>(
             if member.is_private {
                 continue;
             }
-            if member.ty.is_some() {
+            // A type that names no class, such as a callable, says nothing here.
+            if member
+                .ty
+                .as_ref()
+                .is_some_and(|ty| !crate::infer::names_no_class(ty))
+            {
                 return Some((found, member));
             }
             if let Some(hit) = typed_above(index, &found.declaration.fqn, kind, name, visited) {
