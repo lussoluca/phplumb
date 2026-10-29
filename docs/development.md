@@ -84,5 +84,5 @@ npm --prefix editors/vscode run package -- linux-x64
 Each command writes `editors/vscode/phplumb-<target>-<version>.vsix`. Install it in a dedicated profile to test it as a user would:
 
 ```sh
-code --profile "PHPlumb" --install-extension editors/vscode/phplumb-linux-x64-0.4.0.vsix
+code --profile "PHPlumb" --install-extension editors/vscode/phplumb-linux-x64-0.5.0.vsix
 ```
