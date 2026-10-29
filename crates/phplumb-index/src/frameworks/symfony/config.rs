@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::files::ConfigFiles;
 use crate::filter::PathFilter;
 use crate::frameworks::Project;
 use crate::frameworks::symfony::RouteTarget;
@@ -42,16 +43,19 @@ fn files_named(dir: &Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
 /// The parameters the configuration files define under `parameters:`, also
 /// inside `when@<env>` blocks, each at its key; `env(NAME)` keys are environment
 /// defaults, not parameters.
-pub(crate) fn read_parameters(files: &[PathBuf]) -> HashMap<String, Vec<RouteTarget>> {
+pub(crate) fn read_parameters(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+) -> HashMap<String, Vec<RouteTarget>> {
     let mut found: HashMap<String, Vec<RouteTarget>> = HashMap::new();
     for file in files {
-        let Ok(text) = std::fs::read_to_string(file) else {
+        let Some(parsed) = config_files.get(file) else {
             continue;
         };
-        let Some(root) = yaml::parse(&text) else {
+        let (text, Some(root)) = (parsed.text.as_str(), &parsed.yaml) else {
             continue;
         };
-        for block in top_blocks(&root) {
+        for block in top_blocks(root) {
             let Some(Yaml::Map(entries)) = block.get("parameters") else {
                 continue;
             };
@@ -62,7 +66,7 @@ pub(crate) fn read_parameters(files: &[PathBuf]) -> HashMap<String, Vec<RouteTar
                 if value.starts_with("env(") {
                     continue;
                 }
-                let (start, end) = yaml::value_range(&text, value, *start, *end);
+                let (start, end) = yaml::value_range(text, value, *start, *end);
                 found.entry(value.clone()).or_default().push(RouteTarget {
                     location: Location {
                         path: file.clone(),
@@ -80,16 +84,19 @@ pub(crate) fn read_parameters(files: &[PathBuf]) -> HashMap<String, Vec<RouteTar
 /// The services the configuration files define under `services:`, also inside
 /// `when@<env>` blocks, each at its key; `_defaults`, `_instanceof` and prototypes
 /// (keys with a `resource`) are no services.
-pub(crate) fn read_services(files: &[PathBuf]) -> HashMap<String, Vec<RouteTarget>> {
+pub(crate) fn read_services(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+) -> HashMap<String, Vec<RouteTarget>> {
     let mut found: HashMap<String, Vec<RouteTarget>> = HashMap::new();
     for file in files {
-        let Ok(text) = std::fs::read_to_string(file) else {
+        let Some(parsed) = config_files.get(file) else {
             continue;
         };
-        let Some(root) = yaml::parse(&text) else {
+        let (text, Some(root)) = (parsed.text.as_str(), &parsed.yaml) else {
             continue;
         };
-        for block in top_blocks(&root) {
+        for block in top_blocks(root) {
             let Some(Yaml::Map(entries)) = block.get("services") else {
                 continue;
             };
@@ -105,7 +112,7 @@ pub(crate) fn read_services(files: &[PathBuf]) -> HashMap<String, Vec<RouteTarge
                 if id == "_defaults" || id == "_instanceof" || value.get("resource").is_some() {
                     continue;
                 }
-                let (start, end) = yaml::value_range(&text, id, *start, *end);
+                let (start, end) = yaml::value_range(text, id, *start, *end);
                 found.entry(id.clone()).or_default().push(RouteTarget {
                     location: Location {
                         path: file.clone(),
@@ -197,7 +204,11 @@ pub(crate) fn parameters_in(text: &str) -> Vec<(&str, usize, usize)> {
 /// Whether the project has configuration the module does not read, which may define
 /// parameters: PHP configuration files, environment directories below
 /// `config/packages`, or YAML files that import others, also inside `when@<env>`.
-pub(crate) fn has_unread_configuration(project: &Project, files: &[PathBuf]) -> bool {
+pub(crate) fn has_unread_configuration(
+    project: &Project,
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+) -> bool {
     let config = project.dir.join("config");
     let php = |name: &str| name.ends_with(".php");
     let services_php = !files_named(&config, |name| {
@@ -211,10 +222,12 @@ pub(crate) fn has_unread_configuration(project: &Project, files: &[PathBuf]) -> 
         .map(|entry| entry.path())
         .any(|path| path.is_dir() || path.file_name().and_then(|n| n.to_str()).is_some_and(php));
     let imports = files.iter().any(|file| {
-        std::fs::read_to_string(file)
-            .ok()
-            .and_then(|text| yaml::parse(&text))
-            .is_some_and(|root| top_blocks(&root).iter().any(|b| b.get("imports").is_some()))
+        config_files.get(file).is_some_and(|parsed| {
+            parsed
+                .yaml
+                .as_ref()
+                .is_some_and(|root| top_blocks(root).iter().any(|b| b.get("imports").is_some()))
+        })
     });
     services_php || packages || imports
 }

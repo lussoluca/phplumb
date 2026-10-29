@@ -1064,3 +1064,28 @@ fn self_built_twig_environments_and_generators_stay_silent() {
     // Templates outside the configured directories are not the app's.
     assert!(diagnostics(&index, "tests/Fixtures/views/page.html.twig").is_empty());
 }
+
+#[test]
+fn php_updates_keep_the_yaml_read_before() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(&fixture(), &root);
+    let mut index = Index::build(&root, &DiscoverOptions::default()).unwrap().0;
+    let services = root.join("config/services.yaml");
+    let text = std::fs::read_to_string(&services).unwrap();
+    std::fs::write(&services, text.replace("app.limit", "app.ceiling")).unwrap();
+    let count = |index: &Index, name: &str| {
+        index
+            .framework::<Symfony>()
+            .unwrap()
+            .parameter_targets(name)
+            .len()
+    };
+
+    index.update(&[root.join("src/Controller/HomeController.php")], &[]);
+    assert_eq!(count(&index, "app.limit"), 1);
+
+    index.update(&[services], &[]);
+    assert_eq!(count(&index, "app.limit"), 0);
+    assert_eq!(count(&index, "app.ceiling"), 1);
+}

@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use phplumb_index::discover::{DiscoverOptions, discover, framework_files};
+use phplumb_index::discover::{DiscoverOptions, discover};
 use phplumb_index::line_index::LineIndex;
 use phplumb_index::{Index, Location, member_access_offsets};
 use serde::{Deserialize, Serialize};
@@ -269,9 +269,12 @@ fn diagnostics(
         slowest_file_ms: 0,
         entries: Vec::new(),
     };
-    let mut files = discover(root, opts)?;
-    files.extend(framework_files(root, opts)?);
-    for path in files.into_iter().filter(|p| p.starts_with(&dir)) {
+    let mut files: Vec<PathBuf> = discover(root, opts)?
+        .into_iter()
+        .filter(|p| p.starts_with(&dir))
+        .collect();
+    files.extend(index.framework_files_under(&dir).map(Path::to_path_buf));
+    for path in files {
         let source = std::fs::read(&path)?;
         let started = std::time::Instant::now();
         let found = index.diagnostics(&path, &source);

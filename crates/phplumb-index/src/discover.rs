@@ -221,34 +221,6 @@ pub(crate) fn is_recorded_framework_file(filter: &PathFilter, path: &Path) -> bo
         })
 }
 
-/// The YAML, Twig and Doctrine XML files under `root` that only the frameworks
-/// read, outside `vendor`, hidden directories, `node_modules` and excluded paths,
-/// sorted.
-pub fn framework_files(root: &Path, opts: &DiscoverOptions) -> anyhow::Result<Vec<PathBuf>> {
-    let filter = PathFilter::new(root, opts)?;
-    let root = filter.root().to_path_buf();
-    let mut files: Vec<PathBuf> = WalkBuilder::new(&root)
-        .standard_filters(false)
-        .hidden(true)
-        .filter_entry(|entry| {
-            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-            !(is_dir && entry.file_name() == "vendor")
-        })
-        .build()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
-        .map(|entry| entry.into_path())
-        .filter(|path| is_framework_file(path))
-        .filter(|path| {
-            path.strip_prefix(&root).is_ok_and(|relative| {
-                !has_skipped_component(relative) && !filter.excludes(relative)
-            })
-        })
-        .collect();
-    files.sort();
-    Ok(files)
-}
-
 /// The canonical path of `path` and the path the index uses for it: the canonical
 /// path when it is inside the root, otherwise the path as reached.
 pub(crate) fn chosen_path(root: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> {

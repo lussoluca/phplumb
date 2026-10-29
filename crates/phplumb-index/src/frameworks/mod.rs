@@ -47,6 +47,14 @@ pub(crate) fn under_any(path: &Path, paths: &HashSet<PathBuf>) -> bool {
     !paths.is_empty() && path.ancestors().any(|ancestor| paths.contains(ancestor))
 }
 
+/// Whether the summary mentions a member named one of `names`.
+pub(crate) fn mentions_member(summary: &FileSummary, names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        let key = RefKey::Member(name.to_string()).hash();
+        summary.ref_keys.binary_search(&key).is_ok()
+    })
+}
+
 /// Whether the summary mentions one of `classes`.
 pub(crate) fn mentions(summary: &FileSummary, classes: &[&str]) -> bool {
     classes.iter().any(|class| {
@@ -198,9 +206,16 @@ pub trait Framework: Send + Sync {
         value: &str,
         call: Option<(&FrameworkCall<'_>, usize)>,
     ) -> Vec<(Location, String)>;
-    /// Broken references the framework finds in the PHP file at `path`, whose
-    /// current content is `source`.
-    fn diagnostics(&self, index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic>;
+    /// Broken references the framework finds in the file at `path`, whose current
+    /// content is `source`; `summary` is the summary of a PHP file, and none for the
+    /// files only the frameworks read.
+    fn diagnostics(
+        &self,
+        index: &Index,
+        path: &Path,
+        source: &[u8],
+        summary: Option<&FileSummary>,
+    ) -> Vec<Diagnostic>;
     /// Implementations the framework adds to the class-like `class`, each with the
     /// text expected at its range.
     fn class_implementations(&self, index: &Index, class: &str) -> Vec<(Location, String)>;

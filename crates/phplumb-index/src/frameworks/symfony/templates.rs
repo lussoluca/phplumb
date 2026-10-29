@@ -3,8 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
+use super::files::ConfigFiles;
 use crate::frameworks::Project;
-use crate::frameworks::yaml::{self, Yaml};
+use crate::frameworks::yaml::Yaml;
 
 /// The placeholder for the project directory in configured paths.
 const PROJECT_DIR: &str = "%kernel.project_dir%";
@@ -41,18 +42,18 @@ impl Templates {
     /// themes. A `when@<env>` block
     /// adds only namespaced paths, after the others, since its main-namespace paths
     /// and `default_path` would shadow the other environments' templates.
-    pub(crate) fn read(project: &Project) -> Templates {
+    pub(crate) fn read(project: &Project, config_files: &ConfigFiles) -> Templates {
         let dir = &project.dir;
         let mut templates = Templates {
-            unknown: has_unread_twig_configuration(&dir.join("config/packages")),
+            unknown: has_unread_twig_configuration(&dir.join("config/packages"), config_files),
             ..Templates::default()
         };
         let mut default_path = format!("{PROJECT_DIR}/templates");
         for name in ["twig.yaml", "twig.yml"] {
-            let Ok(text) = std::fs::read_to_string(dir.join("config/packages").join(name)) else {
+            let Some(parsed) = config_files.get(&dir.join("config/packages").join(name)) else {
                 continue;
             };
-            let Some(root) = yaml::parse(&text) else {
+            let Some(root) = &parsed.yaml else {
                 continue;
             };
             if let Some(twig) = root.get("twig") {
@@ -61,7 +62,7 @@ impl Templates {
                     default_path = path.to_string();
                 }
             }
-            if let Yaml::Map(entries) = &root {
+            if let Yaml::Map(entries) = root {
                 let environments = entries
                     .iter()
                     .filter(|(key, _)| key.text().is_some_and(|k| k.starts_with("when@")))
@@ -171,7 +172,7 @@ impl Templates {
 /// Whether `packages`, the `config/packages` directory, holds Twig configuration
 /// other than `twig.yaml` and `twig.yml`: `twig.php`, a `twig:` section in another
 /// file, or an environment directory with Twig configuration.
-fn has_unread_twig_configuration(packages: &Path) -> bool {
+fn has_unread_twig_configuration(packages: &Path, config_files: &ConfigFiles) -> bool {
     let Ok(entries) = std::fs::read_dir(packages) else {
         return false;
     };
@@ -201,14 +202,13 @@ fn has_unread_twig_configuration(packages: &Path) -> bool {
         if !(name.ends_with(".yaml") || name.ends_with(".yml")) {
             return false;
         }
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| yaml::parse(&text))
-            .is_some_and(|root| {
-                super::config::top_blocks(&root)
+        config_files.get(&path).is_some_and(|parsed| {
+            parsed.yaml.as_ref().is_some_and(|root| {
+                super::config::top_blocks(root)
                     .iter()
                     .any(|block| block.get("twig").is_some())
             })
+        })
     })
 }
 

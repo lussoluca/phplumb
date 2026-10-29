@@ -3,6 +3,7 @@
 mod broken;
 mod config;
 mod doctrine;
+mod files;
 mod messenger;
 mod routes;
 mod templates;
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::diagnostics::Diagnostic;
-use crate::filter::is_doctrine_xml;
+use crate::filter::{is_doctrine_xml, is_yaml};
 use crate::frameworks::ancestry::is_a;
 use crate::frameworks::yaml::{self, Yaml};
 use crate::frameworks::{
@@ -22,9 +23,10 @@ use crate::frameworks::{
 };
 use crate::index::{Index, Location};
 use crate::phpdoc::TypeExpr;
-use crate::summary::{NameRef, RefKey, summarize};
+use crate::summary::{FileSummary, NameRef, RefKey, summarize};
 
 use doctrine::Mappings;
+use files::ConfigFiles;
 use messenger::Handlers;
 pub use routes::RouteTarget;
 use routes::Routes;
@@ -189,9 +191,11 @@ pub struct Symfony {
     /// Service definitions, by id.
     services: HashMap<String, Vec<RouteTarget>>,
     mappings: Mappings,
-    /// The project's `*.orm.xml` files, walked again only when a directory or a
+    /// The project's `*.orm.xml` files, listed again only when a directory or a
     /// mapping file changes.
     mapping_files: Vec<PathBuf>,
+    /// The YAML and XML files read, kept until they change.
+    config_files: ConfigFiles,
 }
 
 impl Symfony {
@@ -419,18 +423,18 @@ impl Symfony {
     fn read(&mut self, index: &Index) {
         let filter = index.filter().scoped(&self.project);
         let files = config::config_files(&self.project, &filter);
-        self.parameters = config::read_parameters(&files);
+        self.parameters = config::read_parameters(&files, &self.config_files);
         let configured_in_php = CONFIGURATORS
             .iter()
             .flat_map(|class| index.candidate_files(&RefKey::Class(class.to_string())))
             .any(|path| self.is_source(index, path));
-        self.parameters_unknown =
-            configured_in_php || config::has_unread_configuration(&self.project, &files);
+        self.parameters_unknown = configured_in_php
+            || config::has_unread_configuration(&self.project, &files, &self.config_files);
         self.set_parameters = OnceLock::new();
-        self.services = config::read_services(&files);
-        self.mappings = Mappings::read(index, &filter, &self.mapping_files);
-        self.routes = Routes::read(index, &filter, &self.project);
-        self.templates = Templates::read(&self.project);
+        self.services = config::read_services(&files, &self.config_files);
+        self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
+        self.routes = Routes::read(index, &filter, &self.project, &self.config_files);
+        self.templates = Templates::read(&self.project, &self.config_files);
         self.handlers = Handlers::read(index, &filter);
     }
 }
@@ -462,7 +466,7 @@ impl Framework for Symfony {
 
     fn rebuild(&mut self, index: &Index) {
         let filter = index.filter().scoped(&self.project);
-        self.mapping_files = doctrine::mapping_files(&self.project.dir, filter);
+        self.mapping_files = doctrine::mapping_files(index, &self.project.dir, &filter);
         self.read(index);
     }
 
@@ -480,12 +484,24 @@ impl Framework for Symfony {
             let kind = path.extension().and_then(|e| e.to_str());
             path.is_dir() || matches!(kind, None | Some("php" | "yaml" | "yml" | "xml"))
         });
+        let configuration: HashSet<PathBuf> = paths
+            .iter()
+            .filter(|path| {
+                path.is_dir()
+                    || path.extension().is_none()
+                    || is_yaml(path)
+                    || is_doctrine_xml(path)
+            })
+            .flat_map(|path| [Some(path.clone()), path.canonicalize().ok()])
+            .flatten()
+            .collect();
+        self.config_files.forget(&configuration);
         let mappings_moved = paths
             .iter()
             .any(|path| path.is_dir() || path.extension().is_none() || is_doctrine_xml(path));
         if mappings_moved {
             let filter = index.filter().scoped(&self.project);
-            self.mapping_files = doctrine::mapping_files(&self.project.dir, filter);
+            self.mapping_files = doctrine::mapping_files(index, &self.project.dir, &filter);
         }
         if relevant {
             self.read(index);
@@ -609,17 +625,23 @@ impl Framework for Symfony {
 
     /// Route, template and parameter names that are defined nowhere, in PHP, Twig
     /// templates and YAML configuration.
-    fn diagnostics(&self, index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic> {
+    fn diagnostics(
+        &self,
+        index: &Index,
+        path: &Path,
+        source: &[u8],
+        summary: Option<&FileSummary>,
+    ) -> Vec<Diagnostic> {
         if crate::filter::is_twig(path) {
             return broken::find_in_twig(self, index, path, source);
         }
         if crate::filter::is_yaml(path) {
             return broken::find_in_yaml(self, index, path, source);
         }
-        if crate::filter::is_framework_file(path) {
-            return Vec::new();
+        match summary {
+            Some(summary) => broken::find(self, index, path, source, summary),
+            None => Vec::new(),
         }
-        broken::find(self, index, path, source)
     }
 
     fn class_implementations(&self, _index: &Index, _class: &str) -> Vec<(Location, String)> {

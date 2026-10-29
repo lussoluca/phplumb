@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::builtins;
 use crate::index::Index;
 use crate::infer::{self, Receiver};
-use crate::summary::{ClassSel, FileSummary, MemberKind, NameKind, NameRef, SymbolKind, summarize};
+use crate::summary::{ClassSel, FileSummary, MemberKind, NameKind, NameRef, SymbolKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -31,7 +31,12 @@ const ENUM_METHODS: [&str; 3] = ["cases", "from", "tryfrom"];
 /// The interfaces PHP gives every enum, whose members PHP fixes.
 const ENUM_INTERFACES: [&str; 2] = ["UnitEnum", "BackedEnum"];
 
-pub(crate) fn find(index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic> {
+pub(crate) fn find(
+    index: &Index,
+    path: &Path,
+    source: &[u8],
+    summary: &FileSummary,
+) -> Vec<Diagnostic> {
     // `*.api.php` files document hooks with example code that never runs.
     if path
         .file_name()
@@ -40,7 +45,6 @@ pub(crate) fn find(index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic>
     {
         return Vec::new();
     }
-    let summary = summarize(source);
     let guarded: HashSet<&str> = summary.guarded.iter().map(String::as_str).collect();
     let is_guarded = |name: &str| guarded.contains(name.to_ascii_lowercase().as_str());
 
@@ -49,7 +53,7 @@ pub(crate) fn find(index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic>
         if within(&summary.unchecked, name.start) {
             continue;
         }
-        if let Some(diagnostic) = broken_name(index, &summary, source, name, &is_guarded) {
+        if let Some(diagnostic) = broken_name(index, summary, source, name, &is_guarded) {
             found.push(diagnostic);
         }
     }
@@ -95,8 +99,7 @@ pub(crate) fn find(index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic>
         ));
     }
 
-    for (start, end, name, receiver, kind) in infer::member_accesses(index, path, &summary, source)
-    {
+    for (start, end, name, receiver, kind) in infer::member_accesses(index, path, summary, source) {
         if kind != MemberKind::Method || is_guarded(&name) {
             continue;
         }

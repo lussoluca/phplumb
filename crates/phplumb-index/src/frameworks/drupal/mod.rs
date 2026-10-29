@@ -18,7 +18,7 @@ use crate::frameworks::ancestry::is_a;
 use crate::frameworks::{CallTarget, Framework, FrameworkCall, FrameworkDeclaration, Project};
 use crate::index::{Index, Location};
 use crate::phpdoc::TypeExpr;
-use crate::summary::NameRef;
+use crate::summary::{FileSummary, NameRef};
 
 pub use entities::EntityType;
 use entities::EntityTypes;
@@ -351,11 +351,17 @@ impl Framework for Drupal {
     }
 
     /// Service ids, route names and plugin ids in PHP defined nowhere on disk.
-    fn diagnostics(&self, index: &Index, path: &Path, source: &[u8]) -> Vec<Diagnostic> {
-        if crate::filter::is_framework_file(path) {
-            return Vec::new();
+    fn diagnostics(
+        &self,
+        index: &Index,
+        path: &Path,
+        source: &[u8],
+        summary: Option<&FileSummary>,
+    ) -> Vec<Diagnostic> {
+        match summary {
+            Some(summary) => broken::find(self, index, path, source, summary),
+            None => Vec::new(),
         }
-        broken::find(self, index, path, source)
     }
 
     /// Plugin discovery reads the annotations of a class in the subdirectory of a

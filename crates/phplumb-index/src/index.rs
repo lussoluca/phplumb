@@ -562,10 +562,10 @@ impl Index {
     /// offset. Every rule must prove the target missing; uncertainty stays silent.
     pub fn diagnostics(&self, path: &Path, source: &[u8]) -> Vec<Diagnostic> {
         // Only the frameworks read YAML, Twig and Doctrine XML files.
-        let mut found = if is_framework_file(path) {
-            Vec::new()
-        } else {
-            diagnostics::find(self, path, source)
+        let summary = (!is_framework_file(path)).then(|| summarize(source));
+        let mut found = match &summary {
+            Some(summary) => diagnostics::find(self, path, source, summary),
+            None => Vec::new(),
         };
         // `*.api.php` files document hooks with example code that never runs.
         let documentation = path
@@ -575,7 +575,7 @@ impl Index {
         if !documentation {
             found.extend(
                 self.frameworks_for(path)
-                    .flat_map(|f| f.diagnostics(self, path, source)),
+                    .flat_map(|f| f.diagnostics(self, path, source, summary.as_ref())),
             );
         }
         found.sort_by_key(|d| (d.start, d.end));
