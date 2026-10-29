@@ -229,3 +229,14 @@ fn trait_cycles_through_duplicate_names_end() {
 
     assert!(index.definition(&path, &source, offset).is_empty());
 }
+
+#[test]
+fn members_after_variable_classes_resolve() {
+    let mut index = build();
+    let from = definition(&mut index, "app/Uses.php", "from('low')->label();", 1);
+    assert_eq!(described(&index, &from), [pair("Core/Core_c.php", "from")]);
+    let case = definition(&mut index, "app/Severity.php", "Low->label();", 2);
+    assert_eq!(described(&index, &case), [pair("app/Severity.php", "Low")]);
+    let (path, source, offset) = at("app/Uses.php", "from('low')->label();", 1);
+    assert!(index.hover(&path, &source, offset).is_some());
+}

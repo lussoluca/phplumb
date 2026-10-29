@@ -30,13 +30,13 @@ use mago_span::HasSpan;
 use mago_syntax::comments::docblock::get_docblock_before_position;
 use mago_syntax::cst::{
     Access, AnonymousClass, Argument, ArgumentList, ArrayElement, ArrowFunction, Assignment,
-    AssignmentOperator, Attribute, Binary, BinaryOperator, Call, ClassLikeConstantSelector,
-    ClassLikeMemberSelector, Closure, CompositeString, DoWhile, Expression, For, Foreach,
-    ForeachTarget, Function, FunctionCall, FunctionLikeParameterList, Global, Hint, If, IfBody,
-    InterpolatedString, KeyValueArrayElement, Literal, LiteralString, Method, MethodCall,
-    NullSafeMethodCall, NullSafePropertyAccess, PartialArgument, Program, PropertyAccess, Static,
-    StaticItem, StaticMethodCall, StringPart, Switch, TriviaKind, Try, TryCatchClause, Variable,
-    While,
+    AssignmentOperator, Attribute, Binary, BinaryOperator, Call, ClassConstantAccess,
+    ClassLikeConstantSelector, ClassLikeMemberSelector, Closure, CompositeString, DoWhile,
+    Expression, For, Foreach, ForeachTarget, Function, FunctionCall, FunctionLikeParameterList,
+    Global, Hint, If, IfBody, InterpolatedString, KeyValueArrayElement, Literal, LiteralString,
+    Method, MethodCall, NullSafeMethodCall, NullSafePropertyAccess, PartialArgument, Program,
+    PropertyAccess, Static, StaticItem, StaticMethodCall, StringPart, Switch, TriviaKind, Try,
+    TryCatchClause, Variable, While,
 };
 use mago_syntax::parser::parse_file_content;
 use mago_syntax::walker::Walker;
@@ -104,6 +104,7 @@ pub(crate) fn member_at(
     let access = facts
         .accesses
         .iter()
+        .chain(&facts.variable_statics)
         .find(|a| a.start <= offset && offset <= a.end)?;
     let ctx = Ctx::new(index, path, summary, program, source, &facts);
     let receiver = match ctx.anonymous_this(access.object, access.start) {
@@ -1079,6 +1080,9 @@ struct Facts<'ast, 'arena> {
     narrowings: Vec<NarrowFact>,
     branches: Vec<BranchFact>,
     callbacks: Vec<CallbackFact<'ast, 'arena>>,
+    /// Static calls and constants reached through a variable, such as
+    /// `$severity::from()`, with the variable as the object; navigation reads them.
+    variable_statics: Vec<AccessFact<'arena>>,
     /// Every direct variable: name without `$`, start, end.
     variables: Vec<(String, u32, u32)>,
 }
@@ -1188,6 +1192,42 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
         f: &mut Facts<'ast, 'arena>,
     ) {
         f.access(access.object, &access.property, MemberKind::Property);
+    }
+
+    fn walk_in_static_method_call(
+        &self,
+        call: &'ast StaticMethodCall<'arena>,
+        f: &mut Facts<'ast, 'arena>,
+    ) {
+        if let (Expression::Variable(_), ClassLikeMemberSelector::Identifier(name)) =
+            (call.class, &call.method)
+        {
+            f.variable_statics.push(AccessFact {
+                start: name.span.start.offset,
+                end: name.span.end.offset,
+                kind: MemberKind::Method,
+                name: String::from_utf8_lossy(name.value).into_owned(),
+                object: call.class,
+            });
+        }
+    }
+
+    fn walk_in_class_constant_access(
+        &self,
+        access: &'ast ClassConstantAccess<'arena>,
+        f: &mut Facts<'ast, 'arena>,
+    ) {
+        if let (Expression::Variable(_), ClassLikeConstantSelector::Identifier(name)) =
+            (access.class, &access.constant)
+        {
+            f.variable_statics.push(AccessFact {
+                start: name.span.start.offset,
+                end: name.span.end.offset,
+                kind: MemberKind::Constant,
+                name: String::from_utf8_lossy(name.value).into_owned(),
+                object: access.class,
+            });
+        }
     }
 
     fn walk_in_method(&self, method: &'ast Method<'arena>, f: &mut Facts<'ast, 'arena>) {
