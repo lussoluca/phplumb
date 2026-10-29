@@ -1188,6 +1188,18 @@ fn broken_names_in_twig_are_flagged() {
             ),
             pair("Undefined route 'nope_route'", "nope_route"),
             pair("Undefined route 'nope_named'", "nope_named"),
+            pair(
+                "Undefined template 'gone_block.html.twig'",
+                "gone_block.html.twig"
+            ),
+            pair(
+                "Undefined template 'gone_theme.html.twig'",
+                "gone_theme.html.twig"
+            ),
+            pair(
+                "Undefined template 'gone_trim.html.twig'",
+                "gone_trim.html.twig"
+            ),
         ]
     );
     // A list names templates to try in turn.
