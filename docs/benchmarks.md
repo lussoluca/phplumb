@@ -2,6 +2,12 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-29, batch E2 route references
+
+Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #33, #35 and #36. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged.
+
+The Symfony reference's bundle routes now lead to their definitions: `_preview_error`, `_wdt` and `_profiler` to the bundles' route files, and `_logout_main` to the firewall's `logout` setting. The 156 route names used in `src` and `templates` keep their targets, and route names stay certain.
+
 ## 2026-10-29, batch E1 route definitions
 
 Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #29, #30, #31, #32 and #34. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged.
