@@ -2,6 +2,20 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-29, batch C2 generic and element types
+
+Same machine and checkouts, measured with this branch and with `main` back to back, twice each. The batch fixes issues #11, #15, #17, #18, #19 and #20.
+
+| Metric                    | Drupal reference                  | Symfony reference                   |
+| ------------------------- | --------------------------------- | ----------------------------------- |
+| Member coverage           | 42,760 (42,731 on `main`)         | 13,147 of 13,211 (13,126 on `main`) |
+| Warm start from the cache | 1.37 to 1.41 s (1.31 to 1.36 s)   | 0.19 s (0.20 to 0.22 s)             |
+| Update of one file        | 95 to 96 ms (96 to 104 ms)        | 20 to 21 ms (21 to 27 ms)           |
+| Update of 1,000 files     | 0.23 to 0.28 s (0.22 to 0.23 s)   | 82 to 92 ms (81 to 83 ms)           |
+| Peak resident memory      | 677 to 684 MB (675 to 679 MB)     | 270 to 274 MB (257 to 269 MB)       |
+| All cases                 | 85 passed, 9 failed, as on `main` | 31 passed, 0 failed, as on `main`   |
+| Diagnostics               | 94, the same entries as on `main` | 0, as on `main`                     |
+
 ## 2026-10-29, batch C1 call types
 
 Same machine and checkouts, measured with this branch and with `main` back to back, twice each. The batch fixes issues #12, #13, #14, #16 and #21.
