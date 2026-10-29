@@ -39,7 +39,10 @@ const LOGOUT_LOADER: &str = "security.route_loader.logout";
 /// Symfony's bundle classes, whose `getPath()` is the class's directory, or its
 /// parent for an `AbstractBundle`.
 const BUNDLE: &str = "Symfony\\Component\\HttpKernel\\Bundle\\Bundle";
-const ABSTRACT_BUNDLE: &str = "Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle";
+const ABSTRACT_BUNDLES: [&str; 2] = [
+    "Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle",
+    "Symfony\\Component\\DependencyInjection\\Kernel\\AbstractBundle",
+];
 
 /// What a route import loads, as far as the module knows.
 enum Import {
@@ -499,7 +502,11 @@ impl Routes {
                         else {
                             continue;
                         };
-                        if name != "logout" || value.text() == Some("false") {
+                        // Symfony adds a route for a logout path, not for a route name.
+                        let path = value.get("path").and_then(Yaml::text);
+                        let disabled = value.text() == Some("false");
+                        if name != "logout" || disabled || path.is_some_and(|p| !p.starts_with('/'))
+                        {
                             continue;
                         }
                         let (start, end) = yaml::value_range(text, name, *start, *end);
@@ -690,13 +697,15 @@ fn bundle_dir(sources: &Sources, name: &str) -> Option<PathBuf> {
         .first()
         .is_some_and(|(owner, _)| {
             let owner = &owner.declaration.fqn;
-            !owner.eq_ignore_ascii_case(BUNDLE) && !owner.eq_ignore_ascii_case(ABSTRACT_BUNDLE)
+            !std::iter::once(BUNDLE)
+                .chain(ABSTRACT_BUNDLES)
+                .any(|known| owner.eq_ignore_ascii_case(known))
         });
     if own_path {
         return None;
     }
     let dir = class.path.parent()?;
-    if is_a(index, fqn, &[ABSTRACT_BUNDLE]) {
+    if is_a(index, fqn, &ABSTRACT_BUNDLES) {
         dir.parent().map(Path::to_path_buf)
     } else {
         Some(dir.to_path_buf())

@@ -323,6 +323,10 @@ fn is_named_argument(
     functions: &[&str],
     parameter: &str,
 ) -> bool {
+    // A macro's arguments are its defaults, not a call.
+    if literal.tag && tag_name(source, literal.block) == "macro" {
+        return false;
+    }
     let block = literal.block.0;
     let mut i = skip_spaces_back(source, literal.quote, block);
     if i == block || !matches!(source[i - 1], b':' | b'=') {
@@ -400,14 +404,8 @@ fn skip_spaces_back(source: &[u8], mut i: usize, block: usize) -> usize {
     i
 }
 
-/// Whether the literal is the template a tag names: the first argument of one of
-/// the template tags, or an element of the list right after `extends` or
-/// `include`. A literal that is part of a larger expression is not.
-fn is_tag_argument(source: &[u8], literal: &Literal) -> bool {
-    if !literal.tag {
-        return false;
-    }
-    let (start, end) = literal.block;
+/// The name of the tag between `start` and `end`, past whitespace control.
+fn tag_name(source: &[u8], (start, end): (usize, usize)) -> &str {
     let mut i = skip_spaces(source, start, end);
     if i < end && matches!(source[i], b'-' | b'~') {
         i = skip_spaces(source, i + 1, end);
@@ -416,13 +414,26 @@ fn is_tag_argument(source: &[u8], literal: &Literal) -> bool {
     while i < end && source[i].is_ascii_alphabetic() {
         i += 1;
     }
-    let Ok(tag) = std::str::from_utf8(&source[word_start..i]) else {
+    std::str::from_utf8(&source[word_start..i]).unwrap_or_default()
+}
+
+/// Whether the literal is the template a tag names: the first argument of one of
+/// the template tags, or an element of the list right after `extends` or
+/// `include`. A literal that is part of a larger expression is not.
+fn is_tag_argument(source: &[u8], literal: &Literal) -> bool {
+    if !literal.tag {
         return false;
-    };
+    }
+    let (start, end) = literal.block;
+    let tag = tag_name(source, literal.block);
     if !TEMPLATE_TAGS.contains(&tag) {
         return false;
     }
-    let argument = skip_spaces(source, i, end);
+    let mut i = skip_spaces(source, start, end);
+    if i < end && matches!(source[i], b'-' | b'~') {
+        i = skip_spaces(source, i + 1, end);
+    }
+    let argument = skip_spaces(source, i + tag.len(), end);
     if argument == literal.quote {
         return !followed_by(source, literal, b"~|.+[(");
     }
@@ -505,6 +516,8 @@ mod tests {
         assert_eq!(route("{{ path('a', {name: 'b'}) }}", "'b'"), None);
         assert_eq!(route("{{ path(other: 'home') }}", "'home'"), None);
         assert_eq!(route("{{ path(x == 'home') }}", "'home'"), None);
+        assert_eq!(route("{% macro url(name = 'home') %}", "'home'"), None);
+        assert!(names(b"{% macro path(name = 'x') %}{% endmacro %}").is_empty());
     }
 
     #[test]
@@ -521,6 +534,10 @@ mod tests {
             Some("home".into())
         );
         assert_eq!(route("{{ 'x#{path(\"home\")}' }}", "\"home\""), None);
+        assert_eq!(
+            route("{{ \"#{ '\"' }\" ~ path('home') }}", "'home'"),
+            Some("home".into())
+        );
     }
 
     #[test]

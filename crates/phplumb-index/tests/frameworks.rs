@@ -669,6 +669,18 @@ fn invoke_with_a_module_reaches_that_module_only() {
 }
 
 #[test]
+fn named_invoke_arguments_reach_the_named_module() {
+    assert_eq!(
+        definitions_in(HOOK_CALLS, "invoke(hook: 'pi"),
+        vec!["modules/contrib/gadget/gadget.module: gadget_ping"]
+    );
+    assert_eq!(
+        definitions_in(HOOK_CALLS, "'mymodule', hook: 'pi"),
+        vec!["modules/custom/mymodule/mymodule.module: mymodule_ping"]
+    );
+}
+
+#[test]
 fn alter_types_in_arrays_lead_to_alter_implementations() {
     assert_eq!(
         definitions_in(HOOK_CALLS, "alter(['thing_da"),

@@ -8,7 +8,7 @@ function gadget_cron()
 {
 }
 
-function /*@target:gadget_ping*//*@cursor:gadget_ping*/gadget_ping()
+function /*@cursor:gadget_ping*/gadget_ping()
 {
 }
 

@@ -1423,3 +1423,51 @@ fn logout_routes_lead_to_the_firewall() {
     assert!(route_files_of(&index, "_logout_dev").is_empty());
     assert!(!route_missing(&index, "_missing"));
 }
+
+#[test]
+fn named_route_arguments_are_flagged() {
+    let (_dir, root) = broken_symfony(&[(
+        "src/Controller/Uses.php",
+        "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->redirectToRoute(route: 'missing_named');\n        $this->redirectToRoute(route: 'home');\n    }\n}\n",
+    )]);
+
+    assert_eq!(broken_messages(&root), ["Undefined route 'missing_named'"]);
+}
+
+#[test]
+fn logout_routes_need_a_logout_path() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/packages/security.yaml",
+            "security:\n    firewalls:\n        main:\n            logout:\n                path: app_logout\n        admin:\n            logout: ~\n",
+        ),
+        (
+            "config/routes/security.yaml",
+            "_security_logout:\n    resource: security.route_loader.logout\n    type: service\n",
+        ),
+    ]);
+    let index = auto(&root);
+
+    assert!(route_files_of(&index, "_logout_main").is_empty());
+    assert_eq!(route_files_of(&index, "_logout_admin"), ["logout"]);
+}
+
+#[test]
+fn kernel_abstract_bundles_read_routes_from_their_parent_directory() {
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/KernelAbstractBundle.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Kernel;\nabstract class AbstractBundle\n{\n    public function getPath(): string { return ''; }\n}\n",
+        ),
+        (
+            "lib/acme/src/AcmeBundle.php",
+            "<?php\nnamespace Acme;\nuse Symfony\\Component\\DependencyInjection\\Kernel\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle {}\n",
+        ),
+        (
+            "config/routes/acme.yaml",
+            "acme:\n    resource: '@AcmeBundle/config/routes.yaml'\n",
+        ),
+    ]);
+
+    assert_eq!(route_files_of(&auto(&root), "acme_home"), ["acme_home"]);
+}
