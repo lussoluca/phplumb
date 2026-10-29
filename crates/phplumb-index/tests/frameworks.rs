@@ -1907,3 +1907,20 @@ fn drupal_answers_nothing_in_twig() {
     );
     assert!(index.definition(&path, &source, offset - 2).is_empty());
 }
+
+#[test]
+fn off_modules_give_only_php() {
+    let (_dir, root) = project(Some(DRUPAL_LOCK));
+    let opts = DiscoverOptions {
+        frameworks: FrameworkSettings {
+            drupal: Activation::Off,
+            symfony: Activation::Off,
+        },
+        ..DiscoverOptions::default()
+    };
+
+    assert_eq!(
+        Index::build(&root, &opts).unwrap().0.active_frameworks(),
+        Vec::<&str>::new()
+    );
+}

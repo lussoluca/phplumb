@@ -1,6 +1,7 @@
 //! The part of the workspace a framework module reads and answers for: the
 //! directory of its project's `composer.lock`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
@@ -26,11 +27,24 @@ impl Project {
     }
 }
 
-/// The directory of the `composer.lock` nearest to `root` that lists `package`,
-/// outside hidden directories, `vendor` and `node_modules`. Locks at the same depth
-/// go in path order.
-pub(crate) fn nearest_lock(root: &Path, package: &str) -> Option<PathBuf> {
-    let mut locks: Vec<(usize, PathBuf)> = WalkBuilder::new(root)
+/// A `composer.lock` found below the root, with the packages it lists.
+pub(crate) struct Lock {
+    pub dir: PathBuf,
+    packages: HashSet<String>,
+}
+
+impl Lock {
+    /// Whether the lock lists `package`.
+    pub(crate) fn requires(&self, package: &str) -> bool {
+        self.packages.contains(package)
+    }
+}
+
+/// The `composer.lock` files below `root`, outside hidden directories, `vendor` and
+/// `node_modules`, nearest first and in path order at the same depth, each read
+/// once. A lock that cannot be read lists no package.
+pub(crate) fn locks(root: &Path) -> Vec<Lock> {
+    let mut found: Vec<(usize, PathBuf)> = WalkBuilder::new(root)
         .standard_filters(false)
         .hidden(true)
         .max_depth(Some(LOCK_DEPTH))
@@ -49,24 +63,30 @@ pub(crate) fn nearest_lock(root: &Path, package: &str) -> Option<PathBuf> {
         })
         .map(|entry| (entry.depth(), entry.into_path()))
         .collect();
-    locks.sort();
-    locks
+    found.sort();
+    found
         .into_iter()
-        .find(|(_, lock)| requires(lock, package))
-        .and_then(|(_, lock)| lock.parent().map(Path::to_path_buf))
+        .filter_map(|(_, lock)| {
+            Some(Lock {
+                packages: packages(&lock),
+                dir: lock.parent()?.to_path_buf(),
+            })
+        })
+        .collect()
 }
 
-/// Whether the `composer.lock` at `path` lists `package`.
-fn requires(path: &Path, package: &str) -> bool {
+/// The names of the packages the `composer.lock` at `path` lists.
+fn packages(path: &Path) -> HashSet<String> {
     let Ok(text) = std::fs::read(path) else {
-        return false;
+        return HashSet::new();
     };
     let Ok(lock) = serde_json::from_slice::<serde_json::Value>(&text) else {
-        return false;
+        return HashSet::new();
     };
-    ["packages", "packages-dev"].iter().any(|section| {
-        lock[section]
-            .as_array()
-            .is_some_and(|packages| packages.iter().any(|p| p["name"] == package))
-    })
+    ["packages", "packages-dev"]
+        .iter()
+        .filter_map(|section| lock[section].as_array())
+        .flatten()
+        .filter_map(|package| package["name"].as_str().map(str::to_string))
+        .collect()
 }

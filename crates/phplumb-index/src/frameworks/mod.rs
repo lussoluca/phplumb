@@ -227,12 +227,6 @@ pub fn registered(settings: &FrameworkSettings) -> Vec<(Activation, Box<dyn Fram
     ]
 }
 
-/// Extensions of the files read as PHP in the project at `root`: `php`, then those
-/// the active frameworks add.
-pub fn php_extensions(root: &Path, settings: &FrameworkSettings) -> Vec<&'static str> {
-    extensions(&active(root, settings))
-}
-
 /// `php`, then the extensions `frameworks` add.
 pub(crate) fn extensions(frameworks: &[Box<dyn Framework>]) -> Vec<&'static str> {
     std::iter::once(PHP_EXTENSION)
@@ -244,34 +238,133 @@ pub(crate) fn extensions(frameworks: &[Box<dyn Framework>]) -> Vec<&'static str>
         .collect()
 }
 
-/// The frameworks to run for the workspace at `root`, each with its project: the
-/// directory of its nearest `composer.lock`, or the root when forced on without one,
-/// without the projects of the other active modules inside it.
-pub(crate) fn active(root: &Path, settings: &FrameworkSettings) -> Vec<Box<dyn Framework>> {
+/// The framework modules to run for a workspace, each with the directory of its
+/// project.
+#[derive(Clone, Debug)]
+pub struct Detection {
+    settings: FrameworkSettings,
+    projects: Vec<(&'static str, PathBuf)>,
+}
+
+impl Detection {
+    /// Extensions of the files read as PHP: `php`, then those the modules add.
+    pub fn php_extensions(&self) -> Vec<&'static str> {
+        extensions(&self.frameworks())
+    }
+
+    /// Fresh modules, each set to its project: the directory of its nearest
+    /// `composer.lock`, or the root when forced on without one, without the projects
+    /// of the other modules inside it.
+    pub(crate) fn frameworks(&self) -> Vec<Box<dyn Framework>> {
+        registered(&self.settings)
+            .into_iter()
+            .filter_map(|(_, mut framework)| {
+                let (_, dir) = self
+                    .projects
+                    .iter()
+                    .find(|(name, _)| *name == framework.name())?;
+                let excluded = self
+                    .projects
+                    .iter()
+                    .map(|(_, other)| other)
+                    .filter(|other| *other != dir && other.starts_with(dir))
+                    .cloned()
+                    .collect();
+                framework.set_project(Project {
+                    dir: dir.clone(),
+                    excluded,
+                });
+                Some(framework)
+            })
+            .collect()
+    }
+}
+
+/// Which framework modules run for the workspace at `root`. The `composer.lock`
+/// files are looked for once, and not at all when every module is off.
+pub fn detect(root: &Path, settings: &FrameworkSettings) -> Detection {
+    detect_with(root, settings, project::locks)
+}
+
+pub(crate) fn detect_with(
+    root: &Path,
+    settings: &FrameworkSettings,
+    find_locks: impl FnOnce(&Path) -> Vec<project::Lock>,
+) -> Detection {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let found: Vec<(Box<dyn Framework>, PathBuf)> = registered(settings)
+    let modules = registered(settings);
+    let locks = if modules
+        .iter()
+        .any(|(activation, _)| *activation != Activation::Off)
+    {
+        find_locks(&root)
+    } else {
+        Vec::new()
+    };
+    let projects = modules
         .into_iter()
         .filter_map(|(activation, framework)| {
-            let lock = project::nearest_lock(&root, framework.package());
+            let lock = locks
+                .iter()
+                .find(|lock| lock.requires(framework.package()))
+                .map(|lock| lock.dir.clone());
             let dir = match activation {
                 Activation::Off => return None,
                 Activation::On => lock.unwrap_or_else(|| root.clone()),
                 Activation::Auto => lock?,
             };
-            Some((framework, dir))
+            Some((framework.name(), dir))
         })
         .collect();
-    let dirs: Vec<PathBuf> = found.iter().map(|(_, dir)| dir.clone()).collect();
-    found
-        .into_iter()
-        .map(|(mut framework, dir)| {
-            let excluded = dirs
-                .iter()
-                .filter(|other| **other != dir && other.starts_with(&dir))
-                .cloned()
-                .collect();
-            framework.set_project(Project { dir, excluded });
-            framework
-        })
-        .collect()
+    Detection {
+        settings: settings.clone(),
+        projects,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const BOTH_LOCK: &str =
+        r#"{"packages": [{"name": "drupal/core"}, {"name": "symfony/framework-bundle"}]}"#;
+
+    fn root_with_lock(lock: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("composer.lock"), lock).unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn detection_skips_the_walk_when_every_module_is_off() {
+        let (_dir, root) = root_with_lock(BOTH_LOCK);
+        let settings = FrameworkSettings {
+            drupal: Activation::Off,
+            symfony: Activation::Off,
+        };
+
+        let detection = detect_with(&root, &settings, |_| panic!("walked for locks"));
+
+        assert!(detection.frameworks().is_empty());
+        assert_eq!(detection.php_extensions(), vec!["php"]);
+    }
+
+    #[test]
+    fn detection_finds_both_modules_in_one_lock() {
+        let (_dir, root) = root_with_lock(BOTH_LOCK);
+
+        let detection = detect(&root, &FrameworkSettings::default());
+
+        let projects: Vec<(&str, PathBuf)> = detection
+            .frameworks()
+            .iter()
+            .map(|f| (f.name(), f.project().dir.clone()))
+            .collect();
+        assert_eq!(
+            projects,
+            vec![("drupal", root.clone()), ("symfony", root.clone())]
+        );
+    }
 }

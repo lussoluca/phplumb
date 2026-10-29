@@ -37,7 +37,7 @@ use lsp_types::{
 };
 use phplumb_index::diagnostics::Severity;
 use phplumb_index::discover::{DiscoverOptions, PHP_EXTENSION};
-use phplumb_index::frameworks::{self, FrameworkSettings};
+use phplumb_index::frameworks::{self, Detection, FrameworkSettings};
 use phplumb_index::line_index::LineIndex;
 use phplumb_index::summary::{MemberKind, SymbolKind as IndexSymbolKind};
 use phplumb_index::symbols::{self, Kind, OutlineSymbol};
@@ -158,6 +158,7 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
         },
         cache: settings.cache_dir.map(|dir| dir.join(CACHE_FILE)),
         index: None,
+        detection: None,
         pending: VecDeque::new(),
         diagnostics: settings.diagnostics,
         refreshes_diagnostics,
@@ -166,7 +167,14 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
     if let Some(warning) = root_warning {
         server.show(MessageType::WARNING, warning)?;
     }
-    let php_extensions = server.php_extensions();
+    server.detection = server
+        .root
+        .as_deref()
+        .map(|root| frameworks::detect(root, &server.opts.frameworks));
+    let php_extensions = server
+        .detection
+        .as_ref()
+        .map_or_else(|| vec![PHP_EXTENSION], Detection::php_extensions);
     if watches_files {
         server.register_watchers(&php_extensions)?;
     }
@@ -213,6 +221,8 @@ struct Server<'a> {
     opts: DiscoverOptions,
     cache: Option<PathBuf>,
     index: Option<Index>,
+    /// The framework detection made at start, used by the first build.
+    detection: Option<Detection>,
     /// Messages read while collecting file events, handled before the queue.
     pending: VecDeque<Message>,
     /// Whether broken references are reported.
@@ -468,15 +478,6 @@ impl Server<'_> {
         Ok(())
     }
 
-    /// Extensions of the files read as PHP: `php`, then those the active frameworks
-    /// add.
-    fn php_extensions(&self) -> Vec<&'static str> {
-        match &self.root {
-            Some(root) => frameworks::php_extensions(root, &self.opts.frameworks),
-            None => vec![PHP_EXTENSION],
-        }
-    }
-
     /// Tells the client which extensions PHP files have, so it can open them as PHP.
     fn announce_php_extensions(&self, extensions: &[&str]) -> anyhow::Result<()> {
         self.connection
@@ -554,7 +555,12 @@ impl Server<'_> {
             )?;
         }
 
-        let (index, stats) = build_index(&root, &self.opts, self.cache.as_deref())?;
+        let detection = self
+            .detection
+            .take()
+            .unwrap_or_else(|| frameworks::detect(&root, &self.opts.frameworks));
+        let (index, stats) =
+            Index::build_with(&root, &self.opts, self.cache.as_deref(), &detection)?;
         let frameworks = index.active_frameworks();
         self.index = Some(index);
         let summary = summary_message(&stats);
@@ -634,17 +640,6 @@ impl Server<'_> {
                 },
             )))?;
         Ok(())
-    }
-}
-
-fn build_index(
-    root: &Path,
-    opts: &DiscoverOptions,
-    cache: Option<&Path>,
-) -> anyhow::Result<(Index, IndexStats)> {
-    match cache {
-        Some(cache) => Index::build_with_cache(root, opts, cache),
-        None => Index::build(root, opts),
     }
 }
 

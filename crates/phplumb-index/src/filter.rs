@@ -61,7 +61,11 @@ pub struct PathFilter {
 
 impl PathFilter {
     pub fn new(root: &Path, opts: &DiscoverOptions) -> anyhow::Result<PathFilter> {
-        Self::for_frameworks(root, opts, &frameworks::active(root, &opts.frameworks))
+        Self::for_frameworks(
+            root,
+            opts,
+            &frameworks::detect(root, &opts.frameworks).frameworks(),
+        )
     }
 
     /// The filter for a project whose active frameworks are `active`.

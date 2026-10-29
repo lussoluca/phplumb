@@ -13,7 +13,9 @@ use crate::calls::{self, CallItem, CallKind, Calls};
 use crate::diagnostics::{self, Diagnostic};
 use crate::discover::{self, DiscoverOptions, discover_in, discover_with};
 use crate::filter::{PHP_EXTENSION, PathFilter, is_framework_file};
-use crate::frameworks::{self, FoundCall, Framework, FrameworkCall, FrameworkDeclaration, Project};
+use crate::frameworks::{
+    self, Detection, FoundCall, Framework, FrameworkCall, FrameworkDeclaration, Project,
+};
 use crate::hover::{self, Hover};
 use crate::infer::{self, Assigning, PropertyTypes, Receiver};
 use crate::members;
@@ -101,7 +103,8 @@ pub struct Index {
 
 impl Index {
     pub fn build(root: &Path, opts: &DiscoverOptions) -> anyhow::Result<(Index, IndexStats)> {
-        Self::build_from(root, opts, HashMap::new())
+        let detection = frameworks::detect(root, &opts.frameworks);
+        Self::build_with(root, opts, None, &detection)
     }
 
     /// Loads `cache` when it was written by this engine version for the same root and
@@ -112,19 +115,24 @@ impl Index {
         opts: &DiscoverOptions,
         cache: &Path,
     ) -> anyhow::Result<(Index, IndexStats)> {
-        let filter = PathFilter::new(root, opts)?;
-        let cached = cache::load(cache, &filter, cache::ENGINE);
-        Self::build_from(root, opts, cached)
+        let detection = frameworks::detect(root, &opts.frameworks);
+        Self::build_with(root, opts, Some(cache), &detection)
     }
 
-    fn build_from(
+    /// Builds the index with the framework modules `detection` found, from `cache`
+    /// when there is one.
+    pub fn build_with(
         root: &Path,
         opts: &DiscoverOptions,
-        mut cached: HashMap<PathBuf, CachedFile>,
+        cache: Option<&Path>,
+        detection: &Detection,
     ) -> anyhow::Result<(Index, IndexStats)> {
         let started = Instant::now();
-        let active = frameworks::active(root, &opts.frameworks);
+        let active = detection.frameworks();
         let mut filter = PathFilter::for_frameworks(root, opts, &active)?;
+        let mut cached = cache
+            .map(|cache| cache::load(cache, &filter, cache::ENGINE))
+            .unwrap_or_default();
         let paths = discover_with(&mut filter);
 
         let stamps: Vec<Option<(u64, u64)>> = paths.par_iter().map(|p| stamp(p)).collect();
@@ -191,7 +199,7 @@ impl Index {
             stubs: None,
             ..DiscoverOptions::default()
         };
-        let filter = PathFilter::new(dir, &opts)?;
+        let filter = PathFilter::for_frameworks(dir, &opts, &[])?;
         let mut paths: Vec<PathBuf> = Vec::new();
         let mut pending = vec![filter.root().to_path_buf()];
         while let Some(next) = pending.pop() {
