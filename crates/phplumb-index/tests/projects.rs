@@ -475,11 +475,14 @@ fn constants_without_literal_values_keep_routes_uncertain() {
 }
 
 #[test]
-fn php_route_files_silence_route_diagnostics() {
+fn empty_php_route_files_keep_routes_certain() {
     let (_dir, root) = broken_symfony(&[("config/routes/extra.php", "<?php\n")]);
     assert_eq!(
         broken_messages(&root),
-        ["Undefined parameter 'app.nowhere'"]
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
     );
 }
 
@@ -1018,4 +1021,36 @@ fn route_files_imported_from_outside_config_routes_are_read() {
             "Undefined parameter 'app.nowhere'"
         ]
     );
+}
+
+const PHP_ROUTES: &str = "<?php\nuse App\\Controller\\Uses;\nuse Symfony\\Component\\Routing\\Loader\\Configurator\\RoutingConfigurator;\nreturn static function (RoutingConfigurator $routes): void {\n    $routes->add('php_home', '/')->methods(['GET'])->controller([Uses::class, 'run']);\n};\n";
+
+#[test]
+fn php_route_files_define_their_routes() {
+    let (_dir, root) = broken_symfony(&[("config/routes.php", PHP_ROUTES)]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "php_home"), ["php_home", "run"]);
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+}
+
+#[test]
+fn php_route_imports_and_computed_names_silence_route_diagnostics() {
+    for content in [
+        "<?php\nreturn static function ($routes): void {\n    $routes->import('../src/Other/', 'attribute');\n};\n",
+        "<?php\nreturn static function ($routes): void {\n    $name = 'x';\n    $routes->add($name, '/x');\n};\n",
+    ] {
+        let (_dir, root) = broken_symfony(&[("config/routes/extra.php", content)]);
+        assert_eq!(
+            broken_messages(&root),
+            ["Undefined parameter 'app.nowhere'"],
+            "{content}"
+        );
+    }
 }

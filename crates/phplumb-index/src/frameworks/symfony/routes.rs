@@ -11,7 +11,8 @@ use crate::frameworks::Project;
 use crate::frameworks::attributes::{RouteName, route_names, route_variants};
 use crate::frameworks::yaml::{self, Yaml};
 use crate::index::{Index, Location};
-use crate::summary::{Declaration, Member, MemberKind, SymbolKind};
+use crate::infer::php_routes;
+use crate::summary::{Declaration, Member, MemberKind, SymbolKind, summarize};
 
 /// Where a route name leads, with the text expected at the range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +99,9 @@ impl Routes {
         let config = project.dir.join("config");
         let files = route_files(&config, filter);
         routes.unknown |= has_unread_route_files(&config);
+        for file in php_route_files(&config, filter) {
+            routes.read_php(index, &file);
+        }
         routes
             .read_files
             .extend(files.iter().map(|file| (file.clone(), String::new())));
@@ -361,6 +365,34 @@ impl Routes {
         }
     }
 
+    /// The routes and aliases a PHP route file adds through its configurator; an
+    /// import or a computed name leaves route names unknown.
+    fn read_php(&mut self, index: &Index, file: &Path) {
+        let Ok(source) = std::fs::read(file) else {
+            self.unknown = true;
+            return;
+        };
+        let found = php_routes(&summarize(&source), &source);
+        self.unknown |= found.unknown;
+        for (name, start, end, controller) in found.routes {
+            self.add(
+                name.clone(),
+                RouteTarget {
+                    location: Location {
+                        path: file.to_path_buf(),
+                        start,
+                        end,
+                    },
+                    text: name.clone(),
+                },
+            );
+            if let Some(target) = controller.and_then(|c| controller_target(index, &c)) {
+                self.add(name, target);
+            }
+        }
+        self.aliases.extend(found.aliases);
+    }
+
     /// Adds `prefix` before the names of the attribute routes `resource` reads.
     fn prefix_attribute_routes(&mut self, resource: &AttributeResource, prefix: &str) {
         let prefixed: Vec<(String, RouteTarget)> = self
@@ -469,8 +501,8 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// Whether `config` holds route files the module does not read: `routes.php`, or
-/// PHP or XML files below `config/routes`.
+/// Whether `config` holds route files the module does not read: XML files below
+/// `config/routes`.
 fn has_unread_route_files(config: &Path) -> bool {
     fn below(dir: &Path) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -481,11 +513,11 @@ fn has_unread_route_files(config: &Path) -> bool {
             if path.is_dir() {
                 below(&path)
             } else {
-                matches!(kind, Some("php" | "xml"))
+                matches!(kind, Some("xml"))
             }
         })
     }
-    config.join("routes.php").is_file() || below(&config.join("routes"))
+    below(&config.join("routes"))
 }
 
 /// Whether `class` declares a method named `name`.
@@ -585,6 +617,25 @@ fn controller_target(index: &Index, controller: &str) -> Option<RouteTarget> {
         },
         text: member.name.clone(),
     })
+}
+
+/// `routes.php` in `config`, then the PHP files directly in `config/routes`, in path
+/// order.
+fn php_route_files(config: &Path, filter: &PathFilter) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(config.join("routes"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|e| e == "php"))
+        .collect();
+    files.sort();
+    let main = config.join("routes.php");
+    if main.is_file() {
+        files.insert(0, main);
+    }
+    files.retain(|path| filter.in_scope(path));
+    files
 }
 
 /// `routes.yaml` (or `.yml`) in `config`, then every YAML file below

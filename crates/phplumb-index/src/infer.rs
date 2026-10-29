@@ -640,6 +640,135 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Vec<&'ast KeyValueArrayElement<'arena>>>
 
 /// The method calls in a file named one of `names`, case-insensitively, in source
 /// order, with what they target and their literal arguments.
+/// What a Symfony PHP route file defines through its `RoutingConfigurator`.
+#[derive(Default)]
+pub(crate) struct PhpRoutes {
+    /// Each `add('name', ...)`: the name, its range inside the quotes, and the
+    /// controller its chain sets, as `Class::method` or `Class`.
+    pub routes: Vec<(String, u32, u32, Option<String>)>,
+    /// Each `alias('alias', 'route')`.
+    pub aliases: Vec<(String, String)>,
+    /// Whether the file imports routes or names one the module cannot read.
+    pub unknown: bool,
+}
+
+/// The routes, aliases and imports of a PHP route file.
+pub(crate) fn php_routes(summary: &FileSummary, source: &[u8]) -> PhpRoutes {
+    let arena = LocalArena::new();
+    let program = parse_file_content(&arena, FileId::zero(), source);
+    let mut calls: Vec<CallRef<'_, '_>> = Vec::new();
+    CallsWithArguments.walk_program(program, &mut calls);
+    let class_at = |offset: u32| {
+        summary
+            .names
+            .iter()
+            .find(|n| n.start == offset && n.kind == NameKind::ClassLike)
+            .map(|n| n.fqn.clone())
+    };
+    let name_of = |selector: &ClassLikeMemberSelector<'_>| match selector {
+        ClassLikeMemberSelector::Identifier(name) => {
+            Some(String::from_utf8_lossy(name.value).to_ascii_lowercase())
+        }
+        _ => None,
+    };
+    let mut found = PhpRoutes::default();
+    let mut controllers: Vec<(u32, String)> = Vec::new();
+    for call in &calls {
+        let CallRef::Method(call) = call else {
+            continue;
+        };
+        let Some(method) = name_of(&call.method) else {
+            continue;
+        };
+        let literal = |position: usize| match positional(&call.argument_list, position)? {
+            Expression::Literal(Literal::String(literal)) => {
+                let span = literal.span();
+                let value = String::from_utf8_lossy(literal.value?).into_owned();
+                Some((value, span.start.offset + 1, span.end.offset - 1))
+            }
+            _ => None,
+        };
+        match method.as_str() {
+            "add" => match literal(0) {
+                Some((name, start, end)) => found.routes.push((name, start, end, None)),
+                None => found.unknown = true,
+            },
+            "alias" => match (literal(0), literal(1)) {
+                (Some((alias, ..)), Some((route, ..))) => found.aliases.push((alias, route)),
+                _ => found.unknown = true,
+            },
+            "import" | "collection" => found.unknown = true,
+            "controller" => {
+                // The `add()` this chain starts from.
+                let mut object = call.object;
+                let add = loop {
+                    let Expression::Call(Call::Method(inner)) = object else {
+                        break None;
+                    };
+                    if name_of(&inner.method).as_deref() == Some("add") {
+                        break Some(inner);
+                    }
+                    object = inner.object;
+                };
+                let Some(add) = add else {
+                    continue;
+                };
+                let Some(Expression::Literal(Literal::String(name))) =
+                    positional(&add.argument_list, 0)
+                else {
+                    continue;
+                };
+                let controller = match positional(&call.argument_list, 0) {
+                    Some(Expression::Literal(Literal::String(literal))) => literal
+                        .value
+                        .map(|v| String::from_utf8_lossy(v).into_owned()),
+                    Some(Expression::Access(Access::ClassConstant(access))) => match access.class {
+                        Expression::Identifier(class) => class_at(class.span().start.offset),
+                        _ => None,
+                    },
+                    Some(Expression::Array(array)) => {
+                        let mut elements = array.elements.iter().filter_map(|e| match e {
+                            ArrayElement::Value(e) => Some(e.value),
+                            _ => None,
+                        });
+                        let class = match elements.next() {
+                            Some(Expression::Access(Access::ClassConstant(access))) => {
+                                match access.class {
+                                    Expression::Identifier(class) => {
+                                        class_at(class.span().start.offset)
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        let method = match elements.next() {
+                            Some(Expression::Literal(Literal::String(literal))) => literal
+                                .value
+                                .map(|v| String::from_utf8_lossy(v).into_owned()),
+                            _ => None,
+                        };
+                        class
+                            .zip(method)
+                            .map(|(class, method)| format!("{class}::{method}"))
+                    }
+                    _ => None,
+                };
+                if let Some(controller) = controller {
+                    controllers.push((name.span().start.offset + 1, controller));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (start, controller) in controllers {
+        if let Some(route) = found.routes.iter_mut().find(|route| route.1 == start) {
+            route.3 = Some(controller);
+        }
+    }
+    found
+}
+
 pub(crate) fn calls_named(
     index: &Index,
     path: &Path,
