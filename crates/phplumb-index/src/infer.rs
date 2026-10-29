@@ -2518,8 +2518,16 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             ("array_walk" | "array_find" | "array_find_key" | "array_any" | "array_all", 1, 0) => 0,
             _ => return TypeExpr::Other,
         };
-        match positional(arguments, array) {
-            Some(value) => array_element(&self.expr(value, value.span().start.offset, depth + 1)),
+        if let Some(value) = positional(arguments, array) {
+            return array_element(&self.expr(value, value.span().start.offset, depth + 1));
+        }
+        // `...$lists` unpacks an array of arrays into the array arguments.
+        match spread_covering(arguments, array) {
+            Some(value) => array_element(&array_element(&self.expr(
+                value,
+                value.span().start.offset,
+                depth + 1,
+            ))),
             None => TypeExpr::Other,
         }
     }
@@ -2782,6 +2790,24 @@ pub(crate) fn union(types: Vec<TypeExpr>) -> TypeExpr {
 /// The value of the argument at `position`, when it and every argument before it
 /// are positional and none is spread. PHP puts every positional argument before
 /// the named ones.
+/// The value of the spread argument whose elements fill `position`: the first
+/// spread at or before it, after positional arguments only.
+fn spread_covering<'a, 'arena>(
+    arguments: &'a ArgumentList<'arena>,
+    position: usize,
+) -> Option<&'a Expression<'arena>> {
+    for argument in arguments.arguments.iter().take(position + 1) {
+        match argument {
+            Argument::Positional(argument) if argument.ellipsis.is_some() => {
+                return Some(argument.value);
+            }
+            Argument::Positional(_) => {}
+            Argument::Named(_) => return None,
+        }
+    }
+    None
+}
+
 fn positional<'a, 'arena>(
     arguments: &'a ArgumentList<'arena>,
     position: usize,
