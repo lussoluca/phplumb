@@ -1310,3 +1310,187 @@ fn alias_chains_lead_to_their_route() {
     assert_eq!(route_files_of(&auto(&root), "second"), ["home"]);
     assert_eq!(broken_messages(&root), CERTAIN);
 }
+
+const BUNDLES: &str = "<?php\nreturn [\n    Symfony\\Bundle\\FrameworkBundle\\FrameworkBundle::class => ['all' => true],\n    Acme\\AcmeBundle::class => ['all' => true],\n];\n";
+const BUNDLE: &str = "<?php\nnamespace Symfony\\Component\\HttpKernel\\Bundle;\nabstract class Bundle\n{\n    public function getPath(): string { return ''; }\n}\n";
+const ABSTRACT_BUNDLE: &str = "<?php\nnamespace Symfony\\Component\\HttpKernel\\Bundle;\nabstract class AbstractBundle extends Bundle\n{\n    public function getPath(): string { return ''; }\n}\n";
+const FRAMEWORK_BUNDLE: &str = "<?php\nnamespace Symfony\\Bundle\\FrameworkBundle;\nuse Symfony\\Component\\HttpKernel\\Bundle\\Bundle;\nclass FrameworkBundle extends Bundle {}\n";
+const ERRORS_ROUTES: &str = "<?php\nuse Symfony\\Component\\Routing\\Loader\\Configurator\\RoutingConfigurator;\nreturn static function (RoutingConfigurator $routes): void {\n    $routes->add('_preview_error', '/{code}.{_format}')\n        ->controller('error_controller::preview');\n};\n";
+const ACME_BUNDLE: &str = "<?php\nnamespace Acme;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle {}\n";
+
+/// A Symfony project with `config/bundles.php`, Symfony's FrameworkBundle and the
+/// `AcmeBundle`, an `AbstractBundle` defining `acme_home`, and `files`.
+fn bundled_symfony(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let mut all = vec![
+        ("config/bundles.php", BUNDLES),
+        ("lib/Bundle.php", BUNDLE),
+        ("lib/AbstractBundle.php", ABSTRACT_BUNDLE),
+        ("lib/framework-bundle/FrameworkBundle.php", FRAMEWORK_BUNDLE),
+        (
+            "lib/framework-bundle/Resources/config/routing/errors.php",
+            ERRORS_ROUTES,
+        ),
+        ("lib/acme/src/AcmeBundle.php", ACME_BUNDLE),
+        (
+            "lib/acme/config/routes.yaml",
+            "acme_home:\n    path: /acme\n",
+        ),
+    ];
+    all.extend_from_slice(files);
+    broken_symfony(&all)
+}
+
+fn route_missing(index: &Index, name: &str) -> bool {
+    index.framework::<Symfony>().unwrap().route_missing(name)
+}
+
+#[test]
+fn bundle_routes_lead_to_their_definitions() {
+    let (_dir, root) = bundled_symfony(&[(
+        "config/routes/framework.yaml",
+        "when@dev:\n    _errors:\n        resource: '@FrameworkBundle/Resources/config/routing/errors.php'\n        prefix: /_error\n",
+    )]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "_preview_error"), ["_preview_error"]);
+    assert!(route_missing(&index, "_missing"));
+}
+
+#[test]
+fn abstract_bundles_read_routes_from_their_parent_directory() {
+    let (_dir, root) = bundled_symfony(&[(
+        "config/routes/acme.yaml",
+        "acme:\n    resource: '@AcmeBundle/config/routes.yaml'\n",
+    )]);
+
+    assert_eq!(route_files_of(&auto(&root), "acme_home"), ["acme_home"]);
+    assert_eq!(broken_messages(&root), CERTAIN);
+}
+
+#[test]
+fn prefixed_bundle_imports_prefix_bundle_routes() {
+    let (_dir, root) = bundled_symfony(&[(
+        "config/routes/acme.yaml",
+        "acme:\n    resource: '@AcmeBundle/config/routes.yaml'\n    name_prefix: 'x_'\n",
+    )]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "x_acme_home"), ["acme_home"]);
+    assert!(route_files_of(&index, "acme_home").is_empty());
+}
+
+#[test]
+fn unresolved_bundles_keep_routes_uncertain() {
+    let unregistered = [(
+        "config/routes/other.yaml",
+        "other:\n    resource: '@OtherBundle/config/routes.yaml'\n",
+    )];
+    let own_path = [
+        (
+            "lib/acme/src/AcmeBundle.php",
+            "<?php\nnamespace Acme;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle\n{\n    public function getPath(): string { return __DIR__; }\n}\n",
+        ),
+        (
+            "config/routes/acme.yaml",
+            "acme:\n    resource: '@AcmeBundle/config/routes.yaml'\n",
+        ),
+    ];
+    for files in [&unregistered[..], &own_path[..]] {
+        let (_dir, root) = bundled_symfony(files);
+        assert_eq!(
+            broken_messages(&root),
+            ["Undefined parameter 'app.nowhere'"],
+            "{files:?}"
+        );
+    }
+}
+
+#[test]
+fn logout_routes_lead_to_the_firewall() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/packages/security.yaml",
+            "security:\n    firewalls:\n        dev:\n            security: false\n        main:\n            logout:\n                path: /logout\n",
+        ),
+        (
+            "config/routes/security.yaml",
+            "_security_logout:\n    resource: security.route_loader.logout\n    type: service\n",
+        ),
+    ]);
+    let index = auto(&root);
+
+    assert_eq!(route_files_of(&index, "_logout_main"), ["logout"]);
+    assert!(route_files_of(&index, "_logout_dev").is_empty());
+    assert!(!route_missing(&index, "_missing"));
+}
+
+#[test]
+fn named_route_arguments_are_flagged() {
+    let (_dir, root) = broken_symfony(&[(
+        "src/Controller/Uses.php",
+        "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->redirectToRoute(route: 'missing_named');\n        $this->redirectToRoute(route: 'home');\n    }\n}\n",
+    )]);
+
+    assert_eq!(broken_messages(&root), ["Undefined route 'missing_named'"]);
+}
+
+#[test]
+fn logout_routes_need_a_logout_path() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/packages/security.yaml",
+            "security:\n    firewalls:\n        main:\n            logout:\n                path: app_logout\n        admin:\n            logout: ~\n",
+        ),
+        (
+            "config/routes/security.yaml",
+            "_security_logout:\n    resource: security.route_loader.logout\n    type: service\n",
+        ),
+    ]);
+    let index = auto(&root);
+
+    assert!(route_files_of(&index, "_logout_main").is_empty());
+    assert_eq!(route_files_of(&index, "_logout_admin"), ["logout"]);
+}
+
+#[test]
+fn kernel_abstract_bundles_read_routes_from_their_parent_directory() {
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/KernelAbstractBundle.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Kernel;\nabstract class AbstractBundle\n{\n    public function getPath(): string { return ''; }\n}\n",
+        ),
+        (
+            "lib/acme/src/AcmeBundle.php",
+            "<?php\nnamespace Acme;\nuse Symfony\\Component\\DependencyInjection\\Kernel\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle {}\n",
+        ),
+        (
+            "config/routes/acme.yaml",
+            "acme:\n    resource: '@AcmeBundle/config/routes.yaml'\n",
+        ),
+    ]);
+
+    assert_eq!(route_files_of(&auto(&root), "acme_home"), ["acme_home"]);
+}
+
+#[test]
+fn bundles_built_on_kernel_abstract_bundles_keep_their_own_path() {
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/KernelAbstractBundle.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Kernel;\nabstract class AbstractBundle\n{\n    public function getPath(): string { return ''; }\n}\n",
+        ),
+        (
+            "lib/Bundle.php",
+            "<?php\nnamespace Symfony\\Component\\HttpKernel\\Bundle;\nuse Symfony\\Component\\DependencyInjection\\Kernel\\AbstractBundle as BaseAbstractBundle;\nabstract class Bundle extends BaseAbstractBundle\n{\n    public function getPath(): string { return ''; }\n}\n",
+        ),
+        (
+            "config/routes/framework.yaml",
+            "_errors:\n    resource: '@FrameworkBundle/Resources/config/routing/errors.php'\n",
+        ),
+    ]);
+
+    assert_eq!(
+        route_files_of(&auto(&root), "_preview_error"),
+        ["_preview_error"]
+    );
+}

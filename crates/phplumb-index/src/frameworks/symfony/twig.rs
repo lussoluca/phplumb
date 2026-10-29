@@ -40,10 +40,18 @@ impl Literal {
 }
 
 /// The route name under `offset`: a string literal that is the whole first
-/// argument of `path(` or `url(`, with its range inside the quotes.
+/// argument of `path(` or `url(`, or their argument named `name`, with its range
+/// inside the quotes.
 pub(crate) fn route_name_at(source: &[u8], offset: u32) -> Option<(String, u32, u32)> {
     let literal = literal_at(source, offset as usize)?;
-    is_function_argument(source, &literal, &["path", "url"]).then(|| literal.value(source))
+    is_route_argument(source, &literal).then(|| literal.value(source))
+}
+
+/// Whether the literal is the route name of a `path()` or `url()` call.
+fn is_route_argument(source: &[u8], literal: &Literal) -> bool {
+    let functions = ["path", "url"];
+    is_function_argument(source, literal, &functions)
+        || is_named_argument(source, literal, &functions, "name")
 }
 
 /// The template name under `offset`: the whole first argument of `include(` or
@@ -111,7 +119,7 @@ pub(crate) fn names(source: &[u8]) -> Vec<(TwigName, String, u32, u32)> {
                 is_function_argument(source, &literal, &[function])
                     && argument_count(source, &literal) >= arguments
             };
-            let kind = if is_function_argument(source, &literal, &["path", "url"]) {
+            let kind = if is_route_argument(source, &literal) {
                 TwigName::Route
             } else if optional || lenient("include", 4) || lenient("source", 2) {
                 continue;
@@ -163,19 +171,34 @@ fn in_list(source: &[u8], literal: &Literal) -> bool {
     i > literal.block.0 && matches!(source[i - 1], b'[' | b',')
 }
 
-/// The string literal under `offset` inside a `{{ }}` or `{% %}`.
+/// The innermost string literal under `offset` inside a `{{ }}` or `{% %}`.
 fn literal_at(source: &[u8], offset: usize) -> Option<Literal> {
     let (start, end, tag) = block_at(source, offset)?;
     block_literals(source, start, end, tag)
         .into_iter()
+        .rev()
         .find(|literal| literal.content <= offset && offset <= literal.close)
 }
 
-/// The string literals of the block between `start` and `end`.
+/// The string literals of the block between `start` and `end`, each followed by
+/// those inside the `#{...}` interpolations of a double-quoted one.
 fn block_literals(source: &[u8], start: usize, end: usize, tag: bool) -> Vec<Literal> {
     let mut found = Vec::new();
-    let mut i = start;
-    while i < end {
+    literals_in(source, (start, end), start, end, tag, &mut found);
+    found
+}
+
+/// The string literals between `from` and `to`, inside `block`.
+fn literals_in(
+    source: &[u8],
+    block: (usize, usize),
+    from: usize,
+    to: usize,
+    tag: bool,
+    found: &mut Vec<Literal>,
+) {
+    let mut i = from;
+    while i < to {
         let quote = source[i];
         if quote != b'\'' && quote != b'"' {
             i += 1;
@@ -183,20 +206,53 @@ fn block_literals(source: &[u8], start: usize, end: usize, tag: bool) -> Vec<Lit
         }
         let content = i + 1;
         let mut j = content;
-        while j < end && source[j] != quote {
+        let mut interpolations = Vec::new();
+        while j < to && source[j] != quote {
+            if quote == b'"' && source[j] == b'#' && source.get(j + 1) == Some(&b'{') {
+                let open = j + 2;
+                let close = interpolation_end(source, open, to);
+                interpolations.push((open, close));
+                j = close + 1;
+                continue;
+            }
             j += if source[j] == b'\\' { 2 } else { 1 };
         }
-        let close = j.min(end);
+        let close = j.min(to);
         found.push(Literal {
-            block: (start, end),
+            block,
             tag,
             quote: i,
             content,
             close,
         });
+        for (open, close) in interpolations {
+            literals_in(source, block, open, close, tag, found);
+        }
         i = close + 1;
     }
-    found
+}
+
+/// Where the interpolation whose expression starts at `from` ends: its closing
+/// `}`, past nested braces and strings, or `to`.
+fn interpolation_end(source: &[u8], from: usize, to: usize) -> usize {
+    let mut depth = 0;
+    let mut i = from;
+    while i < to {
+        match source[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < to && source[i] != quote {
+                    i += if source[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return i,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    to
 }
 
 /// The `{{ }}` or `{% %}` around `offset`: the range between its delimiters, and
@@ -251,26 +307,114 @@ fn followed_by(source: &[u8], literal: &Literal, allowed: &[u8]) -> bool {
 /// `)` right after it.
 fn is_function_argument(source: &[u8], literal: &Literal, functions: &[&str]) -> bool {
     let block = literal.block.0;
-    let mut i = literal.quote;
-    while i > block && source[i - 1].is_ascii_whitespace() {
-        i -= 1;
+    let i = skip_spaces_back(source, literal.quote, block);
+    i > block
+        && source[i - 1] == b'('
+        && calls_one_of(source, block, i - 1, functions)
+        && followed_by(source, literal, b",)")
+}
+
+/// Whether the literal is the whole argument named `parameter` of one of
+/// `functions`, written `parameter: value` or `parameter = value`, with `,` or `)`
+/// right after it.
+fn is_named_argument(
+    source: &[u8],
+    literal: &Literal,
+    functions: &[&str],
+    parameter: &str,
+) -> bool {
+    // A macro's arguments are its defaults, not a call.
+    if literal.tag && tag_name(source, literal.block) == "macro" {
+        return false;
     }
-    if i == block || source[i - 1] != b'(' {
+    let block = literal.block.0;
+    let mut i = skip_spaces_back(source, literal.quote, block);
+    if i == block || !matches!(source[i - 1], b':' | b'=') {
         return false;
     }
     i -= 1;
-    while i > block && source[i - 1].is_ascii_whitespace() {
+    // `==`, `<=`, `>=` and `!=` compare.
+    if i > block && matches!(source[i - 1], b'=' | b'<' | b'>' | b'!') {
+        return false;
+    }
+    i = skip_spaces_back(source, i, block);
+    let name_end = i;
+    while i > block && (source[i - 1].is_ascii_alphanumeric() || source[i - 1] == b'_') {
         i -= 1;
     }
+    if &source[i..name_end] != parameter.as_bytes() {
+        return false;
+    }
+    i = skip_spaces_back(source, i, block);
+    let open = match i.checked_sub(1).filter(|&before| before >= block) {
+        Some(before) if source[before] == b'(' => before,
+        // After other arguments: the parenthesis that opens them.
+        Some(before) if source[before] == b',' => match enclosing_open(source, block, before) {
+            Some(open) if source[open] == b'(' => open,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    calls_one_of(source, block, open, functions) && followed_by(source, literal, b",)")
+}
+
+/// Whether the parenthesis at `open` follows the name of one of `functions`, the
+/// name not part of a longer name or a method call.
+fn calls_one_of(source: &[u8], block: usize, open: usize, functions: &[&str]) -> bool {
+    let mut i = skip_spaces_back(source, open, block);
     let name_end = i;
     while i > block && (source[i - 1].is_ascii_alphanumeric() || source[i - 1] == b'_') {
         i -= 1;
     }
     let name = &source[i..name_end];
     let attached = i > block && source[i - 1] == b'.';
-    !attached
-        && functions.iter().any(|f| f.as_bytes() == name)
-        && followed_by(source, literal, b",)")
+    !attached && functions.iter().any(|f| f.as_bytes() == name)
+}
+
+/// The bracket that opens the group holding `from`, past nested groups and
+/// strings, scanning back to `block`.
+fn enclosing_open(source: &[u8], block: usize, from: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut i = from;
+    while i > block {
+        i -= 1;
+        match source[i] {
+            quote @ (b'\'' | b'"') => {
+                while i > block {
+                    i -= 1;
+                    if source[i] == quote && source[i - 1] != b'\\' {
+                        break;
+                    }
+                }
+            }
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' if depth == 0 => return Some(i),
+            b'(' | b'[' | b'{' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The position before the spaces that end at `i`, not before `block`.
+fn skip_spaces_back(source: &[u8], mut i: usize, block: usize) -> usize {
+    while i > block && source[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+/// The name of the tag between `start` and `end`, past whitespace control.
+fn tag_name(source: &[u8], (start, end): (usize, usize)) -> &str {
+    let mut i = skip_spaces(source, start, end);
+    if i < end && matches!(source[i], b'-' | b'~') {
+        i = skip_spaces(source, i + 1, end);
+    }
+    let word_start = i;
+    while i < end && source[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    std::str::from_utf8(&source[word_start..i]).unwrap_or_default()
 }
 
 /// Whether the literal is the template a tag names: the first argument of one of
@@ -281,21 +425,15 @@ fn is_tag_argument(source: &[u8], literal: &Literal) -> bool {
         return false;
     }
     let (start, end) = literal.block;
+    let tag = tag_name(source, literal.block);
+    if !TEMPLATE_TAGS.contains(&tag) {
+        return false;
+    }
     let mut i = skip_spaces(source, start, end);
     if i < end && matches!(source[i], b'-' | b'~') {
         i = skip_spaces(source, i + 1, end);
     }
-    let word_start = i;
-    while i < end && source[i].is_ascii_alphabetic() {
-        i += 1;
-    }
-    let Ok(tag) = std::str::from_utf8(&source[word_start..i]) else {
-        return false;
-    };
-    if !TEMPLATE_TAGS.contains(&tag) {
-        return false;
-    }
-    let argument = skip_spaces(source, i, end);
+    let argument = skip_spaces(source, i + tag.len(), end);
     if argument == literal.quote {
         return !followed_by(source, literal, b"~|.+[(");
     }
@@ -337,7 +475,7 @@ fn is_tag_argument(source: &[u8], literal: &Literal) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{route_name_at, template_name_at};
+    use super::{names, route_name_at, template_name_at};
 
     fn route(source: &str, needle: &str) -> Option<String> {
         let offset = source.find(needle).unwrap() as u32 + 1;
@@ -359,6 +497,56 @@ mod tests {
         assert_eq!(route("path('home')", "'home'"), None);
         assert_eq!(route("{{ path('a', {b: 'c'}) }}", "'c'"), None);
         assert_eq!(route("{{ path('a' ~ b) }}", "'a'"), None);
+    }
+
+    #[test]
+    fn reads_route_names_passed_by_name() {
+        assert_eq!(
+            route("{{ path(name: 'home') }}", "'home'"),
+            Some("home".into())
+        );
+        assert_eq!(
+            route("{{ url(name = 'home') }}", "'home'"),
+            Some("home".into())
+        );
+        assert_eq!(
+            route("{{ path(parameters: {id: 1}, name: 'home') }}", "'home'"),
+            Some("home".into())
+        );
+        assert_eq!(route("{{ path('a', {name: 'b'}) }}", "'b'"), None);
+        assert_eq!(route("{{ path(other: 'home') }}", "'home'"), None);
+        assert_eq!(route("{{ path(x == 'home') }}", "'home'"), None);
+        assert_eq!(route("{% macro url(name = 'home') %}", "'home'"), None);
+        assert!(names(b"{% macro path(name = 'x') %}{% endmacro %}").is_empty());
+    }
+
+    #[test]
+    fn reads_route_names_inside_interpolations() {
+        assert_eq!(
+            route("{{ \"#{path('home')}\" }}", "'home'"),
+            Some("home".into())
+        );
+        assert_eq!(
+            route(
+                "{{ \"#{ {a: 'b'}|json_encode }\" ~ path('home') }}",
+                "'home'"
+            ),
+            Some("home".into())
+        );
+        assert_eq!(route("{{ 'x#{path(\"home\")}' }}", "\"home\""), None);
+        assert_eq!(
+            route("{{ \"#{ '\"' }\" ~ path('home') }}", "'home'"),
+            Some("home".into())
+        );
+    }
+
+    #[test]
+    fn lists_interpolated_and_named_route_names() {
+        let found: Vec<String> = names(b"{{ \"x#{path('a')}\" }}{{ path(name: 'b') }}")
+            .into_iter()
+            .map(|(_, name, _, _)| name)
+            .collect();
+        assert_eq!(found, ["a", "b"]);
     }
 
     #[test]

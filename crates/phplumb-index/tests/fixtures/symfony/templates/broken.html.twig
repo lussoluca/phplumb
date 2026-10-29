@@ -11,3 +11,5 @@
     missing %}
 {{ include('gone.html.twig', {}, true, true) }}
 {{ source('gone.html.twig', true) }}
+{{ "x#{path('nope_route')}" }}
+{{ path(name: 'nope_named') }}

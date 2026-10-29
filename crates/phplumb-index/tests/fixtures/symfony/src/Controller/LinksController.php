@@ -18,5 +18,8 @@ class LinksController extends AbstractController
         $this->urls->generate('app_blog_show');
         $this->redirectToRoute('missing');
         $this->redirectToRoute($name);
+        $this->redirectToRoute(route: 'home');
+        $this->urls->generate(parameters: [], name: 'about');
+        $this->redirectToRoute('home', status: 'about');
     }
 }

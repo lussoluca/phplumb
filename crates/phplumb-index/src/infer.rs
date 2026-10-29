@@ -912,17 +912,21 @@ pub(crate) fn calls_named(
             };
             let caller =
                 calls::caller_at(path, summary, name.span.start.offset, source.len() as u32);
+            let targets = ctx.call_targets(&receiver, &method);
             Some(FoundCall {
                 location: Location {
                     path: path.to_path_buf(),
                     start: name.span.start.offset,
                     end: name.span.end.offset,
                 },
-                targets: ctx.call_targets(&receiver, &method),
-                strings: ctx.string_arguments(arguments, start),
+                strings: ctx.string_arguments(arguments, start, &targets),
                 lists: list_arguments(arguments),
                 shapes: argument_shapes(arguments),
-                ranges: argument_ranges(arguments),
+                ranges: by_parameter(
+                    argument_ranges(arguments),
+                    &ctx.parameter_positions(arguments, &targets),
+                ),
+                targets,
                 receiver: receiver.clone(),
                 arguments: ctx.argument_types(arguments),
                 caller: match caller.kind {
@@ -966,24 +970,34 @@ fn string_literal_at(expression: &Expression<'_>, offset: u32) -> Option<String>
     })
 }
 
-/// The byte range of each positional argument that is a string literal (inside its
-/// quotes) or a class constant fetch, by position.
+/// The byte range of each argument that is a string literal (inside its quotes) or
+/// a class constant fetch, in argument order.
 fn argument_ranges(arguments: &ArgumentList<'_>) -> Vec<Option<(u32, u32)>> {
     arguments
         .arguments
         .iter()
-        .map(|argument| match argument {
-            Argument::Positional(argument) => match argument.value {
-                Expression::Literal(Literal::String(literal)) => Some(inside_quotes(literal)),
-                Expression::Access(Access::ClassConstant(access)) => {
-                    let span = access.span();
-                    Some((span.start.offset, span.end.offset))
-                }
-                _ => None,
-            },
-            Argument::Named(_) => None,
+        .map(|argument| match argument.value() {
+            Expression::Literal(Literal::String(literal)) => Some(inside_quotes(literal)),
+            Expression::Access(Access::ClassConstant(access)) => {
+                let span = access.span();
+                Some((span.start.offset, span.end.offset))
+            }
+            _ => None,
         })
         .collect()
+}
+
+/// `values`, one per argument, moved to the position of the parameter each fills;
+/// a position no argument fills, and an argument filling none, give the default.
+fn by_parameter<T: Default>(values: Vec<T>, positions: &[Option<usize>]) -> Vec<T> {
+    let length = positions.iter().flatten().max().map_or(0, |last| last + 1);
+    let mut placed: Vec<T> = (0..length).map(|_| T::default()).collect();
+    for (value, position) in values.into_iter().zip(positions) {
+        if let Some(position) = position {
+            placed[*position] = value;
+        }
+    }
+    placed
 }
 
 /// The range of a string literal's text, quotes left out.
@@ -2275,7 +2289,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         if targets.is_empty() {
             return None;
         }
-        let strings = self.string_arguments(arguments, at);
+        let strings = self.string_arguments(arguments, at, &targets);
         let call = FrameworkCall {
             targets: &targets,
             strings: &strings,
@@ -2316,8 +2330,9 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             .map(|(value, argument)| StringArgument { value, ..argument })
     }
 
-    /// The first positional argument of `call` for which `find` gives something,
-    /// with what the call targets; the argument's `value` is left empty.
+    /// The first argument of `call` for which `find` gives something, with what the
+    /// call targets; the argument's `value` is left empty. A named argument is at
+    /// the position of the parameter it fills, and gives nothing when none is known.
     fn argument_with<T>(
         &self,
         call: &CallRef<'_, '_>,
@@ -2328,20 +2343,50 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             CallRef::NullSafe(c) => &c.argument_list,
             CallRef::Static(c) => &c.argument_list,
         };
-        let (position, found) =
-            arguments
-                .arguments
-                .iter()
-                .enumerate()
-                .find_map(|(i, argument)| {
-                    let Argument::Positional(argument) = argument else {
-                        return None;
-                    };
-                    find(argument.value).map(|found| (i, found))
-                })?;
+        let (index, found) = arguments
+            .arguments
+            .iter()
+            .enumerate()
+            .find_map(|(i, argument)| find(argument.value()).map(|found| (i, found)))?;
         let mut argument = self.call_parts(call)?;
-        argument.position = position;
+        argument.position = self.parameter_positions(arguments, &argument.targets)[index]?;
         Some((found, argument))
+    }
+
+    /// The parameter each argument of a call fills, in argument order: its own
+    /// position for a positional argument; for a named one, the position of the
+    /// parameter of that name in the first of `targets` declaring it.
+    fn parameter_positions(
+        &self,
+        arguments: &ArgumentList<'_>,
+        targets: &[CallTarget],
+    ) -> Vec<Option<usize>> {
+        arguments
+            .arguments
+            .iter()
+            .enumerate()
+            .map(|(i, argument)| match argument {
+                Argument::Positional(_) => Some(i),
+                Argument::Named(argument) => {
+                    let name = String::from_utf8_lossy(argument.name.value);
+                    targets.iter().find_map(|target| {
+                        let CallTarget::Method {
+                            class,
+                            name: method,
+                        } = target
+                        else {
+                            return None;
+                        };
+                        let (_, member) = self
+                            .index
+                            .find_member(class, MemberKind::Method, method)
+                            .into_iter()
+                            .next()?;
+                        member.params.iter().position(|(param, _)| *param == name)
+                    })
+                }
+            })
+            .collect()
     }
 
     /// What `call` targets, its literal arguments and its receiver, as a string
@@ -2364,9 +2409,10 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         let ClassLikeMemberSelector::Identifier(name) = selector else {
             return None;
         };
+        let targets = self.call_targets(&receiver, &String::from_utf8_lossy(name.value));
         Some(StringArgument {
-            targets: self.call_targets(&receiver, &String::from_utf8_lossy(name.value)),
-            strings: self.string_arguments(arguments, start),
+            strings: self.string_arguments(arguments, start, &targets),
+            targets,
             receiver,
             position: 0,
             value: String::new(),
@@ -2387,16 +2433,20 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             .collect()
     }
 
-    /// Positional arguments that are string literals or `X::class`, by position.
-    fn string_arguments(&self, arguments: &ArgumentList<'_>, at: u32) -> Vec<Option<String>> {
-        arguments
+    /// Arguments that are string literals or `X::class`, by the position of the
+    /// parameter they fill among those of `targets`.
+    fn string_arguments(
+        &self,
+        arguments: &ArgumentList<'_>,
+        at: u32,
+        targets: &[CallTarget],
+    ) -> Vec<Option<String>> {
+        let values = arguments
             .arguments
             .iter()
-            .map(|argument| match argument {
-                Argument::Positional(argument) => self.string_value(argument.value, at),
-                Argument::Named(_) => None,
-            })
-            .collect()
+            .map(|argument| self.string_value(argument.value(), at))
+            .collect();
+        by_parameter(values, &self.parameter_positions(arguments, targets))
     }
 
     fn string_value(&self, expression: &Expression<'_>, at: u32) -> Option<String> {
