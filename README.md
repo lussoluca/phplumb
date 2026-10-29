@@ -118,3 +118,5 @@ PHPlumb has two parts: an engine in Rust (`crates/`) that speaks the Language Se
 ## License
 
 [MIT](LICENSE). The list of PHP built-in names comes from [JetBrains phpstorm-stubs](https://github.com/JetBrains/phpstorm-stubs), under the Apache License 2.0; see [its notice](crates/phplumb-index/data/README.md).
+
+The website in `site/` is built on a Tailwind Plus template and is not covered by the MIT license; see [its README](site/README.md).
