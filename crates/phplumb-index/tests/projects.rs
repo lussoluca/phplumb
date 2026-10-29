@@ -738,3 +738,73 @@ fn links_outside_the_root_change_nothing() {
     assert_eq!(scope(&index, "symfony").1, vec![root.join("drupal")]);
     assert!(index.framework_project("drupal").unwrap().linked.is_empty());
 }
+
+/// Go to definition at the first `needle` in `file`, below `root`.
+fn definitions_at(index: &mut Index, root: &Path, file: &str, needle: &str) -> Vec<PathBuf> {
+    let path = root.join(file);
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source).find(needle).unwrap() as u32;
+    index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| location.path)
+        .collect()
+}
+
+#[test]
+fn drupal_answers_nothing_in_symfony_yaml() {
+    let mut index = auto(&nested());
+    assert!(definitions_at(&mut index, &nested(), "config/services.yaml", "demo.thing").is_empty());
+}
+
+#[test]
+fn drupal_declarations_stay_in_drupal() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(&nested(), &root);
+    fs::write(
+        root.join("src/hooks.php"),
+        "<?php\nfunction demo_cron() {}\n",
+    )
+    .unwrap();
+    let mut index = auto(&root);
+
+    assert_eq!(
+        definitions_at(&mut index, &root, "src/hooks.php", "demo_cron"),
+        vec![root.join("src/hooks.php")]
+    );
+}
+
+#[test]
+fn drupal_keyed_strings_stay_in_drupal() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(&nested(), &root);
+    fs::write(
+        root.join("src/Form.php"),
+        "<?php\nnamespace App;\nfunction form(): array\n{\n    return ['#type' => 'demo_element', 'thing' => 'demo.thing'];\n}\n",
+    )
+    .unwrap();
+    let mut index = auto(&root);
+
+    assert!(definitions_at(&mut index, &root, "src/Form.php", "demo_element").is_empty());
+}
+
+#[test]
+fn drupal_updates_ignore_yaml_outside_its_project() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(&nested(), &root);
+    let mut index = auto(&root);
+    let outside = root.join("src/outside.services.yml");
+    fs::write(
+        &outside,
+        "services:\n  outside.svc:\n    class: App\\Uses\n",
+    )
+    .unwrap();
+
+    index.update(&[outside], &[]);
+
+    assert!(drupal(&index).services("outside.svc").is_empty());
+    assert!(!drupal(&index).defines_service(&index, "outside.svc"));
+}
