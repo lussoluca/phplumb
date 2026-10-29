@@ -1706,7 +1706,9 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 variable.span.start.offset,
                 depth + 1,
             ) {
-                TypeExpr::Named(class) | TypeExpr::Tagged { class, .. } => Some(class),
+                TypeExpr::Named(class)
+                | TypeExpr::Tagged { class, .. }
+                | TypeExpr::Generic { class, .. } => Some(class),
                 _ => None,
             },
             _ => None,
@@ -2218,10 +2220,16 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
 
     /// What calling `function` returns: a named function's return type, or for any
     /// other callee, what its object's `__invoke()` returns.
-    fn function_returns(&self, function: &Expression<'_>, at: u32, depth: u32) -> TypeExpr {
-        let Expression::Identifier(identifier) = function else {
-            let callee = self.expr(function, at, depth);
-            return self.member_type(&callee, MemberKind::Method, "__invoke", None, None);
+    fn function_returns(&self, call: &FunctionCall<'_>, at: u32, depth: u32) -> TypeExpr {
+        let Expression::Identifier(identifier) = call.function else {
+            let callee = self.expr(call.function, at, depth);
+            return self.member_type(
+                &callee,
+                MemberKind::Method,
+                "__invoke",
+                None,
+                Some((&call.argument_list, at, depth)),
+            );
         };
         let Some(name) = self
             .names
@@ -2467,7 +2475,12 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
 
     /// The type an ancestor's declaration of the method at `scope` gives its
     /// parameter `i`, as an interface documents it for its implementations.
+    /// Closures, arrow functions and constructors are not tied to an ancestor's
+    /// signature.
     fn inherited_param(&self, scope: &ScopeFact<'_, '_>, i: usize) -> Option<TypeExpr> {
+        if !matches!(scope.kind, ScopeKind::Function) {
+            return None;
+        }
         let fqn = self.summary.enclosing_class(scope.start)?.fqn.as_deref()?;
         let method = self
             .summary
@@ -2481,6 +2494,9 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                     && member.range.0 <= scope.start
                     && scope.start <= member.range.1
             })?;
+        if method.name.eq_ignore_ascii_case("__construct") {
+            return None;
+        }
         self.index.ancestor_param(fqn, &method.name, i)
     }
 
@@ -2542,7 +2558,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
     /// functions keep, or the declared return type.
     fn function_call(&self, call: &FunctionCall<'_>, at: u32, depth: u32) -> TypeExpr {
         let Some(function) = self.builtin_function(call.function) else {
-            return self.function_returns(call.function, at, depth);
+            return self.function_returns(call, at, depth);
         };
         let first = || {
             positional(&call.argument_list, 0)
@@ -2562,7 +2578,7 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
                 };
                 hint.map_or(TypeExpr::Other, |hint| array_of(self.hint_type(&hint.hint)))
             }
-            _ => self.function_returns(call.function, at, depth),
+            _ => self.function_returns(call, at, depth),
         }
     }
 

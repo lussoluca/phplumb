@@ -1163,10 +1163,9 @@ impl Index {
             .clone()
     }
 
-    /// The nearest typed declaration of a member above `class`, for members with no
-    /// type of their own.
-    /// The type of the parameter at `position` of the nearest declaration of
-    /// `method` among the parents and interfaces of `class`, when it names a class.
+    /// The type of the parameter at `position` of the nearest non-private
+    /// declaration of `method` among the parents and interfaces of `class`, when it
+    /// says something about classes.
     pub(crate) fn ancestor_param(
         &self,
         class: &str,
@@ -1189,7 +1188,12 @@ impl Index {
                     .class
                     .iter()
                     .flat_map(|shape| shape.members.iter())
-                    .find(|m| m.kind == MemberKind::Method && m.name.eq_ignore_ascii_case(method))
+                    // A private method binds nothing in its subclasses.
+                    .find(|m| {
+                        m.kind == MemberKind::Method
+                            && !m.is_private
+                            && m.name.eq_ignore_ascii_case(method)
+                    })
                     .and_then(|m| m.params.get(position))
                     .and_then(|(_, ty)| ty.clone())
                     .filter(|ty| !crate::infer::names_no_class(ty));
@@ -1202,6 +1206,8 @@ impl Index {
         None
     }
 
+    /// The nearest typed declaration of a member above `class`, for members with no
+    /// type of their own.
     pub(crate) fn typed_ancestor(
         &self,
         class: &str,
