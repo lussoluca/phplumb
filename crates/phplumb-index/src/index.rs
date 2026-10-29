@@ -2026,28 +2026,40 @@ impl Index {
 }
 
 /// Gives each framework project the directories that symlinks inside it lead to
-/// elsewhere under the root, and leaves them out of the other projects.
+/// elsewhere under the root, as a Composer path repository links a module, and
+/// leaves them out of the other projects unless those link them too. Links inside
+/// `vendor` install libraries, not modules, and a link to another project's folder
+/// (or a folder holding it) is not followed.
 fn link_projects(frameworks: &mut [Box<dyn Framework>], links: &[(PathBuf, PathBuf)], root: &Path) {
     let mut projects: Vec<Project> = frameworks.iter().map(|f| f.project().clone()).collect();
-    let mut taken: Vec<(usize, PathBuf)> = Vec::new();
-    for (i, project) in projects.iter_mut().enumerate() {
+    let dirs: Vec<PathBuf> = projects.iter().map(|p| p.dir.clone()).collect();
+    let in_vendor = |link: &Path| {
+        link.strip_prefix(root)
+            .is_ok_and(|relative| relative.components().any(|c| c.as_os_str() == "vendor"))
+    };
+    for project in projects.iter_mut() {
         for (link, target) in links {
-            let inside = project.contains(link);
-            if inside
-                && target.starts_with(root)
-                && !target.starts_with(&project.dir)
-                && !project.linked.contains(target)
-            {
+            let linkable = target.starts_with(root)
+                && !in_vendor(link)
+                && project.contains(link)
+                && !project.contains(target)
+                && !dirs.iter().any(|dir| dir.starts_with(target));
+            if linkable && !project.linked.contains(target) {
                 project.linked.push(target.clone());
-                taken.push((i, target.clone()));
             }
         }
     }
-    for (owner, target) in taken {
-        for (i, project) in projects.iter_mut().enumerate() {
-            if i != owner && target.starts_with(&project.dir) && !project.excluded.contains(&target)
-            {
-                project.excluded.push(target.clone());
+    let linked: Vec<Vec<PathBuf>> = projects.iter().map(|p| p.linked.clone()).collect();
+    for (owner, targets) in linked.iter().enumerate() {
+        for target in targets {
+            for (i, project) in projects.iter_mut().enumerate() {
+                if i != owner
+                    && !project.linked.contains(target)
+                    && project.contains(target)
+                    && !project.excluded.contains(target)
+                {
+                    project.excluded.push(target.clone());
+                }
             }
         }
     }

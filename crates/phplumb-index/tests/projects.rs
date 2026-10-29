@@ -751,43 +751,66 @@ fn definitions_at(index: &mut Index, root: &Path, file: &str, needle: &str) -> V
         .collect()
 }
 
+/// A Symfony project at the root holding the full Drupal fixture in `drupal/`, with
+/// Symfony files naming what the Drupal module would answer for.
+fn symfony_with_drupal() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/drupal"),
+        &root.join("drupal"),
+    );
+    lock(&root, ".", SYMFONY_LOCK);
+    for (file, content) in [
+        (
+            "src/app.services.yml",
+            "services:\n  app.x:\n    arguments: ['@entity_type.manager']\n",
+        ),
+        ("src/hooks.php", "<?php\nfunction mymodule_example() {}\n"),
+        (
+            "src/Form.php",
+            "<?php\nnamespace App;\nfunction form(): array\n{\n    return ['#type' => 'textfield'];\n}\n",
+        ),
+    ] {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    (dir, root)
+}
+
 #[test]
 fn drupal_answers_nothing_in_symfony_yaml() {
-    let mut index = auto(&nested());
-    assert!(definitions_at(&mut index, &nested(), "config/services.yaml", "demo.thing").is_empty());
+    let (_dir, root) = symfony_with_drupal();
+    let mut index = auto(&root);
+    assert!(
+        definitions_at(
+            &mut index,
+            &root,
+            "src/app.services.yml",
+            "entity_type.manager"
+        )
+        .is_empty()
+    );
 }
 
 #[test]
 fn drupal_declarations_stay_in_drupal() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    copy_dir(&nested(), &root);
-    fs::write(
-        root.join("src/hooks.php"),
-        "<?php\nfunction demo_cron() {}\n",
-    )
-    .unwrap();
+    let (_dir, root) = symfony_with_drupal();
     let mut index = auto(&root);
 
     assert_eq!(
-        definitions_at(&mut index, &root, "src/hooks.php", "demo_cron"),
+        definitions_at(&mut index, &root, "src/hooks.php", "mymodule_example"),
         vec![root.join("src/hooks.php")]
     );
 }
 
 #[test]
 fn drupal_keyed_strings_stay_in_drupal() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    copy_dir(&nested(), &root);
-    fs::write(
-        root.join("src/Form.php"),
-        "<?php\nnamespace App;\nfunction form(): array\n{\n    return ['#type' => 'demo_element', 'thing' => 'demo.thing'];\n}\n",
-    )
-    .unwrap();
+    let (_dir, root) = symfony_with_drupal();
     let mut index = auto(&root);
 
-    assert!(definitions_at(&mut index, &root, "src/Form.php", "demo_element").is_empty());
+    assert!(definitions_at(&mut index, &root, "src/Form.php", "textfield").is_empty());
 }
 
 #[test]
@@ -807,4 +830,108 @@ fn drupal_updates_ignore_yaml_outside_its_project() {
 
     assert!(drupal(&index).services("outside.svc").is_empty());
     assert!(!drupal(&index).defines_service(&index, "outside.svc"));
+}
+
+const LIB_CONTROLLER: &str = "<?php\nnamespace Lib;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass LibController\n{\n    #[Route('/x', name: 'lib_x')]\n    public function x(): void {}\n}\n";
+
+#[cfg(unix)]
+#[test]
+fn packages_both_projects_link_stay_with_both() {
+    let (_dir, root) = project();
+    lock(&root, ".", SYMFONY_LOCK);
+    lock(&root, "drupal", DRUPAL_LOCK);
+    for (file, content) in [
+        ("lib/AbstractController.php", ABSTRACT_CONTROLLER),
+        (
+            "src/Controller/Uses.php",
+            "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->redirectToRoute('lib_x');\n    }\n}\n",
+        ),
+        ("config/routes.yaml", "home:\n    path: /\n"),
+        ("packages/lib/src/LibController.php", LIB_CONTROLLER),
+        (
+            "packages/lib/config/services.yml",
+            "services:\n  lib.svc:\n    class: Lib\\LibController\n",
+        ),
+    ] {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    fs::create_dir_all(root.join("vendor/acme")).unwrap();
+    std::os::unix::fs::symlink("../../packages/lib", root.join("vendor/acme/lib")).unwrap();
+    fs::create_dir_all(root.join("drupal/vendor/acme")).unwrap();
+    std::os::unix::fs::symlink("../../../packages/lib", root.join("drupal/vendor/acme/lib"))
+        .unwrap();
+    let index = auto(&root);
+    let path = root.join("src/Controller/Uses.php");
+    let source = fs::read(&path).unwrap();
+
+    let messages: Vec<String> = index
+        .diagnostics(&path, &source)
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+    assert!(messages.is_empty(), "{messages:?}");
+    assert!(
+        !index
+            .framework::<Symfony>()
+            .unwrap()
+            .route_targets("lib_x")
+            .is_empty()
+    );
+    assert!(drupal(&index).services("lib.svc").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_root_drupal_project_gets_modules_linked_from_a_nested_project() {
+    let (_dir, root) = project();
+    lock(&root, ".", DRUPAL_LOCK);
+    lock(&root, "site", SYMFONY_LOCK);
+    let module = root.join("site/bridge/foo");
+    fs::create_dir_all(module.join("src")).unwrap();
+    fs::write(module.join("foo.info.yml"), "name: Foo\ntype: module\n").unwrap();
+    fs::write(
+        module.join("foo.services.yml"),
+        "services:\n  foo.svc:\n    class: Foo\\Svc\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("web/modules/custom")).unwrap();
+    std::os::unix::fs::symlink(
+        "../../../site/bridge/foo",
+        root.join("web/modules/custom/foo"),
+    )
+    .unwrap();
+
+    let index = auto(&root);
+
+    assert_eq!(drupal(&index).services("foo.svc").len(), 1);
+    assert!(
+        !index
+            .framework_project("symfony")
+            .unwrap()
+            .contains(&module.join("foo.services.yml"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn links_to_another_project_leave_it_alone() {
+    let (_dir, root) = project();
+    lock(&root, "drupal", DRUPAL_LOCK);
+    lock(&root, "site", SYMFONY_LOCK);
+    fs::create_dir_all(root.join("site/src")).unwrap();
+    fs::write(root.join("site/src/A.php"), "<?php\nclass A {}\n").unwrap();
+    fs::create_dir_all(root.join("drupal/web/modules/custom")).unwrap();
+    std::os::unix::fs::symlink(
+        "../../../../site",
+        root.join("drupal/web/modules/custom/site"),
+    )
+    .unwrap();
+
+    let index = auto(&root);
+
+    let file = root.join("site/src/A.php");
+    assert!(index.framework_project("symfony").unwrap().contains(&file));
+    assert!(!index.framework_project("drupal").unwrap().contains(&file));
 }
