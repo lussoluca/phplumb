@@ -13,3 +13,8 @@
 {{ source('gone.html.twig', true) }}
 {{ "x#{path('nope_route')}" }}
 {{ path(name: 'nope_named') }}
+{{ block('n', 'gone_block.html.twig') }}
+{% form_theme form 'gone_theme.html.twig' %}
+{{ include(['gone_list.html.twig', 'base.html.twig']) }}
+{% include x ? 'gone_branch.html.twig' : 'base.html.twig' %}
+{% include 'gone_trim.html.twig' ~%}

@@ -55,18 +55,39 @@ fn is_route_argument(source: &[u8], literal: &Literal) -> bool {
 }
 
 /// The template name under `offset`: the whole first argument of `include(` or
-/// `source(`, or the template a tag names, as an element of a list for `extends`
-/// and `include`.
+/// `source(` or an element of a list there, the second argument of `block(`, the
+/// template a tag names (also an element of a list for `extends` and `include`, or
+/// a branch of a conditional), or a `form_theme` theme.
 pub(crate) fn template_name_at(source: &[u8], offset: u32) -> Option<(String, u32, u32)> {
     let literal = literal_at(source, offset as usize)?;
-    (is_function_argument(source, &literal, &["include", "source"])
-        || is_tag_argument(source, &literal))
-    .then(|| literal.value(source))
+    template_use(source, &literal).map(|_| literal.value(source))
+}
+
+/// Whether the literal names a template, and whether that template must exist:
+/// one of a list, or a branch of a conditional, may be missing.
+fn template_use(source: &[u8], literal: &Literal) -> Option<bool> {
+    // `{% include('a') %}` is the tag, whose argument goes on past the parenthesis.
+    let function = is_function_argument(source, literal, &["include", "source"])
+        && !is_tag_parenthesis(source, literal);
+    if function || is_second_argument(source, literal, "block") {
+        return Some(true);
+    }
+    if is_function_list_element(source, literal, &["include"]) {
+        return Some(false);
+    }
+    if is_tag_argument(source, literal) {
+        return Some(!in_list(source, literal));
+    }
+    if is_conditional_branch(source, literal) {
+        return Some(false);
+    }
+    form_theme(source, literal)
 }
 
 /// Every route name and template name `source` writes as a whole literal argument,
 /// with its range inside the quotes. Names a template may lack, in an element of a
-/// list or with `ignore missing`, are left out, as is text inside `verbatim`.
+/// list, a branch of a conditional or with `ignore missing`, are left out, as is
+/// text inside `verbatim`.
 pub(crate) fn names(source: &[u8]) -> Vec<(TwigName, String, u32, u32)> {
     let mut found = Vec::new();
     let mut i = 0;
@@ -123,9 +144,7 @@ pub(crate) fn names(source: &[u8]) -> Vec<(TwigName, String, u32, u32)> {
                 TwigName::Route
             } else if optional || lenient("include", 4) || lenient("source", 2) {
                 continue;
-            } else if is_function_argument(source, &literal, &["include", "source"])
-                || (is_tag_argument(source, &literal) && !in_list(source, &literal))
-            {
+            } else if template_use(source, &literal) == Some(true) {
                 TwigName::Template
             } else {
                 continue;
@@ -411,7 +430,7 @@ fn tag_name(source: &[u8], (start, end): (usize, usize)) -> &str {
         i = skip_spaces(source, i + 1, end);
     }
     let word_start = i;
-    while i < end && source[i].is_ascii_alphabetic() {
+    while i < end && (source[i].is_ascii_alphabetic() || source[i] == b'_') {
         i += 1;
     }
     std::str::from_utf8(&source[word_start..i]).unwrap_or_default()
@@ -424,18 +443,22 @@ fn is_tag_argument(source: &[u8], literal: &Literal) -> bool {
     if !literal.tag {
         return false;
     }
-    let (start, end) = literal.block;
+    let end = literal.block.1;
     let tag = tag_name(source, literal.block);
     if !TEMPLATE_TAGS.contains(&tag) {
         return false;
     }
-    let mut i = skip_spaces(source, start, end);
-    if i < end && matches!(source[i], b'-' | b'~') {
-        i = skip_spaces(source, i + 1, end);
-    }
-    let argument = skip_spaces(source, i + tag.len(), end);
+    let argument = tag_argument(source, literal.block);
     if argument == literal.quote {
-        return !followed_by(source, literal, b"~|.+[(");
+        return !continues(source, literal.close + 1, end);
+    }
+    // `{% extends('a') %}`
+    if argument < end
+        && source[argument] == b'('
+        && skip_spaces(source, argument + 1, end) == literal.quote
+    {
+        let after = skip_spaces(source, literal.close + 1, end);
+        return after < end && source[after] == b')' && !continues(source, after + 1, end);
     }
     if LIST_TAGS.contains(&tag) && argument < end && source[argument] == b'[' {
         // Only a direct element of that first list, not of a later one.
@@ -473,9 +496,169 @@ fn is_tag_argument(source: &[u8], literal: &Literal) -> bool {
     false
 }
 
+/// Whether the expression goes on at `from`, past spaces, before `end`: a `~`,
+/// `|`, `.`, `+`, `[` or `(`, except a `~` that trims the whitespace after the tag.
+fn continues(source: &[u8], from: usize, end: usize) -> bool {
+    let next = skip_spaces(source, from, end);
+    !at_end(source, next, end) && b"~|.+[(".contains(&source[next])
+}
+
+/// Whether `at` is the end of the block: its closing delimiter, or the `-` or `~`
+/// right before it that trims the whitespace after it.
+fn at_end(source: &[u8], at: usize, end: usize) -> bool {
+    at >= end || (matches!(source[at], b'-' | b'~') && at + 1 == end)
+}
+
+/// Where the argument of the tag between `start` and `end` starts, past its name.
+fn tag_argument(source: &[u8], (start, end): (usize, usize)) -> usize {
+    let mut i = skip_spaces(source, start, end);
+    if i < end && matches!(source[i], b'-' | b'~') {
+        i = skip_spaces(source, i + 1, end);
+    }
+    let tag = tag_name(source, (start, end));
+    skip_spaces(source, i + tag.len(), end)
+}
+
+/// Whether the literal is right inside a parenthesis that opens a template tag's
+/// argument, as in `{% include('a') %}`.
+fn is_tag_parenthesis(source: &[u8], literal: &Literal) -> bool {
+    if !literal.tag || !TEMPLATE_TAGS.contains(&tag_name(source, literal.block)) {
+        return false;
+    }
+    let argument = tag_argument(source, literal.block);
+    source.get(argument) == Some(&b'(')
+        && skip_spaces(source, argument + 1, literal.block.1) == literal.quote
+}
+
+/// Where the group opened at `open` closes, past nested groups and strings.
+fn closing(source: &[u8], open: usize, end: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut i = open + 1;
+    while i < end {
+        match source[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < end && source[i] != quote {
+                    i += if source[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => return Some(i),
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether the literal is a direct element of a list that is the whole first
+/// argument of one of `functions`.
+fn is_function_list_element(source: &[u8], literal: &Literal, functions: &[&str]) -> bool {
+    let (block, end) = literal.block;
+    let before = skip_spaces_back(source, literal.quote, block);
+    if before == block || !matches!(source[before - 1], b'[' | b',') {
+        return false;
+    }
+    let Some(open) = enclosing_open(source, block, literal.quote) else {
+        return false;
+    };
+    let paren = skip_spaces_back(source, open, block);
+    let Some(close) = closing(source, open, end) else {
+        return false;
+    };
+    let after = skip_spaces(source, close + 1, end);
+    source[open] == b'['
+        && paren > block
+        && source[paren - 1] == b'('
+        && calls_one_of(source, block, paren - 1, functions)
+        && followed_by(source, literal, b",]")
+        && after < end
+        && matches!(source[after], b',' | b')')
+}
+
+/// Whether the literal is the whole second argument of `function`.
+fn is_second_argument(source: &[u8], literal: &Literal, function: &str) -> bool {
+    let block = literal.block.0;
+    let before = skip_spaces_back(source, literal.quote, block);
+    if before == block || source[before - 1] != b',' {
+        return false;
+    }
+    let Some(open) = enclosing_open(source, block, literal.quote) else {
+        return false;
+    };
+    if source[open] != b'(' || !calls_one_of(source, block, open, &[function]) {
+        return false;
+    }
+    // One comma at the call's own depth, the one before the literal.
+    let mut commas = 0;
+    let mut depth = 0;
+    let mut i = open + 1;
+    while i < literal.quote {
+        match source[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < literal.quote && source[i] != quote {
+                    i += if source[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => commas += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    commas == 1 && followed_by(source, literal, b",)")
+}
+
+/// Whether the literal is a branch of a conditional that is the argument of a
+/// template tag, as in `{% extends x ? 'a' : 'b' %}`.
+fn is_conditional_branch(source: &[u8], literal: &Literal) -> bool {
+    let (block, end) = literal.block;
+    if !literal.tag || !["extends", "include", "embed"].contains(&tag_name(source, literal.block)) {
+        return false;
+    }
+    let before = skip_spaces_back(source, literal.quote, block);
+    let after = skip_spaces(source, literal.close + 1, end);
+    enclosing_open(source, block, literal.quote).is_none()
+        && before > block
+        && matches!(source[before - 1], b'?' | b':')
+        && (at_end(source, after, end)
+            || source[after] == b':'
+            || source[after].is_ascii_alphabetic())
+}
+
+/// Whether the literal is a theme of a `form_theme` tag, and whether it must exist:
+/// a theme of a list after `with` may be missing.
+fn form_theme(source: &[u8], literal: &Literal) -> Option<bool> {
+    let (block, end) = literal.block;
+    if !literal.tag || tag_name(source, literal.block) != "form_theme" {
+        return None;
+    }
+    let before = skip_spaces_back(source, literal.quote, block);
+    if let Some(open) = enclosing_open(source, block, literal.quote) {
+        let word_end = skip_spaces_back(source, open, block);
+        let in_themes = source[open] == b'['
+            && enclosing_open(source, block, open).is_none()
+            && source[..word_end].ends_with(b"with")
+            && matches!(source[before - 1], b'[' | b',')
+            && followed_by(source, literal, b",]");
+        return in_themes.then_some(false);
+    }
+    // Past the form: a theme ends its own expression.
+    let first = tag_argument(source, literal.block);
+    let operator = b"~|.+-*/%=<>?:(,[{".contains(&source[before - 1]);
+    let after = skip_spaces(source, literal.close + 1, end);
+    let ends = at_end(source, after, end)
+        || matches!(source[after], b'\'' | b'"')
+        || source[after].is_ascii_alphabetic();
+    (literal.quote != first && !operator && ends).then_some(true)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{names, route_name_at, template_name_at};
+    use super::{TwigName, names, route_name_at, template_name_at};
 
     fn route(source: &str, needle: &str) -> Option<String> {
         let offset = source.find(needle).unwrap() as u32 + 1;
@@ -497,6 +680,58 @@ mod tests {
         assert_eq!(route("path('home')", "'home'"), None);
         assert_eq!(route("{{ path('a', {b: 'c'}) }}", "'c'"), None);
         assert_eq!(route("{{ path('a' ~ b) }}", "'a'"), None);
+    }
+
+    #[test]
+    fn reads_more_template_forms() {
+        for (source, needle) in [
+            ("{{ include(['a', 'b']) }}", "'a'"),
+            ("{{ include([ 'x', 'a' ]) }}", "'a'"),
+            ("{% extends x ? 'a' : 'b' %}", "'a'"),
+            ("{% extends x ? 'b' : 'a' %}", "'a'"),
+            ("{% extends x ? 'a' : y %}", "'a'"),
+            ("{% extends('a') %}", "'a'"),
+            ("{% include 'a' ~%}", "'a'"),
+            ("{{ block('n', 'a') }}", "'a'"),
+            ("{% form_theme form 'a' %}", "'a'"),
+            ("{% form_theme form 'x' 'a' %}", "'a'"),
+            ("{% form_theme form with 'a' %}", "'a'"),
+            ("{% form_theme form with ['x', 'a'] %}", "'a'"),
+            ("{% form_theme form 'a' -%}", "'a'"),
+            ("{% form_theme form with 'a' ~%}", "'a'"),
+            ("{% extends x ? 'b' : 'a' -%}", "'a'"),
+            ("{% include ('a') %}", "'a'"),
+        ] {
+            assert_eq!(template(source, needle), Some("a".into()), "{source}");
+        }
+        for (source, needle) in [
+            ("{% include 'a' ~ b %}", "'a'"),
+            ("{{ block('a') }}", "'a'"),
+            ("{{ block('n', 'a') }}", "'n'"),
+            ("{% set x = c ? 'a' : 'b' %}", "'a'"),
+            ("{% include 'x' with {a: 'b'} %}", "'b'"),
+            ("{% form_theme form with {a: 'b'} %}", "'b'"),
+            ("{{ include(['a'] ~ b) }}", "'a'"),
+            ("{{ x.include(['a']) }}", "'a'"),
+            ("{% include('a') ~ b %}", "'a'"),
+            ("{% include ('a') ~ b %}", "'a'"),
+            ("{% include 'a' ~ %}", "'a'"),
+        ] {
+            assert_eq!(template(source, needle), None, "{source} {needle}");
+        }
+    }
+
+    #[test]
+    fn lists_only_templates_that_must_exist() {
+        let found: Vec<String> = names(
+            b"{% extends('a') %}{% include 'b' ~%}{{ block('n', 'c') }}{% form_theme form 'd' %}\
+              {{ include(['e', 'f']) }}{% extends x ? 'g' : 'h' %}{% form_theme form with ['i'] %}",
+        )
+        .into_iter()
+        .filter(|(kind, ..)| *kind == TwigName::Template)
+        .map(|(_, name, ..)| name)
+        .collect();
+        assert_eq!(found, ["a", "b", "c", "d"]);
     }
 
     #[test]

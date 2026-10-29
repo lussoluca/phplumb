@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use phplumb_index::Index;
 use phplumb_index::discover::DiscoverOptions;
 use phplumb_index::frameworks::drupal::Drupal;
-use phplumb_index::frameworks::symfony::Symfony;
+use phplumb_index::frameworks::symfony::{Symfony, TemplateStatus};
 use phplumb_index::frameworks::{Activation, FrameworkSettings, Project};
 use tempfile::TempDir;
 
@@ -1492,5 +1492,155 @@ fn bundles_built_on_kernel_abstract_bundles_keep_their_own_path() {
     assert_eq!(
         route_files_of(&auto(&root), "_preview_error"),
         ["_preview_error"]
+    );
+}
+
+/// TwigBridge's form themes, so the main namespace can be known in full.
+const TWIG_BRIDGE: (&str, &str) = (
+    "vendor/symfony/twig-bridge/Resources/views/Form/form_div_layout.html.twig",
+    "form\n",
+);
+
+fn template_status(root: &Path, name: &str) -> TemplateStatus {
+    auto(root)
+        .framework::<Symfony>()
+        .unwrap()
+        .template_status(name)
+}
+
+#[test]
+fn environment_twig_files_add_namespaced_paths() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/packages/dev/twig.yaml",
+            "twig:\n    paths:\n        '%kernel.project_dir%/dev/templates': Dev\n",
+        ),
+        ("dev/templates/tools.html.twig", "tools\n"),
+        ("templates/base.html.twig", "base\n"),
+        TWIG_BRIDGE,
+    ]);
+
+    assert!(matches!(
+        template_status(&root, "@Dev/tools.html.twig"),
+        TemplateStatus::Found(_)
+    ));
+    assert_eq!(
+        template_status(&root, "gone.html.twig"),
+        TemplateStatus::Missing
+    );
+}
+
+#[test]
+fn environment_twig_files_with_main_paths_keep_main_names_unknown() {
+    for twig in [
+        "twig:\n    paths:\n        '%kernel.project_dir%/dev/main': ~\n",
+        "twig:\n    default_path: '%kernel.project_dir%/dev/main'\n",
+    ] {
+        let (_dir, root) = broken_symfony(&[
+            ("config/packages/dev/twig.yaml", twig),
+            ("templates/base.html.twig", "base\n"),
+            TWIG_BRIDGE,
+        ]);
+        assert_eq!(
+            template_status(&root, "gone.html.twig"),
+            TemplateStatus::Unknown,
+            "{twig}"
+        );
+    }
+}
+
+#[test]
+fn environment_twig_php_keeps_names_unknown() {
+    let (_dir, root) = broken_symfony(&[
+        ("config/packages/dev/twig.php", "<?php\nreturn [];\n"),
+        ("templates/base.html.twig", "base\n"),
+        TWIG_BRIDGE,
+    ]);
+
+    assert_eq!(
+        template_status(&root, "gone.html.twig"),
+        TemplateStatus::Unknown
+    );
+}
+
+fn template_file(root: &Path, name: &str) -> Option<String> {
+    let found = auto(root)
+        .framework::<Symfony>()
+        .unwrap()
+        .template_file(name)?;
+    Some(found.strip_prefix(root).unwrap().display().to_string())
+}
+
+#[test]
+fn list_and_relative_twig_paths_are_read() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/packages/twig.yaml",
+            "twig:\n    paths: ['%kernel.project_dir%/listed', 'relative']\n",
+        ),
+        ("listed/a.html.twig", "a\n"),
+        ("relative/b.html.twig", "b\n"),
+    ]);
+
+    assert_eq!(
+        template_file(&root, "a.html.twig").as_deref(),
+        Some("listed/a.html.twig")
+    );
+    assert_eq!(
+        template_file(&root, "b.html.twig").as_deref(),
+        Some("relative/b.html.twig")
+    );
+}
+
+#[test]
+fn default_path_overrides_templates() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/packages/twig.yaml",
+            "twig:\n    default_path: '%kernel.project_dir%/views'\n",
+        ),
+        ("views/v.html.twig", "v\n"),
+        ("templates/t.html.twig", "t\n"),
+        TWIG_BRIDGE,
+    ]);
+
+    assert_eq!(
+        template_file(&root, "v.html.twig").as_deref(),
+        Some("views/v.html.twig")
+    );
+    assert_eq!(
+        template_status(&root, "t.html.twig"),
+        TemplateStatus::Missing
+    );
+}
+
+#[test]
+fn twig_files_of_a_nested_drupal_project_get_no_symfony_answers() {
+    let (_dir, root) = symfony_with_drupal();
+    for (file, content) in [
+        ("templates/base.html.twig", "base\n"),
+        (
+            "drupal/templates/page.html.twig",
+            "{% include 'base.html.twig' %}\n{% include 'gone.html.twig' %}\n",
+        ),
+    ] {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let mut index = auto(&root);
+    let path = root.join("drupal/templates/page.html.twig");
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source).find("'base").unwrap() as u32 + 1;
+
+    assert!(index.definition(&path, &source, offset).is_empty());
+    assert!(index.diagnostics(&path, &source).is_empty());
+    let own = root.join("templates/base.html.twig");
+    assert!(
+        index
+            .framework::<Symfony>()
+            .unwrap()
+            .template_file("base.html.twig")
+            == Some(own)
     );
 }

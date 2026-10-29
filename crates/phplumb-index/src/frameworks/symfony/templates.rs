@@ -68,8 +68,21 @@ impl Templates {
                     .filter(|(key, _)| key.text().is_some_and(|k| k.starts_with("when@")))
                     .filter_map(|(_, value)| value.get("twig"));
                 for twig in environments {
-                    templates.read_paths(dir, twig.get("paths"), false);
-                    templates.main_unknown |= twig.get("default_path").is_some();
+                    templates.read_environment(dir, twig);
+                }
+            }
+        }
+        // Environment directories, loaded after `config/packages`.
+        for file in environment_twig_files(&dir.join("config/packages")) {
+            let Some(parsed) = config_files.get(&file) else {
+                continue;
+            };
+            let Some(root) = &parsed.yaml else {
+                continue;
+            };
+            for block in super::config::top_blocks(root) {
+                if let Some(twig) = block.get("twig") {
+                    templates.read_environment(dir, twig);
                 }
             }
         }
@@ -83,6 +96,13 @@ impl Templates {
         let form_themes = form_themes.is_dir().then_some(form_themes);
         templates.paths.push((None, form_themes));
         templates
+    }
+
+    /// The Twig configuration of one environment: its namespaced paths, while its
+    /// main-namespace paths and `default_path` leave main-namespace names unknown.
+    fn read_environment(&mut self, dir: &Path, twig: &Yaml) {
+        self.read_paths(dir, twig.get("paths"), false);
+        self.main_unknown |= twig.get("default_path").is_some();
     }
 
     /// `paths` as a map from directory to namespace (empty or null for the main
@@ -126,17 +146,18 @@ impl Templates {
 
     /// Whether `name` resolves to a file, as Twig's loader looks for it.
     pub(crate) fn status(&self, name: &str) -> TemplateStatus {
+        let name = name.replace('\\', "/");
         let (namespace, rest) = match name.strip_prefix('@') {
             Some(named) => match named.split_once('/') {
                 Some((namespace, rest)) => (Some(namespace), rest),
                 None => return TemplateStatus::Unknown,
             },
-            None => (None, name),
+            None => (None, name.as_str()),
         };
-        let rest = rest.trim_start_matches('/');
-        if rest.is_empty() || rest.split('/').any(|part| part == "..") {
+        // Twig refuses a name that climbs above its directory.
+        let Some(rest) = normalize(rest) else {
             return TemplateStatus::Unknown;
-        }
+        };
         let mut configured = false;
         for (_, dir) in self
             .paths
@@ -148,9 +169,14 @@ impl Templates {
             let Some(dir) = dir else {
                 return TemplateStatus::Unknown;
             };
-            let path = dir.join(rest);
+            // The operating system resolves `.` and `..`, as for Twig's `is_file()`.
+            let path = dir.join(&rest);
             if path.is_file() {
-                return TemplateStatus::Found(path);
+                let relative = rest.split('/').any(|part| part == "." || part == "..");
+                return TemplateStatus::Found(match relative {
+                    true => path.canonicalize().unwrap_or(path),
+                    false => path,
+                });
             }
         }
         if configured && !self.unknown && !(namespace.is_none() && self.main_unknown) {
@@ -169,9 +195,25 @@ impl Templates {
     }
 }
 
-/// Whether `packages`, the `config/packages` directory, holds Twig configuration
-/// other than `twig.yaml` and `twig.yml`: `twig.php`, a `twig:` section in another
-/// file, or an environment directory with Twig configuration.
+/// The `twig.yaml` and `twig.yml` files of the environment directories of
+/// `packages`, in path order.
+fn environment_twig_files(packages: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(packages)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .flat_map(|dir| [dir.join("twig.yaml"), dir.join("twig.yml")])
+        .filter(|file| file.is_file())
+        .collect();
+    files.sort();
+    files
+}
+
+/// Whether `packages`, the `config/packages` directory or one of its environment
+/// directories, holds Twig configuration other than `twig.yaml` and `twig.yml`:
+/// `twig.php`, or a `twig:` section in another file.
 fn has_unread_twig_configuration(packages: &Path, config_files: &ConfigFiles) -> bool {
     let Ok(entries) = std::fs::read_dir(packages) else {
         return false;
@@ -182,16 +224,7 @@ fn has_unread_twig_configuration(packages: &Path, config_files: &ConfigFiles) ->
             .and_then(|n| n.to_str())
             .unwrap_or_default();
         if path.is_dir() {
-            return std::fs::read_dir(&path)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .any(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|n| n.starts_with("twig."))
-                });
+            return has_unread_twig_configuration(&path, config_files);
         }
         if name == "twig.yaml" || name == "twig.yml" {
             return false;
@@ -210,6 +243,25 @@ fn has_unread_twig_configuration(packages: &Path, config_files: &ConfigFiles) ->
             })
         })
     })
+}
+
+/// `name` with runs of `/` collapsed, as Twig's loader normalizes it; none when a
+/// `..` climbs above the start, which `FilesystemLoader::validateName` refuses.
+fn normalize(name: &str) -> Option<String> {
+    let mut level = 0;
+    let mut parts: Vec<&str> = Vec::new();
+    for part in name.split('/').filter(|part| !part.is_empty()) {
+        match part {
+            ".." => level -= 1,
+            "." => {}
+            _ => level += 1,
+        }
+        if level < 0 {
+            return None;
+        }
+        parts.push(part);
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// A configured path with the project directory filled in; relative paths are

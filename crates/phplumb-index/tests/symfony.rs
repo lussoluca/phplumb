@@ -1188,6 +1188,18 @@ fn broken_names_in_twig_are_flagged() {
             ),
             pair("Undefined route 'nope_route'", "nope_route"),
             pair("Undefined route 'nope_named'", "nope_named"),
+            pair(
+                "Undefined template 'gone_block.html.twig'",
+                "gone_block.html.twig"
+            ),
+            pair(
+                "Undefined template 'gone_theme.html.twig'",
+                "gone_theme.html.twig"
+            ),
+            pair(
+                "Undefined template 'gone_trim.html.twig'",
+                "gone_trim.html.twig"
+            ),
         ]
     );
     // A list names templates to try in turn.
@@ -1322,4 +1334,166 @@ fn localized_methods_get_no_class_alias() {
     let index = build();
     assert!(routes(&index, "App\\Controller\\LocalizedController::about").is_empty());
     assert!(!routes(&index, "App\\Controller\\LocalizedController::aliased").is_empty());
+}
+
+/// Writes `content` to `file` in the copy at `root` and updates the index.
+fn add_file(index: &mut Index, root: &Path, file: &str, content: &str) -> PathBuf {
+    let path = root.join(file);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, content).unwrap();
+    index.update(std::slice::from_ref(&path), &[]);
+    path
+}
+
+/// The files the definitions of the literal in `needle`, at its first quote, in
+/// `path` lead to, by name.
+fn opened(index: &mut Index, path: &Path, needle: &str) -> Vec<String> {
+    let source = std::fs::read(path).unwrap();
+    let quote = needle.find(['\'', '"']).unwrap_or(0);
+    let offset = (String::from_utf8_lossy(&source).find(needle).unwrap() + quote) as u32 + 1;
+    index
+        .definition(path, &source, offset)
+        .iter()
+        .map(|location| {
+            let parent = location.path.parent().unwrap().file_name().unwrap();
+            let name = location.path.file_name().unwrap();
+            format!("{}/{}", parent.to_string_lossy(), name.to_string_lossy())
+        })
+        .collect()
+}
+
+fn messages(index: &Index, path: &Path) -> Vec<String> {
+    let source = std::fs::read(path).unwrap();
+    index
+        .diagnostics(path, &source)
+        .into_iter()
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn normalized_template_names_open_their_file() {
+    let (_dir, root, mut index) = copied();
+    add_file(&mut index, &root, "templates/sub/keep.html.twig", "keep\n");
+    let path = add_file(
+        &mut index,
+        &root,
+        "templates/normalized.html.twig",
+        "{% include 'sub/../page.html.twig' %}\n{% include './/page.html.twig' %}\n{% include '../page.html.twig' %}\n{% include 'nope/../page.html.twig' %}\n",
+    );
+
+    assert_eq!(
+        opened(&mut index, &path, "'sub/../"),
+        ["templates/page.html.twig"]
+    );
+    assert_eq!(
+        opened(&mut index, &path, "'.//"),
+        ["templates/page.html.twig"]
+    );
+    assert!(opened(&mut index, &path, "'../").is_empty());
+    // The operating system resolves `..` after a directory that must exist.
+    assert!(opened(&mut index, &path, "'nope/").is_empty());
+    assert_eq!(
+        messages(&index, &path),
+        ["Undefined template 'nope/../page.html.twig'"]
+    );
+}
+
+#[test]
+fn templated_emails_open_their_templates() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Mail.php",
+        "<?php\nnamespace App;\nuse Symfony\\Bridge\\Twig\\Mime\\TemplatedEmail;\nfunction mail(): void\n{\n    $email = new TemplatedEmail();\n    $email->htmlTemplate('page.html.twig');\n    $email->textTemplate('gone_text.html.twig');\n}\n",
+    );
+
+    assert_eq!(
+        opened(&mut index, &path, "'page"),
+        ["templates/page.html.twig"]
+    );
+    assert_eq!(
+        messages(&index, &path),
+        ["Undefined template 'gone_text.html.twig'"]
+    );
+}
+
+#[test]
+fn named_view_arguments_open_their_template() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Controller/NamedView.php",
+        "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass NamedView extends AbstractController\n{\n    public function show(): void\n    {\n        $this->render(view: 'page.html.twig');\n        $this->render(view: 'gone_named.html.twig');\n    }\n}\n",
+    );
+
+    assert_eq!(
+        opened(&mut index, &path, "'page"),
+        ["templates/page.html.twig"]
+    );
+    assert_eq!(
+        messages(&index, &path),
+        ["Undefined template 'gone_named.html.twig'"]
+    );
+}
+
+#[test]
+fn class_template_attributes_open_their_template() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Controller/ClassTemplate.php",
+        "<?php\nnamespace App\\Controller;\nuse Symfony\\Bridge\\Twig\\Attribute\\Template;\n#[Template('page.html.twig')]\nclass ClassTemplate\n{\n    public function __invoke(): array { return []; }\n}\n#[Template('gone_class.html.twig')]\nclass GoneTemplate\n{\n    public function __invoke(): array { return []; }\n}\n",
+    );
+
+    assert_eq!(
+        opened(&mut index, &path, "'page"),
+        ["templates/page.html.twig"]
+    );
+    assert_eq!(
+        messages(&index, &path),
+        ["Undefined template 'gone_class.html.twig'"]
+    );
+}
+
+#[test]
+fn render_block_and_stream_open_their_template() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Controller/Blocks.php",
+        "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Blocks extends AbstractController\n{\n    public function show(): void\n    {\n        $this->renderBlock('page.html.twig', 'a');\n        $this->renderBlockView('page.html.twig', 'b');\n        $this->stream('page.html.twig');\n    }\n}\n",
+    );
+
+    for needle in ["renderBlock('page", "renderBlockView('page", "stream('page"] {
+        assert_eq!(
+            opened(&mut index, &path, needle),
+            ["templates/page.html.twig"],
+            "{needle}"
+        );
+    }
+}
+
+#[test]
+fn environment_display_and_load_open_their_template() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Display.php",
+        "<?php\nnamespace App;\nuse Twig\\Environment;\nfunction display(Environment $twig): void\n{\n    $twig->display('page.html.twig');\n    $twig->load('base.html.twig');\n}\n",
+    );
+
+    assert_eq!(
+        opened(&mut index, &path, "display('page"),
+        ["templates/page.html.twig"]
+    );
+    assert_eq!(
+        opened(&mut index, &path, "load('base"),
+        ["extra/base.html.twig"]
+    );
 }

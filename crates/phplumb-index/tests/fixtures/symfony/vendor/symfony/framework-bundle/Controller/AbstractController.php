@@ -19,6 +19,21 @@ abstract class AbstractController
         return '';
     }
 
+    protected function renderBlock(string $view, string $block, array $parameters = []): object
+    {
+        return new \stdClass();
+    }
+
+    protected function renderBlockView(string $view, string $block, array $parameters = []): string
+    {
+        return '';
+    }
+
+    protected function stream(string $view, array $parameters = []): object
+    {
+        return new \stdClass();
+    }
+
     protected function getParameter(string $name): mixed
     {
         return null;
