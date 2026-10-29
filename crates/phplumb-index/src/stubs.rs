@@ -71,8 +71,9 @@ pub fn summarize_stub(source: &[u8]) -> FileSummary {
         };
         available(metadata)
     });
+    let imports = imports(source);
     for declaration in &mut summary.declarations {
-        apply_versions(declaration);
+        apply_versions(declaration, &imports);
     }
     keep_last(&mut summary.declarations, |declaration| {
         (declaration.kind == SymbolKind::Function).then(|| declaration.fqn.to_ascii_lowercase())
@@ -80,7 +81,7 @@ pub fn summarize_stub(source: &[u8]) -> FileSummary {
     summary
 }
 
-fn apply_versions(declaration: &mut Declaration) {
+fn apply_versions(declaration: &mut Declaration, imports: &str) {
     let names = StubNames {
         namespace: namespace_of(&declaration.fqn),
     };
@@ -91,6 +92,7 @@ fn apply_versions(declaration: &mut Declaration) {
         declaration.signature = plain_signature(
             &declaration.signature,
             language_level_text(&declaration.metadata).as_deref(),
+            imports,
         );
     }
     let Some(shape) = &mut declaration.class else {
@@ -105,6 +107,7 @@ fn apply_versions(declaration: &mut Declaration) {
             member.signature = plain_signature(
                 &member.signature,
                 language_level_text(&member.metadata).as_deref(),
+                imports,
             );
         }
     }
@@ -155,28 +158,28 @@ fn language_level_text(metadata: &[Metadata]) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-/// A function or method signature as PHP `PHP_VERSION` declares it: parameter
-/// attributes are dropped, `LanguageLevelTypeAware` leaves its type before an
-/// untyped parameter, and `returns` is added when the signature declares no
-/// return type.
-fn plain_signature(signature: &str, returns: Option<&str>) -> String {
-    let mut out = String::new();
-    let mut rest = signature;
-    while let Some(start) = rest.find("#[") {
-        out.push_str(&rest[..start]);
-        let Some(len) = attribute_group_len(&rest[start..]) else {
-            break;
-        };
-        let group = &rest[start..start + len];
-        rest = rest[start + len..].trim_start();
-        if rest.starts_with(['$', '&', '.'])
-            && let Some(ty) = attribute_type(group)
-        {
-            out.push_str(&ty);
-            out.push(' ');
-        }
+/// A function or method signature as PHP `PHP_VERSION` declares it: parameters it
+/// lacks are dropped, parameter attributes are dropped, `LanguageLevelTypeAware`
+/// leaves its type before an untyped parameter, and `returns` is added when the
+/// signature declares no return type. `imports` are the stub file's `use` lines,
+/// which name the attributes.
+fn plain_signature(signature: &str, returns: Option<&str>, imports: &str) -> String {
+    let mut out = signature.to_string();
+    if signature.contains("#[")
+        && let Some(open) = signature.find('(')
+        && let Some(close) = closing(signature, open)
+    {
+        let parameters: Vec<String> = split_top_level(&signature[open + 1..close])
+            .into_iter()
+            .filter_map(|parameter| plain_parameter(parameter, imports))
+            .collect();
+        out = format!(
+            "{}({}){}",
+            &signature[..open],
+            parameters.join(", "),
+            &signature[close + 1..]
+        );
     }
-    out.push_str(rest);
     match returns {
         Some(returns) if out.trim_end().ends_with(')') => {
             format!("{}: {returns}", out.trim_end())
@@ -185,13 +188,124 @@ fn plain_signature(signature: &str, returns: Option<&str>) -> String {
     }
 }
 
+/// A parameter without its attributes, typed as `LanguageLevelTypeAware` says;
+/// none when PHP `PHP_VERSION` lacks it.
+fn plain_parameter(parameter: &str, imports: &str) -> Option<String> {
+    let mut rest = parameter.trim();
+    let mut groups = String::new();
+    while rest.starts_with("#[") {
+        let Some(len) = attribute_group_len(rest) else {
+            break;
+        };
+        groups.push_str(&rest[..len]);
+        groups.push('\n');
+        rest = rest[len..].trim_start();
+    }
+    if groups.is_empty() {
+        return Some(rest.to_string());
+    }
+    let metadata = attribute_metadata(&groups, imports);
+    if !available(&metadata) {
+        return None;
+    }
+    match language_level_text(&metadata) {
+        Some(ty) if rest.starts_with(['$', '&', '.']) => Some(format!("{ty} {rest}")),
+        _ => Some(rest.to_string()),
+    }
+}
+
+/// The metadata of attribute `groups`, read by summarizing them on a function of
+/// their own after the stub file's `imports`.
+fn attribute_metadata(groups: &str, imports: &str) -> Vec<Metadata> {
+    let source = format!("<?php\n{imports}{groups}function phplumb_attribute() {{}}\n");
+    summarize(source.as_bytes())
+        .declarations
+        .into_iter()
+        .find(|d| d.fqn == "phplumb_attribute")
+        .map(|d| d.metadata)
+        .unwrap_or_default()
+}
+
+/// The top-level `use` lines of a stub file, which import the attribute classes.
+fn imports(source: &[u8]) -> String {
+    String::from_utf8_lossy(source)
+        .lines()
+        .filter(|line| line.starts_with("use ") && line.trim_end().ends_with(';'))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// The offset of the `)` closing the `(` at `open`, outside strings.
+fn closing(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut found = None;
+    scan(&text[open..], |i, byte| {
+        match byte {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    found = Some(open + i);
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        true
+    });
+    found
+}
+
+/// `text` cut at its top-level commas, outside strings, brackets and parentheses.
+fn split_top_level(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    scan(text, |i, byte| {
+        match byte {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        true
+    });
+    parts.push(&text[start..]);
+    parts.retain(|part| !part.trim().is_empty());
+    parts
+}
+
 /// The length of the attribute group `#[...]` that `text` starts with, quotes and
 /// nested brackets included; none when it is not closed.
 fn attribute_group_len(text: &str) -> Option<usize> {
     let mut depth = 0usize;
+    let mut found = None;
+    scan(&text[1..], |i, byte| {
+        match byte {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    found = Some(i + 2);
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        true
+    });
+    found
+}
+
+/// Calls `each` with the offset and byte of every byte of `text` outside quoted
+/// strings, until it returns false.
+fn scan(text: &str, mut each: impl FnMut(usize, u8) -> bool) {
     let mut quote: Option<u8> = None;
     let mut escaped = false;
-    for (i, byte) in text.bytes().enumerate().skip(1) {
+    for (i, byte) in text.bytes().enumerate() {
         if let Some(open) = quote {
             if escaped {
                 escaped = false;
@@ -202,34 +316,14 @@ fn attribute_group_len(text: &str) -> Option<usize> {
             }
             continue;
         }
-        match byte {
-            b'\'' | b'"' => quote = Some(byte),
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-            _ => {}
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+            continue;
+        }
+        if !each(i, byte) {
+            return;
         }
     }
-    None
-}
-
-/// The type a `LanguageLevelTypeAware` attribute group gives in `PHP_VERSION`, read
-/// by summarizing the group on a function of its own.
-fn attribute_type(group: &str) -> Option<String> {
-    if !group.contains("LanguageLevelTypeAware") {
-        return None;
-    }
-    let source = format!("<?php\nuse {TYPE_AWARE};\n{group}\nfunction phplumb_attribute() {{}}\n");
-    let summary = summarize(source.as_bytes());
-    let function = summary
-        .declarations
-        .iter()
-        .find(|d| d.fqn == "phplumb_attribute")?;
-    language_level_text(&function.metadata)
 }
 
 /// The `@return` type of `doc`.

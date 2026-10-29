@@ -510,3 +510,47 @@ fn stub_functions_show_language_level_types() {
         .expect("function g");
     assert_eq!(g.signature, "function g(array $list): string");
 }
+
+fn stub_function(source: &str, name: &str) -> String {
+    summarize_stub(source.as_bytes())
+        .declarations
+        .into_iter()
+        .find(|d| d.fqn == name)
+        .unwrap_or_else(|| panic!("no function {name}"))
+        .signature
+}
+
+#[test]
+fn stub_signatures_drop_parameters_php_85_lacks() {
+    let source = stub(
+        "function parse_str(string $string, #[PhpStormStubsElementAvailable(from: '5.3', to: '7.4')] &$result = [], #[PhpStormStubsElementAvailable(from: '8.0')] &$result): void {}\n",
+    );
+    assert_eq!(
+        stub_function(&source, "parse_str"),
+        "function parse_str(string $string, &$result): void"
+    );
+    let last = stub(
+        "function close(#[PhpStormStubsElementAvailable(to: '7.4')] $handle = null): void {}\n",
+    );
+    assert_eq!(stub_function(&last, "close"), "function close(): void");
+}
+
+#[test]
+fn stub_signatures_read_aliased_attributes() {
+    let source = "<?php\n\
+use JetBrains\\PhpStorm\\Internal\\LanguageLevelTypeAware as LanguageAware;\n\
+use JetBrains\\PhpStorm\\Internal\\PhpStormStubsElementAvailable as ElementAvailable;\n\
+function h(#[LanguageAware(['8.0' => 'string'], default: '')] $locale, #[ElementAvailable(to: '7.4')] $old) {}\n";
+    assert_eq!(stub_function(source, "h"), "function h(string $locale)");
+}
+
+#[test]
+fn stub_signatures_read_every_attribute_of_a_parameter() {
+    let source = stub(
+        "function q(#[LanguageLevelTypeAware(['8.0' => 'string'], default: '')] #[\\SensitiveParameter] $expression, $x = '#[y]') {}\n",
+    );
+    assert_eq!(
+        stub_function(&source, "q"),
+        "function q(string $expression, $x = '#[y]')"
+    );
+}
