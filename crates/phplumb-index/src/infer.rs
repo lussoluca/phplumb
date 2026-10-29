@@ -1069,6 +1069,15 @@ struct CallbackFact<'ast, 'arena> {
     position: usize,
 }
 
+/// A closure or arrow function given positionally to a method call.
+struct MethodCallbackFact<'ast, 'arena> {
+    /// Where the closure starts, as its scope does.
+    start: u32,
+    object: &'arena Expression<'arena>,
+    method: &'ast ClassLikeMemberSelector<'arena>,
+    position: usize,
+}
+
 #[derive(Default)]
 struct Facts<'ast, 'arena> {
     accesses: Vec<AccessFact<'arena>>,
@@ -1080,6 +1089,7 @@ struct Facts<'ast, 'arena> {
     narrowings: Vec<NarrowFact>,
     branches: Vec<BranchFact>,
     callbacks: Vec<CallbackFact<'ast, 'arena>>,
+    method_callbacks: Vec<MethodCallbackFact<'ast, 'arena>>,
     /// Static calls and constants reached through a variable, such as
     /// `$severity::from()`, with the variable as the object; navigation reads them.
     variable_statics: Vec<AccessFact<'arena>>,
@@ -1101,6 +1111,31 @@ impl<'ast, 'arena> Facts<'ast, 'arena> {
                 kind,
                 name: String::from_utf8_lossy(name.value).into_owned(),
                 object,
+            });
+        }
+    }
+
+    /// Records each closure or arrow function given positionally to a method call.
+    fn method_callbacks(
+        &mut self,
+        object: &'arena Expression<'arena>,
+        method: &'ast ClassLikeMemberSelector<'arena>,
+        arguments: &'ast ArgumentList<'arena>,
+    ) {
+        for (position, argument) in arguments.arguments.iter().enumerate() {
+            let Argument::Positional(argument) = argument else {
+                continue;
+            };
+            let start = match argument.value {
+                Expression::Closure(closure) => closure.span().start.offset,
+                Expression::ArrowFunction(arrow) => arrow.span().start.offset,
+                _ => continue,
+            };
+            self.method_callbacks.push(MethodCallbackFact {
+                start,
+                object,
+                method,
+                position,
             });
         }
     }
@@ -1168,6 +1203,7 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
 
     fn walk_in_method_call(&self, call: &'ast MethodCall<'arena>, f: &mut Facts<'ast, 'arena>) {
         f.access(call.object, &call.method, MemberKind::Method);
+        f.method_callbacks(call.object, &call.method, &call.argument_list);
     }
 
     fn walk_in_null_safe_method_call(
@@ -1176,6 +1212,7 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Facts<'ast, 'arena>> for Collect {
         f: &mut Facts<'ast, 'arena>,
     ) {
         f.access(call.object, &call.method, MemberKind::Method);
+        f.method_callbacks(call.object, &call.method, &call.argument_list);
     }
 
     fn walk_in_property_access(
@@ -2527,11 +2564,52 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         self.index.ancestor_param(fqn, &method.name, i)
     }
 
+    /// The type a method's callable parameter gives parameter `i` of a closure
+    /// written at that argument, such as `T` of `Closure(T): bool` with the
+    /// receiver's argument for `T`.
+    fn method_callback_param(&self, scope: &ScopeFact<'_, '_>, i: usize, depth: u32) -> TypeExpr {
+        let Some(callback) = self
+            .facts
+            .method_callbacks
+            .iter()
+            .find(|c| c.start == scope.start)
+        else {
+            return TypeExpr::Other;
+        };
+        let ClassLikeMemberSelector::Identifier(name) = callback.method else {
+            return TypeExpr::Other;
+        };
+        let name = String::from_utf8_lossy(name.value);
+        let receiver = self.expr(callback.object, callback.start, depth + 1);
+        let mut types = Vec::new();
+        for (class, args) in classes_with_args(&receiver) {
+            for (found, member) in self.index.find_member(&class, MemberKind::Method, &name) {
+                let Some((_, Some(ty))) = member.params.get(callback.position) else {
+                    continue;
+                };
+                let Some(param) = callable_params(ty).and_then(|params| params.get(i)) else {
+                    continue;
+                };
+                let declaration = found.declaration;
+                let param = match &declaration.class {
+                    Some(shape) if !shape.templates.is_empty() => {
+                        let given = supertype_args(self.index, &class, &args, &declaration.fqn)
+                            .unwrap_or_default();
+                        substitute(param, &shape.templates, &given)
+                    }
+                    _ => param.clone(),
+                };
+                types.push(param);
+            }
+        }
+        union(types)
+    }
+
     /// The element type that PHP passes to parameter `i` of a callback written at
     /// a positional argument of a built-in array function.
     fn callback_param(&self, scope: &ScopeFact<'_, '_>, i: usize, depth: u32) -> TypeExpr {
         let Some(callback) = self.facts.callbacks.iter().find(|c| c.start == scope.start) else {
-            return TypeExpr::Other;
+            return self.method_callback_param(scope, i, depth);
         };
         let Some(function) = self.builtin_function(callback.call.function) else {
             return TypeExpr::Other;
@@ -2727,10 +2805,19 @@ fn is_plain_value(expression: &Expression<'_>) -> bool {
     }
 }
 
+/// The parameter types of the callable in `ty`, alone or in a union.
+fn callable_params(ty: &TypeExpr) -> Option<&Vec<TypeExpr>> {
+    match ty {
+        TypeExpr::Callable(params) => Some(params),
+        TypeExpr::Union(members) => members.iter().find_map(callable_params),
+        _ => None,
+    }
+}
+
 /// Whether `ty` says nothing about classes: unknown, or an array of nothing known.
 pub(crate) fn names_no_class(ty: &TypeExpr) -> bool {
     match ty {
-        TypeExpr::Other | TypeExpr::Scalar(_) => true,
+        TypeExpr::Other | TypeExpr::Scalar(_) | TypeExpr::Callable(_) => true,
         TypeExpr::ArrayOf(element) => names_no_class(element),
         TypeExpr::Union(members) => members.iter().all(names_no_class),
         _ => false,

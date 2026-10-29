@@ -791,9 +791,16 @@ fn to_fqn(name: &[u8]) -> String {
 /// PHPDoc wins when it names a class; otherwise the declared type, when it names
 /// anything navigable.
 pub(crate) fn pick_type(doc: Option<TypeExpr>, declared: Option<TypeExpr>) -> Option<TypeExpr> {
+    let declared = declared.filter(|ty| *ty != TypeExpr::Other);
     match doc {
         Some(doc) if names_a_class(&doc) => Some(doc),
-        _ => declared.filter(|ty| *ty != TypeExpr::Other),
+        // A documented callable keeps its parameter types beside the declared class,
+        // such as `Closure`.
+        Some(TypeExpr::Callable(params)) => Some(match declared {
+            Some(declared) => TypeExpr::Union(vec![declared, TypeExpr::Callable(params)]),
+            None => TypeExpr::Callable(params),
+        }),
+        _ => declared,
     }
 }
 
@@ -807,7 +814,7 @@ fn names_a_class(ty: &TypeExpr) -> bool {
         | TypeExpr::ParentType => true,
         TypeExpr::ArrayOf(element) | TypeExpr::ClassString(element) => names_a_class(element),
         TypeExpr::Union(members) => members.iter().any(names_a_class),
-        TypeExpr::Scalar(_) | TypeExpr::Other => false,
+        TypeExpr::Scalar(_) | TypeExpr::Callable(_) | TypeExpr::Other => false,
     }
 }
 

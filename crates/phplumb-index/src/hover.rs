@@ -128,6 +128,10 @@ fn display(ty: &TypeExpr) -> String {
         ),
         TypeExpr::ClassString(class) => format!("class-string<{}>", display(class)),
         TypeExpr::Scalar(name) => name.clone(),
+        TypeExpr::Callable(params) => format!(
+            "callable({})",
+            params.iter().map(display).collect::<Vec<_>>().join(", ")
+        ),
         TypeExpr::Union(members) => members.iter().map(display).collect::<Vec<_>>().join("|"),
         TypeExpr::Other => "mixed".to_string(),
     }

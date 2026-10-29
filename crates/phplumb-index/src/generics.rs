@@ -56,6 +56,12 @@ pub(crate) fn substitute(ty: &TypeExpr, templates: &[String], args: &[TypeExpr])
             None => ty.clone(),
         },
         TypeExpr::ArrayOf(element) => array_of(substitute(element, templates, args)),
+        TypeExpr::Callable(params) => TypeExpr::Callable(
+            params
+                .iter()
+                .map(|param| substitute(param, templates, args))
+                .collect(),
+        ),
         TypeExpr::ClassString(class) => {
             TypeExpr::ClassString(Box::new(substitute(class, templates, args)))
         }

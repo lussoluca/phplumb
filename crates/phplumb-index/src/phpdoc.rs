@@ -21,6 +21,8 @@ pub enum TypeExpr {
         class: String,
         args: Vec<TypeExpr>,
     },
+    /// `callable(A, B): R` or `Closure(A, B): R`: the parameter types.
+    Callable(Vec<TypeExpr>),
     /// A scalar or pseudo-type written as a generic argument, such as the `int` of
     /// `Collection<int, Item>`, kept for display; read like `Other` elsewhere.
     Scalar(String),
@@ -286,11 +288,18 @@ impl TypeParser<'_> {
                 return Parsed::Type(TypeExpr::Other);
             }
             Some(b'(') => {
-                self.skip_balanced(b'(', b')');
+                let lower = word.trim_start_matches('\\').to_ascii_lowercase();
+                let params = if lower == "callable" || lower == "closure" {
+                    self.pos += 1;
+                    Some(self.callable_params())
+                } else {
+                    self.skip_balanced(b'(', b')');
+                    None
+                };
                 if self.eat(b':') {
                     self.postfix();
                 }
-                return Parsed::Type(TypeExpr::Other);
+                return Parsed::Type(params.map_or(TypeExpr::Other, TypeExpr::Callable));
             }
             _ => None,
         };
@@ -335,6 +344,33 @@ impl TypeParser<'_> {
                 }
             }
         })
+    }
+
+    /// The parameter types of `callable(A, B $name, ...)`, after its `(`, up to and
+    /// including its `)`.
+    fn callable_params(&mut self) -> Vec<TypeExpr> {
+        let mut params = Vec::new();
+        loop {
+            self.skip_spaces();
+            if self.peek().is_none() || self.eat(b')') {
+                return params;
+            }
+            params.push(finish(self.union()));
+            // A name, a variadic or by-reference marker, or a default marker.
+            self.skip_spaces();
+            while matches!(self.peek(), Some(b'$' | b'.' | b'&' | b'=')) {
+                if self.peek() == Some(b'$') {
+                    self.word();
+                } else {
+                    self.pos += 1;
+                }
+                self.skip_spaces();
+            }
+            if !self.eat(b',') {
+                self.eat(b')');
+                return params;
+            }
+        }
     }
 
     /// Consumes `word` when it comes next as a whole word.
@@ -443,7 +479,10 @@ fn split_type(text: &str) -> (&str, &str) {
         match c {
             '<' | '{' | '(' | '[' => depth += 1,
             '>' | '}' | ')' | ']' => depth -= 1,
-            c if c.is_whitespace() && depth <= 0 => return (&text[..i], text[i..].trim_start()),
+            // The return type of `callable(T): R` follows its colon.
+            c if c.is_whitespace() && depth <= 0 && !text[..i].ends_with(':') => {
+                return (&text[..i], text[i..].trim_start());
+            }
             _ => {}
         }
     }
@@ -894,7 +933,6 @@ mod tests {
             "int",
             "array",
             "array{a: int}",
-            "callable(int): void",
             "mixed",
             "string|int",
             "class-string",
@@ -913,6 +951,28 @@ mod tests {
         ] {
             assert_eq!(ty(text), ty("Foo|Bar"), "{text}");
         }
+    }
+
+    #[test]
+    fn callables_keep_their_parameter_types() {
+        assert_eq!(
+            ty("Closure(T, int): bool"),
+            TypeExpr::Callable(vec![named("App\\T"), TypeExpr::Other])
+        );
+        assert_eq!(
+            ty("callable(Foo $item): void"),
+            TypeExpr::Callable(vec![named("App\\Foo")])
+        );
+        assert_eq!(ty("\\Closure"), named("Closure"));
+    }
+
+    #[test]
+    fn callable_params_keep_their_names() {
+        let doc = parse_docblock("/**\n * @param Closure(T): bool $p\n */", &Names);
+        assert_eq!(
+            doc.params,
+            [("p".to_string(), TypeExpr::Callable(vec![named("App\\T")]))]
+        );
     }
 
     #[test]
