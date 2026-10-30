@@ -147,11 +147,22 @@ pub(crate) enum Named {
 /// element it belongs to and the class the enclosing element maps.
 pub(crate) fn named_at(text: &str, offset: u32) -> Option<Named> {
     let mut mapped: Option<String> = None;
+    // The target entity of the association the elements read are inside.
+    let mut association: Option<String> = None;
     for element in elements(text) {
-        if MAPPED_CLASSES.contains(&element.name.as_str()) {
+        let name = element.name.as_str();
+        if MAPPED_CLASSES.contains(&name) {
             mapped = element
                 .attribute("name")
                 .map(|n| n.trim_start_matches('\\').to_string());
+        }
+        if ASSOCIATIONS.contains(&name) {
+            association = element
+                .attribute("target-entity")
+                .zip(mapped.as_deref())
+                .map(|(target, mapped)| qualify(mapped, target));
+        } else if !matches!(name, "order-by" | "order-by-field") {
+            association = None;
         }
         let Some((key, value, ..)) = element
             .attributes
@@ -160,14 +171,27 @@ pub(crate) fn named_at(text: &str, offset: u32) -> Option<Named> {
         else {
             continue;
         };
-        let name = element.name.as_str();
         let class = |written: &str| mapped.as_deref().map(|m| qualify(m, written));
         return match key.as_str() {
             "name" if MAPPED_CLASSES.contains(&name) => {
                 Some(Named::Class(value.trim_start_matches('\\').to_string()))
             }
             "target-entity" | "repository-class" => class(value).map(Named::Class),
-            "class" if name == "embedded" => class(value).map(Named::Class),
+            "class"
+                if matches!(
+                    name,
+                    "embedded" | "discriminator-mapping" | "entity-listener"
+                ) =>
+            {
+                class(value).map(Named::Class)
+            }
+            // Doctrine reads a custom generator's class as written.
+            "class" if name == "custom-id-generator" => {
+                Some(Named::Class(value.trim_start_matches('\\').to_string()))
+            }
+            "name" if name == "order-by-field" => {
+                Some(Named::Property(association.clone()?, value.clone()))
+            }
             // Doctrine reads `enum-type` as written, without the mapped namespace.
             "enum-type" if matches!(name, "field" | "id") => {
                 Some(Named::Class(value.trim_start_matches('\\').to_string()))
@@ -321,7 +345,7 @@ pub(crate) fn mapping_files(index: &Index, dir: &Path, filter: &PathFilter) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::{elements, qualify};
+    use super::{Named, elements, named_at, qualify};
 
     #[test]
     fn reads_elements_and_their_attributes() {
@@ -356,6 +380,35 @@ mod tests {
             finishes("<entity name=\"A\"><![CDATA[x > <field name=\"bogus\"/> <c / d>]]></entity>"),
             ["entity"]
         );
+    }
+
+    #[test]
+    fn reads_more_mapping_attributes() {
+        let text = r#"<doctrine-mapping>
+  <entity name="App\Entity\Post">
+    <discriminator-map><discriminator-mapping value="a" class="Article"/></discriminator-map>
+    <entity-listeners><entity-listener class="PostListener"/></entity-listeners>
+    <id name="id"><generator strategy="CUSTOM"/><custom-id-generator class="App\Id\IdGen"/></id>
+    <one-to-many field="comments" target-entity="Comment" mapped-by="post">
+      <order-by><order-by-field name="createdAt" direction="DESC"/></order-by>
+    </one-to-many>
+    <field name="title"/>
+    <order-by-field name="stray"/>
+  </entity>
+</doctrine-mapping>"#;
+        let at = |needle: &str| named_at(text, text.find(needle).unwrap() as u32 + 1);
+        let class = |name: &str| Some(Named::Class(name.to_string()));
+        assert_eq!(at("Article"), class("App\\Entity\\Article"));
+        assert_eq!(at("PostListener"), class("App\\Entity\\PostListener"));
+        assert_eq!(at("App\\Id"), class("App\\Id\\IdGen"));
+        assert_eq!(
+            at("createdAt"),
+            Some(Named::Property(
+                "App\\Entity\\Comment".to_string(),
+                "createdAt".to_string()
+            ))
+        );
+        assert_eq!(at("stray"), None);
     }
 
     #[test]
