@@ -423,6 +423,92 @@ fn certain_symfony_projects_flag_missing_names() {
     );
 }
 
+const UNDEFINED_ROUTE: &str = "Undefined route 'missing_route'";
+const UNDEFINED_PARAMETER: &str = "Undefined parameter 'app.nowhere'";
+
+/// A Symfony project whose kernel declares `methods`, with a template directory, so
+/// route, parameter and template names can all be checked.
+fn kernel_symfony(class: &str, methods: &str) -> (TempDir, PathBuf) {
+    let kernel = format!(
+        "<?php\nnamespace App;\nuse Symfony\\Component\\HttpKernel\\Kernel as BaseKernel;\nclass {class}\n{{\n{methods}}}\n"
+    );
+    broken_symfony(&[
+        (
+            "lib/HttpKernel.php",
+            "<?php\nnamespace Symfony\\Component\\HttpKernel;\nabstract class Kernel\n{\n}\n",
+        ),
+        ("src/Kernel.php", &kernel),
+        ("templates/home.html.twig", "home\n"),
+        TWIG_BRIDGE,
+    ])
+}
+
+#[test]
+fn kernel_overrides_keep_names_unknown() {
+    let method =
+        |name: &str| format!("    public function {name}()\n    {{\n        return [];\n    }}\n");
+    let cases = [
+        ("Kernel extends BaseKernel", String::new(), true, true, true),
+        (
+            "Kernel extends BaseKernel",
+            method("getConfigDir"),
+            false,
+            false,
+            false,
+        ),
+        (
+            "Kernel extends BaseKernel",
+            method("loadRoutes"),
+            false,
+            true,
+            true,
+        ),
+        (
+            "Kernel extends BaseKernel",
+            method("getKernelParameters"),
+            true,
+            false,
+            true,
+        ),
+        ("Paths", method("getConfigDir"), true, true, true),
+    ];
+    for (class, methods, route, parameter, template) in cases {
+        let (_dir, root) = kernel_symfony(class, &methods);
+        let mut expected = Vec::new();
+        if route {
+            expected.push(UNDEFINED_ROUTE);
+        }
+        if parameter {
+            expected.push(UNDEFINED_PARAMETER);
+        }
+        assert_eq!(broken_messages(&root), expected, "{class} {methods}");
+        let status = template_status(&root, "missing.html.twig");
+        let wanted = if template {
+            TemplateStatus::Missing
+        } else {
+            TemplateStatus::Unknown
+        };
+        assert_eq!(status, wanted, "{class} {methods}");
+    }
+}
+
+#[test]
+fn router_resource_keeps_routes_unknown() {
+    let other =
+        "framework:\n    router:\n        resource: '%kernel.project_dir%/config/routing.php'\n";
+    let in_environment = "when@dev:\n    framework:\n        router:\n            resource: '%kernel.project_dir%/config/routing.php'\n";
+    for config in [other, in_environment] {
+        let (_dir, root) = broken_symfony(&[("config/packages/routing.yaml", config)]);
+        assert_eq!(broken_messages(&root), [UNDEFINED_PARAMETER], "{config}");
+    }
+    let default = "framework:\n    router:\n        resource: 'kernel::loadRoutes'\n";
+    let (_dir, root) = broken_symfony(&[("config/packages/routing.yaml", default)]);
+    assert_eq!(
+        broken_messages(&root),
+        [UNDEFINED_ROUTE, UNDEFINED_PARAMETER]
+    );
+}
+
 #[test]
 fn unknown_route_imports_silence_route_diagnostics() {
     let (_dir, root) = broken_symfony(&[(

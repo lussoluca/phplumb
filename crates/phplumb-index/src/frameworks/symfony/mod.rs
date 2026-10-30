@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use crate::diagnostics::Diagnostic;
-use crate::filter::{is_doctrine_xml, is_yaml};
+use crate::filter::{PathFilter, is_doctrine_xml, is_yaml};
 use crate::frameworks::ancestry::is_a;
 use crate::frameworks::yaml::{self, Yaml};
 use crate::frameworks::{
@@ -29,7 +29,7 @@ use crate::frameworks::{
 use crate::index::{Index, Location};
 use crate::metadata::MetaValue;
 use crate::phpdoc::TypeExpr;
-use crate::summary::{FileSummary, NameRef, RefKey, summarize};
+use crate::summary::{FileSummary, NameRef, RefKey, SymbolKind, summarize};
 
 use doctrine::Mappings;
 use files::ConfigFiles;
@@ -293,6 +293,47 @@ fn constructor_parameters(index: &Index, class: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The classes a Symfony kernel extends or implements.
+const KERNELS: [&str; 2] = [
+    "Symfony\\Component\\HttpKernel\\Kernel",
+    "Symfony\\Component\\HttpKernel\\KernelInterface",
+];
+
+/// What the project's kernels override: `getConfigDir()` moves every configuration
+/// file, `loadRoutes()` loads other routes and `getKernelParameters()` adds
+/// parameters.
+#[derive(Default)]
+struct KernelOverrides {
+    config_dir: bool,
+    routes: bool,
+    parameters: bool,
+}
+
+fn kernel_overrides(index: &Index, filter: &PathFilter) -> KernelOverrides {
+    let mut found = KernelOverrides::default();
+    for (path, declaration) in index.declarations() {
+        if declaration.kind != SymbolKind::Class {
+            continue;
+        }
+        let declares = |name: &str| routes::declares_method(declaration, name);
+        let config_dir = declares("getConfigDir");
+        let routes = declares("loadRoutes");
+        let parameters = declares("getKernelParameters");
+        // Path and ancestry checks cost more than reading members, so they come last.
+        if !(config_dir || routes || parameters)
+            || !filter.in_scope(path)
+            || !index.is_project_code(path)
+            || !is_a(index, &declaration.fqn, &KERNELS)
+        {
+            continue;
+        }
+        found.config_dir |= config_dir;
+        found.routes |= routes;
+        found.parameters |= parameters;
+    }
+    found
 }
 
 /// The interface message buses are autowired by.
@@ -981,8 +1022,12 @@ impl Symfony {
             .iter()
             .flat_map(|class| index.candidate_files(&RefKey::Class(class.to_string())))
             .any(|path| self.is_source(index, path));
-        self.parameters_unknown =
-            configured_in_php || unread_imports || config::has_unread_configuration(&self.project);
+        let kernel = kernel_overrides(index, &filter);
+        self.parameters_unknown = configured_in_php
+            || unread_imports
+            || config::has_unread_configuration(&self.project)
+            || kernel.config_dir
+            || kernel.parameters;
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
         self.aliases = config::read_aliases(&files, &self.config_files);
@@ -1002,7 +1047,16 @@ impl Symfony {
             &self.config_files,
         );
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
+        if kernel.config_dir
+            || kernel.routes
+            || config::router_resource_changed(&files, &self.config_files)
+        {
+            self.routes.mark_unknown();
+        }
         self.templates = Templates::read(index, &self.project, &self.config_files);
+        if kernel.config_dir {
+            self.templates.mark_unknown();
+        }
         let tagged =
             config::tagged_services(&files, &self.config_files, "messenger.message_handler");
         self.handlers = Handlers::read(index, &filter, &tagged);

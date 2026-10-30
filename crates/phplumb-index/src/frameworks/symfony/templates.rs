@@ -176,6 +176,12 @@ impl Templates {
         }
     }
 
+    /// Leaves every namespace unknown, for a source of templates the module does not
+    /// read.
+    pub(crate) fn mark_unknown(&mut self) {
+        self.unknown = true;
+    }
+
     /// The first existing file `name` names: `@Ns/rest` in `Ns`'s directories,
     /// anything else in the main namespace's.
     pub(crate) fn file(&self, name: &str) -> Option<PathBuf> {

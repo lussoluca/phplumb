@@ -135,6 +135,12 @@ impl Routes {
         routes
     }
 
+    /// Leaves every route name unknown, for a source of routes the module does not
+    /// read.
+    pub(crate) fn mark_unknown(&mut self) {
+        self.unknown = true;
+    }
+
     pub(crate) fn targets(&self, name: &str) -> &[RouteTarget] {
         self.by_name.get(name).map_or(&[], Vec::as_slice)
     }
@@ -752,7 +758,7 @@ fn has_unread_route_files(config: &Path) -> bool {
 }
 
 /// Whether `class` declares a method named `name`.
-fn declares_method(class: &Declaration, name: &str) -> bool {
+pub(crate) fn declares_method(class: &Declaration, name: &str) -> bool {
     class.class.as_ref().is_some_and(|shape| {
         shape
             .members
