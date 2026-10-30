@@ -2492,3 +2492,47 @@ fn parameters_set_from_php_lead_to_their_call() {
 
     assert_eq!(found, [root.join("src/Pass.php")]);
 }
+
+#[test]
+fn php_and_xml_configuration_define_targets() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/services.php",
+            "<?php\nreturn static function ($container): void {\n    $container->parameters()->set('app.nowhere', 1);\n    $container->services()->set('app.php_service', \\stdClass::class);\n};\n",
+        ),
+        (
+            "config/packages/extra.xml",
+            "<container><services><service id=\"app.xml_service\" class=\"stdClass\"/></services></container>\n",
+        ),
+        (
+            "config/packages/refs.yaml",
+            "services:\n    app.user:\n        arguments: ['@app.php_service', '@app.xml_service']\n",
+        ),
+    ]);
+    let mut index = auto(&root);
+    let at = |index: &mut Index, file: &str, needle: &str| -> Vec<PathBuf> {
+        let path = root.join(file);
+        let source = fs::read(&path).unwrap();
+        let offset = String::from_utf8_lossy(&source).find(needle).unwrap() as u32 + 1;
+        index
+            .definition(&path, &source, offset)
+            .into_iter()
+            .map(|location| location.path)
+            .collect()
+    };
+
+    assert_eq!(
+        at(&mut index, "src/Controller/Uses.php", "app.nowhere"),
+        [root.join("config/services.php")]
+    );
+    assert_eq!(
+        at(&mut index, "config/packages/refs.yaml", "app.php_service"),
+        [root.join("config/services.php")]
+    );
+    assert_eq!(
+        at(&mut index, "config/packages/refs.yaml", "app.xml_service"),
+        [root.join("config/packages/extra.xml")]
+    );
+    // PHP and XML configuration keep parameter names unknown.
+    assert_eq!(broken_messages(&root), ["Undefined route 'missing_route'"]);
+}

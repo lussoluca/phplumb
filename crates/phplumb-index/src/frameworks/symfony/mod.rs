@@ -3,6 +3,8 @@
 mod broken;
 mod bundles;
 mod config;
+mod definitions;
+use definitions::Definitions;
 mod doctrine;
 mod files;
 mod messenger;
@@ -100,6 +102,55 @@ const MESSAGE_CALLS: [(&str, &str, usize); 5] = [
         1,
     ),
 ];
+
+/// What the PHP and XML files below `config` define, each file once, in path
+/// order.
+fn project_definitions(config: &Path) -> Definitions {
+    fn walk(dir: &Path, seen: &mut Vec<PathBuf>, found: &mut Vec<PathBuf>) {
+        let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if seen.contains(&real) {
+            return;
+        }
+        seen.push(real);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                walk(&path, seen, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(config, &mut Vec::new(), &mut files);
+    let mut definitions = Definitions::default();
+    for file in files {
+        let extension = file
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        match extension.as_deref() {
+            Some("php") => {
+                if let Ok(source) = std::fs::read(&file) {
+                    definitions.read_php(&file, &source);
+                }
+            }
+            Some("xml") => {
+                if let Ok(text) = std::fs::read_to_string(&file) {
+                    definitions.read_xml(&file, &text);
+                }
+            }
+            _ => {}
+        }
+    }
+    definitions
+}
 
 /// The interface message buses are autowired by.
 const MESSAGE_BUS: &str = "Symfony\\Component\\Messenger\\MessageBusInterface";
@@ -302,6 +353,9 @@ pub struct Symfony {
     handlers: Handlers,
     /// The message buses and the default one; none when they cannot be told.
     buses: Option<(Vec<String>, String)>,
+    /// The parameters, services and aliases of the project's PHP and XML
+    /// configuration.
+    definitions: Definitions,
     /// Each service alias and the service it stands for.
     aliases: HashMap<String, Vec<String>>,
     /// The argument names the configuration binds, and the classes whose
@@ -581,6 +635,9 @@ impl Symfony {
         if let Some(set) = self.set_parameters(index).and_then(|set| set.get(name)) {
             found.extend(targets_of(set));
         }
+        if let Some(defined) = self.definitions.parameters.get(name) {
+            found.extend(targets_of(defined));
+        }
         found
     }
 
@@ -597,10 +654,20 @@ impl Symfony {
                 continue;
             }
             seen.push(id);
-            let targets = match self.services.get(id) {
-                Some(targets) => targets_of(targets),
-                None if config::looks_like_class(id) => class_targets(index, id),
-                None => Vec::new(),
+            let defined: Vec<&RouteTarget> = self
+                .services
+                .get(id)
+                .into_iter()
+                .chain(self.definitions.services.get(id))
+                .flatten()
+                .collect();
+            let targets = match defined.is_empty() {
+                false => defined
+                    .into_iter()
+                    .map(|target| (target.location.clone(), target.text.clone()))
+                    .collect(),
+                true if config::looks_like_class(id) => class_targets(index, id),
+                true => Vec::new(),
             };
             for target in targets {
                 if !found.contains(&target) {
@@ -611,6 +678,7 @@ impl Symfony {
                 self.aliases
                     .get(id)
                     .into_iter()
+                    .chain(self.definitions.aliases.get(id))
                     .flatten()
                     .map(String::as_str),
             );
@@ -721,6 +789,7 @@ impl Symfony {
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
         self.aliases = config::read_aliases(&files, &self.config_files);
+        self.definitions = project_definitions(&self.project.dir.join("config"));
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);
