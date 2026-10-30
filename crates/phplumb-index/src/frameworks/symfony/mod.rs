@@ -302,6 +302,8 @@ pub struct Symfony {
     handlers: Handlers,
     /// The message buses and the default one; none when they cannot be told.
     buses: Option<(Vec<String>, String)>,
+    /// Each service alias and the service it stands for.
+    aliases: HashMap<String, String>,
     /// The argument names the configuration binds, and the classes whose
     /// arguments it wires.
     bindings: (Vec<String>, Vec<String>),
@@ -561,13 +563,30 @@ impl Symfony {
     }
 
     /// The definition of the service `id`, or the class when the id names one that no
-    /// key defines.
+    /// key defines; for an alias, then those of the service it stands for.
     pub fn service_targets(&self, index: &Index, id: &str) -> Vec<(Location, String)> {
-        match self.services.get(id) {
-            Some(targets) => targets_of(targets),
-            None if config::looks_like_class(id) => class_targets(index, id),
-            None => Vec::new(),
+        let mut found: Vec<(Location, String)> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        let mut next = Some(id);
+        // An alias also leads to the service it stands for, through a chain of them.
+        while let Some(id) = next.take() {
+            if seen.contains(&id) {
+                break;
+            }
+            seen.push(id);
+            let targets = match self.services.get(id) {
+                Some(targets) => targets_of(targets),
+                None if config::looks_like_class(id) => class_targets(index, id),
+                None => Vec::new(),
+            };
+            for target in targets {
+                if !found.contains(&target) {
+                    found.push(target);
+                }
+            }
+            next = self.aliases.get(id).map(String::as_str);
         }
+        found
     }
 
     /// In a YAML configuration file: a `%parameter%`, a template name, an `@id`
@@ -656,6 +675,7 @@ impl Symfony {
             || config::has_unread_configuration(&self.project, &files, &self.config_files);
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
+        self.aliases = config::read_aliases(&files, &self.config_files);
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);

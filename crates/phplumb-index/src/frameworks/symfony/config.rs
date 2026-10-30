@@ -367,6 +367,52 @@ fn tags_of(service: &Yaml, tag: &str) -> Vec<Vec<(String, String)>> {
     found
 }
 
+/// The service id a reference `@id` names, past the `?`, `!` and `>` markers;
+/// none for an expression (`@=`) or an escaped `@` (`@@`).
+pub(crate) fn service_reference(value: &str) -> Option<&str> {
+    let reference = value.strip_prefix('@')?;
+    if reference.starts_with('=') || reference.starts_with('@') {
+        return None;
+    }
+    Some(reference.trim_start_matches(['?', '!', '>']))
+}
+
+/// The aliases the configuration files define under `services:`, also inside
+/// `when@<env>` blocks: `id: '@other'` and `id: { alias: other }`, each id with the
+/// service it stands for.
+pub(crate) fn read_aliases(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+) -> HashMap<String, String> {
+    let mut found: HashMap<String, String> = HashMap::new();
+    for file in files {
+        let Some(parsed) = config_files.get(file) else {
+            continue;
+        };
+        let Some(root) = &parsed.yaml else {
+            continue;
+        };
+        for block in top_blocks(root) {
+            let Some(Yaml::Map(entries)) = block.get("services") else {
+                continue;
+            };
+            for (key, value) in entries {
+                let Some(id) = key.text() else {
+                    continue;
+                };
+                let target = match value {
+                    Yaml::Scalar { value, .. } => service_reference(value),
+                    _ => value.get("alias").and_then(Yaml::text),
+                };
+                if let Some(target) = target {
+                    found.insert(id.to_string(), target.to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Whether `text` is written like a fully qualified class name.
 pub(crate) fn looks_like_class(text: &str) -> bool {
     let name = text.trim_start_matches('\\');

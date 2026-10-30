@@ -943,9 +943,14 @@ fn yaml_class_names_open_their_class() {
 #[test]
 fn yaml_service_references_open_their_definition() {
     let mut index = build();
+    // `app.mailer` is an alias: its service comes after it.
+    let mailer = [
+        pair(SERVICES, "app.mailer"),
+        pair(SERVICES, "App\\Service\\Mailer"),
+    ];
     assert_eq!(
         definition_on_line(&mut index, SERVICES, 20, "app.mailer"),
-        [pair(SERVICES, "app.mailer")]
+        mailer
     );
     assert_eq!(
         definition_on_line(&mut index, SERVICES, 15, "App\\Service"),
@@ -953,7 +958,7 @@ fn yaml_service_references_open_their_definition() {
     );
     assert_eq!(
         definition_on_line(&mut index, SERVICES, 16, "app.mailer"),
-        [pair(SERVICES, "app.mailer")]
+        mailer
     );
     assert!(definition_on_line(&mut index, SERVICES, 17, "service(").is_empty());
 }
@@ -963,7 +968,10 @@ fn autowire_service_opens_its_definition() {
     let mut index = build();
     assert_eq!(
         definition(&mut index, CONFIGURED, "'app.mailer'"),
-        [pair(SERVICES, "app.mailer")]
+        [
+            pair(SERVICES, "app.mailer"),
+            pair(SERVICES, "App\\Service\\Mailer")
+        ]
     );
 }
 
@@ -982,7 +990,10 @@ fn translations_have_no_parameters() {
 #[test]
 fn alias_and_decorates_open_their_service() {
     let mut index = build();
-    let mailer = [pair(SERVICES, "app.mailer")];
+    let mailer = [
+        pair(SERVICES, "app.mailer"),
+        pair(SERVICES, "App\\Service\\Mailer"),
+    ];
     assert_eq!(
         definition_on_line(&mut index, SERVICES, 22, "app.mailer"),
         mailer,
@@ -1843,6 +1854,42 @@ fn only_envelope_wrap_unwraps_static_calls() {
             19,
             "dispatch"
         )
+    );
+    let _ = path;
+}
+
+#[test]
+fn service_aliases_also_lead_to_their_service() {
+    let mut index = build();
+    let both = [
+        pair(SERVICES, "app.mailer"),
+        pair(SERVICES, "App\\Service\\Mailer"),
+    ];
+    assert_eq!(
+        definition_on_line(&mut index, SERVICES, 20, "app.mailer"),
+        both
+    );
+    assert_eq!(
+        definition_on_line(&mut index, SERVICES, 22, "app.mailer"),
+        both
+    );
+}
+
+#[test]
+fn alias_cycles_end() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "config/services_test.yaml",
+        "services:\n    app.a: '@app.b'\n    app.b:\n        alias: app.a\n    app.c:\n        arguments: ['@app.a']\n",
+    );
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, "config/services_test.yaml", 6, "app.a"),
+        [
+            pair("config/services_test.yaml", "app.a"),
+            pair("config/services_test.yaml", "app.b")
+        ]
     );
     let _ = path;
 }
