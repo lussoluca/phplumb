@@ -1751,6 +1751,78 @@ fn templated_bundles(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
 }
 
 #[test]
+fn custom_twig_loaders_keep_templates_unknown() {
+    let interface = (
+        "lib/LoaderInterface.php",
+        "<?php\nnamespace Twig\\Loader;\ninterface LoaderInterface\n{\n}\n",
+    );
+    let base = [
+        interface,
+        ("templates/home.html.twig", "home\n"),
+        TWIG_BRIDGE,
+    ];
+    let project = |files: &[(&str, &str)]| {
+        let mut all = base.to_vec();
+        all.extend_from_slice(files);
+        broken_symfony(&all)
+    };
+    let (_dir, root) = project(&[(
+        "src/Twig/Plain.php",
+        "<?php\nnamespace App\\Twig;\nclass Plain\n{\n}\n",
+    )]);
+    assert_eq!(
+        template_status(&root, "missing.html.twig"),
+        TemplateStatus::Missing
+    );
+    let loader = "<?php\nnamespace App\\Twig;\nuse Twig\\Loader\\LoaderInterface;\nclass DbLoader implements LoaderInterface\n{\n}\n";
+    let (_dir, root) = project(&[("src/Twig/DbLoader.php", loader)]);
+    assert_eq!(
+        template_status(&root, "missing.html.twig"),
+        TemplateStatus::Unknown
+    );
+    for tags in ["['twig.loader']", "[{ name: twig.loader, priority: 10 }]"] {
+        let services = format!(
+            "parameters:\n    app.name: x\nservices:\n    App\\Twig\\Plain:\n        tags: {tags}\n"
+        );
+        let (_dir, root) = project(&[
+            (
+                "src/Twig/Plain.php",
+                "<?php\nnamespace App\\Twig;\nclass Plain\n{\n}\n",
+            ),
+            ("config/services.yaml", &services),
+        ]);
+        assert_eq!(
+            template_status(&root, "missing.html.twig"),
+            TemplateStatus::Unknown,
+            "{tags}"
+        );
+    }
+}
+
+#[test]
+fn namespaces_from_paths_and_bundles_read_both() {
+    let (_dir, root) = templated_bundles(&[
+        (
+            "config/packages/twig.yaml",
+            "twig:\n    paths:\n        '%kernel.project_dir%/extra': Acme\n",
+        ),
+        ("extra/own.html.twig", "own\n"),
+    ]);
+    assert_eq!(
+        template_file(&root, "@Acme/own.html.twig").as_deref(),
+        Some("extra/own.html.twig")
+    );
+    assert_eq!(
+        template_file(&root, "@Acme/card.html.twig").as_deref(),
+        Some("lib/acme/templates/card.html.twig")
+    );
+    assert_eq!(
+        template_status(&root, "@Acme/gone.html.twig"),
+        TemplateStatus::Missing
+    );
+}
+
+#[test]
 fn bundle_templates_open_from_their_views() {
     let (_dir, root) = templated_bundles(&[]);
 

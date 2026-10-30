@@ -301,37 +301,47 @@ const KERNELS: [&str; 2] = [
     "Symfony\\Component\\HttpKernel\\KernelInterface",
 ];
 
-/// What the project's kernels override: `getConfigDir()` moves every configuration
-/// file, `loadRoutes()` loads other routes and `getKernelParameters()` adds
-/// parameters.
+/// The interface of Twig loaders, which autoconfiguration tags `twig.loader`.
+const TWIG_LOADER: &str = "Twig\\Loader\\LoaderInterface";
+
+/// What project classes change of the names the module reads: a kernel's
+/// `getConfigDir()` moves every configuration file, `loadRoutes()` loads other
+/// routes and `getKernelParameters()` adds parameters; a Twig loader may load any
+/// template.
 #[derive(Default)]
-struct KernelOverrides {
+struct ClassSources {
     config_dir: bool,
     routes: bool,
     parameters: bool,
+    twig_loader: bool,
 }
 
-fn kernel_overrides(index: &Index, filter: &PathFilter) -> KernelOverrides {
-    let mut found = KernelOverrides::default();
+fn class_sources(index: &Index, filter: &PathFilter) -> ClassSources {
+    let mut found = ClassSources::default();
     for (path, declaration) in index.declarations() {
-        if declaration.kind != SymbolKind::Class {
+        let concrete = declaration
+            .class
+            .as_ref()
+            .is_some_and(|shape| !shape.is_abstract);
+        if declaration.kind != SymbolKind::Class || !index.is_project_code(path) {
             continue;
         }
         let declares = |name: &str| routes::declares_method(declaration, name);
         let config_dir = declares("getConfigDir");
         let routes = declares("loadRoutes");
         let parameters = declares("getKernelParameters");
-        // Path and ancestry checks cost more than reading members, so they come last.
-        if !(config_dir || routes || parameters)
-            || !filter.in_scope(path)
-            || !index.is_project_code(path)
-            || !is_a(index, &declaration.fqn, &KERNELS)
-        {
+        let kernel =
+            (config_dir || routes || parameters) && is_a(index, &declaration.fqn, &KERNELS);
+        let twig_loader = concrete && is_a(index, &declaration.fqn, &[TWIG_LOADER]);
+        if !(kernel || twig_loader) || !filter.in_scope(path) {
             continue;
         }
-        found.config_dir |= config_dir;
-        found.routes |= routes;
-        found.parameters |= parameters;
+        if kernel {
+            found.config_dir |= config_dir;
+            found.routes |= routes;
+            found.parameters |= parameters;
+        }
+        found.twig_loader |= twig_loader;
     }
     found
 }
@@ -1022,12 +1032,12 @@ impl Symfony {
             .iter()
             .flat_map(|class| index.candidate_files(&RefKey::Class(class.to_string())))
             .any(|path| self.is_source(index, path));
-        let kernel = kernel_overrides(index, &filter);
+        let classes = class_sources(index, &filter);
         self.parameters_unknown = configured_in_php
             || unread_imports
             || config::has_unread_configuration(&self.project)
-            || kernel.config_dir
-            || kernel.parameters;
+            || classes.config_dir
+            || classes.parameters;
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
         self.aliases = config::read_aliases(&files, &self.config_files);
@@ -1047,14 +1057,16 @@ impl Symfony {
             &self.config_files,
         );
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
-        if kernel.config_dir
-            || kernel.routes
+        if classes.config_dir
+            || classes.routes
             || config::router_resource_changed(&files, &self.config_files)
         {
             self.routes.mark_unknown();
         }
         self.templates = Templates::read(index, &self.project, &self.config_files);
-        if kernel.config_dir {
+        // Custom loaders, autoconfigured or tagged, may load any template.
+        let loaders = config::tagged_services(&files, &self.config_files, "twig.loader");
+        if classes.config_dir || classes.twig_loader || !loaders.is_empty() {
             self.templates.mark_unknown();
         }
         let tagged =
