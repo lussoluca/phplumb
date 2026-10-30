@@ -3,6 +3,8 @@
 mod broken;
 mod bundles;
 mod config;
+mod definitions;
+use definitions::Definitions;
 mod doctrine;
 mod files;
 mod messenger;
@@ -14,6 +16,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use crate::diagnostics::Diagnostic;
 use crate::filter::{is_doctrine_xml, is_yaml};
@@ -100,6 +103,113 @@ const MESSAGE_CALLS: [(&str, &str, usize); 5] = [
         1,
     ),
 ];
+
+/// The files below `dirs`, each once, in path order.
+fn files_below(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    fn walk(dir: &Path, seen: &mut Vec<PathBuf>, found: &mut Vec<PathBuf>) {
+        let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if seen.contains(&real) {
+            return;
+        }
+        seen.push(real);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                walk(&path, seen, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    let mut seen = Vec::new();
+    for dir in dirs {
+        walk(dir, &mut seen, &mut files);
+    }
+    files
+}
+
+/// The PHP and XML configuration files of `config` the kernel loads:
+/// `packages/*` and `packages/<env>/*`, and `services.*` and `services_<env>.*`
+/// when there is no `services.yaml`.
+fn project_definition_files(config: &Path) -> Vec<PathBuf> {
+    let listed = |dir: &Path| -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        files.sort();
+        files
+    };
+    let packages = config.join("packages");
+    let mut files = listed(&packages);
+    let mut environments: Vec<PathBuf> = std::fs::read_dir(&packages)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    environments.sort();
+    for environment in environments {
+        files.extend(listed(&environment));
+    }
+    let yaml = ["services.yaml", "services.yml"]
+        .iter()
+        .any(|name| config.join(name).is_file());
+    if !yaml {
+        files.extend(listed(config).into_iter().filter(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem == "services" || stem.starts_with("services_"))
+        }));
+    }
+    files
+}
+
+/// When `config/bundles.php` and `composer.lock` of the project at `dir` last
+/// changed.
+fn bundles_key(dir: &Path) -> Option<(Option<SystemTime>, Option<SystemTime>)> {
+    let modified = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    Some((
+        modified(dir.join("config/bundles.php")),
+        modified(dir.join("composer.lock")),
+    ))
+}
+
+/// What the PHP and XML files among `files` define.
+fn definitions_of(files: &[PathBuf]) -> Definitions {
+    let mut definitions = Definitions::default();
+    for file in files {
+        let extension = file
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        match extension.as_deref() {
+            Some("php") => {
+                if let Ok(source) = std::fs::read(file) {
+                    definitions.read_php(file, &source);
+                }
+            }
+            Some("xml") => {
+                if let Ok(text) = std::fs::read_to_string(file) {
+                    definitions.read_xml(file, &text);
+                }
+            }
+            _ => {}
+        }
+    }
+    definitions
+}
 
 /// The interface message buses are autowired by.
 const MESSAGE_BUS: &str = "Symfony\\Component\\Messenger\\MessageBusInterface";
@@ -198,6 +308,10 @@ fn messages(
 }
 
 /// Classes whose `setParameter()` defines a container parameter.
+/// The parameter bag, whose `set()` defines a parameter.
+const PARAMETER_BAG: &str =
+    "Symfony\\Component\\DependencyInjection\\ParameterBag\\ParameterBagInterface";
+
 const PARAMETER_HOLDERS: [&str; 4] = [
     "Symfony\\Component\\DependencyInjection\\Container",
     "Symfony\\Component\\DependencyInjection\\ContainerBuilder",
@@ -302,6 +416,14 @@ pub struct Symfony {
     handlers: Handlers,
     /// The message buses and the default one; none when they cannot be told.
     buses: Option<(Vec<String>, String)>,
+    /// The parameters, services and aliases of the project's PHP and XML
+    /// configuration.
+    definitions: Definitions,
+    /// Those of the bundles' configuration, read on the first lookup after the
+    /// bundles or the dependencies change.
+    bundle_definitions: OnceLock<Definitions>,
+    /// When `config/bundles.php` and `composer.lock` last changed.
+    bundles_key: Option<(Option<SystemTime>, Option<SystemTime>)>,
     /// Each service alias and the service it stands for.
     aliases: HashMap<String, Vec<String>>,
     /// The argument names the configuration binds, and the classes whose
@@ -313,7 +435,7 @@ pub struct Symfony {
     parameters_unknown: bool,
     /// The parameters project code sets with `setParameter()`, or none when one of
     /// those calls computes its name; found on first use after each read.
-    set_parameters: OnceLock<Option<HashSet<String>>>,
+    set_parameters: OnceLock<Option<HashMap<String, Vec<RouteTarget>>>>,
     /// Service definitions, by id.
     services: HashMap<String, Vec<RouteTarget>>,
     mappings: Mappings,
@@ -358,6 +480,12 @@ impl Symfony {
         {
             return false;
         }
+        // Parameters PHP or XML configuration defines, the project's or a bundle's.
+        if self.definitions.parameters.contains_key(name)
+            || self.bundle_definitions(index).parameters.contains_key(name)
+        {
+            return false;
+        }
         let family = |name: &str| name.split('.').next().unwrap_or_default().to_string();
         let ours = family(name);
         if !self
@@ -368,7 +496,7 @@ impl Symfony {
             return false;
         }
         self.set_parameters(index)
-            .is_some_and(|set| !set.contains(name))
+            .is_some_and(|set| !set.contains_key(name))
     }
 
     /// Whether `path` is code of the project, not a dependency nor what Symfony
@@ -383,7 +511,7 @@ impl Symfony {
     /// project code give the container, or none when one of them is computed. Only
     /// files that mention a container class are read: a `setParameter()` whose
     /// receiver stays unknown there counts.
-    fn set_parameters(&self, index: &Index) -> Option<&HashSet<String>> {
+    fn set_parameters(&self, index: &Index) -> Option<&HashMap<String, Vec<RouteTarget>>> {
         self.set_parameters
             .get_or_init(|| {
                 let holders: Vec<&Path> = PARAMETER_HOLDERS
@@ -398,7 +526,7 @@ impl Symfony {
                     .collect();
                 files.sort();
                 files.dedup();
-                let mut names = HashSet::new();
+                let mut names: HashMap<String, Vec<RouteTarget>> = HashMap::new();
                 for path in files {
                     let source = std::fs::read(path).ok()?;
                     let summary = summarize(&source);
@@ -412,14 +540,33 @@ impl Symfony {
                     for call in calls {
                         let (start, end) = (call.location.start, call.location.end);
                         let method = String::from_utf8_lossy(&source[start as usize..end as usize]);
+                        // A container's `set()` registers a service; a bag's sets a parameter.
+                        let setter = method.eq_ignore_ascii_case("setParameter");
+                        let holders: &[&str] = if setter {
+                            &PARAMETER_HOLDERS
+                        } else {
+                            &[PARAMETER_BAG]
+                        };
                         let holder = call.targets.iter().any(|target| {
                             matches!(target, CallTarget::Method { class, .. }
-                                if is_a(index, class, &PARAMETER_HOLDERS))
+                                if is_a(index, class, holders))
                         });
                         let unknown =
                             call.targets.is_empty() && method.eq_ignore_ascii_case("setParameter");
                         if holder || unknown {
-                            names.insert(call.strings.first().cloned().flatten()?);
+                            let name = call.strings.first().cloned().flatten()?;
+                            let target =
+                                call.ranges.first().copied().flatten().map(|(start, end)| {
+                                    RouteTarget {
+                                        location: Location {
+                                            path: path.to_path_buf(),
+                                            start,
+                                            end,
+                                        },
+                                        text: name.clone(),
+                                    }
+                                });
+                            names.entry(name).or_default().extend(target);
                         }
                     }
                 }
@@ -562,6 +709,43 @@ impl Symfony {
         self.parameters.get(name).map_or(&[], Vec::as_slice)
     }
 
+    /// The parameters, services and aliases the configuration of the bundles of
+    /// `config/bundles.php` defines, in their `Resources/config` and `config`
+    /// directories.
+    fn bundle_definitions(&self, index: &Index) -> &Definitions {
+        self.bundle_definitions.get_or_init(|| {
+            let dirs: Vec<PathBuf> = bundles::bundles(index, &self.project.dir.join("config"))
+                .into_iter()
+                .filter_map(|(_, dir)| dir)
+                .flat_map(|dir| [dir.join("Resources/config"), dir.join("config")])
+                .filter(|dir| dir.is_dir())
+                .collect();
+            definitions_of(&files_below(&dirs))
+        })
+    }
+
+    /// Where the parameter `name` is defined: under `parameters:`, then by the
+    /// project's `setParameter()` and parameter bag `set()` calls, then in PHP and
+    /// XML configuration, the project's and the bundles'.
+    fn parameter_locations(&self, index: &Index, name: &str) -> Vec<(Location, String)> {
+        let mut found = targets_of(self.parameter_targets(name));
+        if let Some(set) = self.set_parameters(index).and_then(|set| set.get(name)) {
+            found.extend(targets_of(set));
+        }
+        for definitions in [&self.definitions, self.bundle_definitions(index)] {
+            if let Some(defined) = definitions.parameters.get(name) {
+                found.extend(targets_of(defined));
+            }
+        }
+        let mut unique: Vec<(Location, String)> = Vec::new();
+        for target in found {
+            if !unique.contains(&target) {
+                unique.push(target);
+            }
+        }
+        unique
+    }
+
     /// The definition of the service `id`, or the class when the id names one that no
     /// key defines; for an alias, then those of the service it stands for.
     pub fn service_targets(&self, index: &Index, id: &str) -> Vec<(Location, String)> {
@@ -575,10 +759,22 @@ impl Symfony {
                 continue;
             }
             seen.push(id);
-            let targets = match self.services.get(id) {
-                Some(targets) => targets_of(targets),
-                None if config::looks_like_class(id) => class_targets(index, id),
-                None => Vec::new(),
+            let bundles = self.bundle_definitions(index);
+            let defined: Vec<&RouteTarget> = self
+                .services
+                .get(id)
+                .into_iter()
+                .chain(self.definitions.services.get(id))
+                .chain(bundles.services.get(id))
+                .flatten()
+                .collect();
+            let targets = match defined.is_empty() {
+                false => defined
+                    .into_iter()
+                    .map(|target| (target.location.clone(), target.text.clone()))
+                    .collect(),
+                true if config::looks_like_class(id) => class_targets(index, id),
+                true => Vec::new(),
             };
             for target in targets {
                 if !found.contains(&target) {
@@ -589,6 +785,8 @@ impl Symfony {
                 self.aliases
                     .get(id)
                     .into_iter()
+                    .chain(self.definitions.aliases.get(id))
+                    .chain(bundles.aliases.get(id))
                     .flatten()
                     .map(String::as_str),
             );
@@ -645,7 +843,7 @@ impl Symfony {
         }
         let raw = &text[*start as usize..*end as usize];
         if let Some(name) = config::parameter_at(raw, (offset - start) as usize) {
-            return targets_of(self.parameter_targets(&name));
+            return self.parameter_locations(index, &name);
         }
         // A template name, such as a `form_themes` entry; with `@`, a namespaced one.
         let namespaced = !value.starts_with('@') || value.contains('/');
@@ -676,11 +874,12 @@ impl Symfony {
     /// The `%name%` under the cursor in the value of an attribute.
     fn value_parameter_targets(
         &self,
+        index: &Index,
         found: &AttributeString,
         offset: u32,
     ) -> Vec<(Location, String)> {
         config::parameter_at(&found.value, offset.saturating_sub(found.start) as usize)
-            .map(|name| targets_of(self.parameter_targets(&name)))
+            .map(|name| self.parameter_locations(index, &name))
             .unwrap_or_default()
     }
 
@@ -698,6 +897,14 @@ impl Symfony {
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
         self.aliases = config::read_aliases(&files, &self.config_files);
+        self.definitions =
+            definitions_of(&project_definition_files(&self.project.dir.join("config")));
+        // Bundle configuration changes with the bundles and the dependencies only.
+        let key = bundles_key(&self.project.dir);
+        if self.bundles_key != key {
+            self.bundles_key = key;
+            self.bundle_definitions = OnceLock::new();
+        }
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);
@@ -823,7 +1030,7 @@ impl Framework for Symfony {
             return Vec::new();
         }
         if calls_one_of(index, call, &PARAMETER_METHODS) {
-            return targets_of(self.parameter_targets(value));
+            return self.parameter_locations(index, value);
         }
         if calls_one_of(index, call, &TEMPLATE_METHODS) {
             return self
@@ -866,9 +1073,9 @@ impl Framework for Symfony {
                         .map(|id| self.service_targets(index, id))
                         .unwrap_or_default()
                 }
-                Some(0) => self.value_parameter_targets(found, offset),
+                Some(0) => self.value_parameter_targets(index, found, offset),
                 Some(1) => self.service_targets(index, &found.value),
-                Some(4) => targets_of(self.parameter_targets(&found.value)),
+                Some(4) => self.parameter_locations(index, &found.value),
                 _ => Vec::new(),
             };
         }

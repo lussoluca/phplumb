@@ -41,7 +41,7 @@ The module is optional and configurable like the Drupal module:
 
 - Symfony events and event subscribers. They may come later.
 - Environment variables (`%env(NAME)%`, `#[Autowire(env:)]`) and `.env` files.
-- Service definitions that bundles declare in their own PHP or XML configuration, and diagnostics for service ids.
+- Diagnostics for service ids. Service and parameter definitions from PHP and XML configuration, the project's and the bundles', are read for navigation only and never make a name certain.
 - Navigation into Twig expressions: variables, attribute access such as `{{ user.name }}`, filters and functions.
 - Reading the compiled container or router from `var/cache`. The module reads source files only, like the Drupal module.
 - Typing the result of `$container->get('id')` in Symfony code. Modern Symfony code uses constructor injection.
