@@ -78,6 +78,27 @@ pub struct FrameworkCall<'a> {
     pub receiver: Option<&'a TypeExpr>,
 }
 
+/// What a method call is made on, when it is a plain name: `$this->name` or
+/// `$name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReceiverName {
+    Property(String),
+    Variable(String),
+}
+
+/// What a framework sees of a call's arguments, receiver and place.
+pub struct CallArguments<'a> {
+    /// The type of each argument, by parameter position.
+    pub types: &'a [TypeExpr],
+    /// For each argument written `new C(x)` or `C::wrap(x)`, the type of `x`, by
+    /// parameter position.
+    pub wrapped: &'a [Option<TypeExpr>],
+    /// What the call is made on, when it is a plain name.
+    pub receiver: Option<&'a ReceiverName>,
+    /// `Class::method` or the function the call is in.
+    pub caller: Option<&'a str>,
+}
+
 /// The declaration a definition request is on: its name, or one of its attributes.
 pub enum FrameworkDeclaration<'a> {
     /// A function, with every declaration of its file.
@@ -137,9 +158,11 @@ pub struct FoundCall {
     /// The type of each argument by the position of the parameter it fills, up to
     /// the first spread one; `Other` when unknown.
     pub arguments: Vec<TypeExpr>,
-    /// For each argument written `new C(x, ...)` or `C::f(x, ...)`, the type of `x`,
-    /// by position.
+    /// For each argument written `new C(x, ...)` or `C::wrap(x, ...)`, the type of
+    /// `x`, by position.
     pub wrapped: Vec<Option<TypeExpr>>,
+    /// What the call is made on, when it is a plain name.
+    pub receiver_name: Option<ReceiverName>,
     /// The method or function holding the call: `Class::method` with the declaring
     /// class's fully qualified name, or the function's fully qualified name.
     pub caller: Option<String>,
@@ -187,16 +210,14 @@ pub trait Framework: Send + Sync {
         argument: usize,
         value: &str,
     ) -> Vec<(Location, String)>;
-    /// Targets of a definition request on the name of a method call, given the type
-    /// of each of its arguments and, for one written `new C(x)` or `C::f(x)`, the
-    /// type of `x`, by parameter position, each with the text expected at its
-    /// range; none to keep the method's declaration.
+    /// Targets of a definition request on the name of a method call, given its
+    /// arguments, receiver and place, each with the text expected at its range;
+    /// none to keep the method's declaration.
     fn call_targets(
         &self,
         index: &Index,
         call: &FrameworkCall<'_>,
-        arguments: &[TypeExpr],
-        wrapped: &[Option<TypeExpr>],
+        arguments: &CallArguments<'_>,
     ) -> Vec<(Location, String)>;
     /// Targets of a string literal under the cursor at `offset` that is an argument
     /// of an attribute, each with the text expected at its range.

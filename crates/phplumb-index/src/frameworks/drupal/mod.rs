@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 
 use crate::diagnostics::Diagnostic;
 use crate::frameworks::ancestry::is_a;
-use crate::frameworks::{CallTarget, Framework, FrameworkCall, FrameworkDeclaration, Project};
+use crate::frameworks::{
+    CallArguments, CallTarget, Framework, FrameworkCall, FrameworkDeclaration, Project,
+};
 use crate::index::{Index, Location};
 use crate::phpdoc::TypeExpr;
 use crate::summary::{FileSummary, NameRef};
@@ -318,8 +320,7 @@ impl Framework for Drupal {
         &self,
         _index: &Index,
         _call: &FrameworkCall<'_>,
-        _arguments: &[TypeExpr],
-        _wrapped: &[Option<TypeExpr>],
+        _arguments: &CallArguments<'_>,
     ) -> Vec<(Location, String)> {
         Vec::new()
     }

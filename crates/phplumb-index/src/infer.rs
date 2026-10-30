@@ -42,7 +42,9 @@ use mago_syntax::parser::parse_file_content;
 use mago_syntax::walker::Walker;
 
 use crate::calls::{self, CallKind};
-use crate::frameworks::{AttributeString, CallTarget, FoundCall, Framework, FrameworkCall};
+use crate::frameworks::{
+    AttributeString, CallTarget, FoundCall, Framework, FrameworkCall, ReceiverName,
+};
 use crate::generics::{array_element, element_type, entry_type, substitute, supertype_args};
 use crate::index::{Index, Location};
 use crate::phpdoc::{TypeExpr, array_of, parse_docblock, parse_type};
@@ -229,6 +231,8 @@ pub(crate) struct CallAt {
     pub parts: StringArgument,
     pub arguments: Vec<TypeExpr>,
     pub wrapped: Vec<Option<TypeExpr>>,
+    pub receiver_name: Option<ReceiverName>,
+    pub caller: Option<String>,
 }
 
 /// The method, null-safe or static call whose name holds `offset`.
@@ -265,6 +269,8 @@ pub(crate) fn call_at(
             parts,
             arguments,
             wrapped,
+            receiver_name: receiver_name(call),
+            caller: caller_name(path, summary, name.span.start.offset, source),
         })
     })
 }
@@ -915,8 +921,6 @@ pub(crate) fn calls_named(
                     .class_of(c.class, start, 0)
                     .map_or(TypeExpr::Other, TypeExpr::Named),
             };
-            let caller =
-                calls::caller_at(path, summary, name.span.start.offset, source.len() as u32);
             let targets = ctx.call_targets(&receiver, &method);
             Some(FoundCall {
                 location: Location {
@@ -935,12 +939,8 @@ pub(crate) fn calls_named(
                 wrapped: ctx.wrapped_types(arguments, &targets),
                 targets,
                 receiver: receiver.clone(),
-                caller: match caller.kind {
-                    CallKind::Method => Some(format!("{}::{}", caller.detail, caller.name)),
-                    CallKind::Function if caller.detail.is_empty() => Some(caller.name),
-                    CallKind::Function => Some(format!("{}\\{}", caller.detail, caller.name)),
-                    CallKind::File => None,
-                },
+                receiver_name: receiver_name(call),
+                caller: caller_name(path, summary, name.span.start.offset, source),
             })
         })
         .collect();
@@ -974,6 +974,45 @@ fn string_literal_at(expression: &Expression<'_>, offset: u32) -> Option<String>
         },
         _ => None,
     })
+}
+
+/// `Class::method` or the function the code at `offset` is in.
+fn caller_name(path: &Path, summary: &FileSummary, offset: u32, source: &[u8]) -> Option<String> {
+    let caller = calls::caller_at(path, summary, offset, source.len() as u32);
+    match caller.kind {
+        CallKind::Method => Some(format!("{}::{}", caller.detail, caller.name)),
+        CallKind::Function if caller.detail.is_empty() => Some(caller.name),
+        CallKind::Function => Some(format!("{}\\{}", caller.detail, caller.name)),
+        CallKind::File => None,
+    }
+}
+
+/// What `call` is made on, when it is `$this->name` or `$name`.
+fn receiver_name(call: &CallRef<'_, '_>) -> Option<ReceiverName> {
+    let object = match call {
+        CallRef::Method(c) => c.object,
+        CallRef::NullSafe(c) => c.object,
+        CallRef::Static(_) => return None,
+    };
+    match object {
+        Expression::Variable(Variable::Direct(variable)) => {
+            let name = String::from_utf8_lossy(variable.name);
+            let name = name.trim_start_matches('$');
+            (name != "this").then(|| ReceiverName::Variable(name.to_string()))
+        }
+        Expression::Access(Access::Property(access)) => {
+            let Expression::Variable(Variable::Direct(this)) = access.object else {
+                return None;
+            };
+            let ClassLikeMemberSelector::Identifier(property) = &access.property else {
+                return None;
+            };
+            let this = String::from_utf8_lossy(this.name);
+            (this.trim_start_matches('$') == "this")
+                .then(|| ReceiverName::Property(String::from_utf8_lossy(property.value).into()))
+        }
+        _ => None,
+    }
 }
 
 /// The byte range of each argument that is a string literal (inside its quotes) or

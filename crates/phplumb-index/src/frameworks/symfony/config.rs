@@ -127,6 +127,49 @@ pub(crate) fn read_services(
     found
 }
 
+/// The bus Symfony adds when the configuration defines none.
+const DEFAULT_BUS: &str = "messenger.bus.default";
+
+/// The message buses the configuration files define under `framework.messenger`,
+/// also inside `when@<env>` blocks, and the default one: `default_bus`, or the only
+/// bus. Without buses, the one Symfony adds; none when several buses have no
+/// default.
+pub(crate) fn buses(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+) -> Option<(Vec<String>, String)> {
+    let mut names: Vec<String> = Vec::new();
+    let mut default: Option<String> = None;
+    for file in files {
+        let Some(parsed) = config_files.get(file) else {
+            continue;
+        };
+        let Some(root) = &parsed.yaml else {
+            continue;
+        };
+        for block in top_blocks(root) {
+            let Some(messenger) = block.get("framework").and_then(|f| f.get("messenger")) else {
+                continue;
+            };
+            if let Some(Yaml::Map(buses)) = messenger.get("buses") {
+                for name in buses.iter().filter_map(|(key, _)| key.text()) {
+                    if !names.iter().any(|known| known == name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+            if let Some(bus) = messenger.get("default_bus").and_then(Yaml::text) {
+                default = Some(bus.to_string());
+            }
+        }
+    }
+    if names.is_empty() {
+        return Some((vec![DEFAULT_BUS.to_string()], DEFAULT_BUS.to_string()));
+    }
+    let default = default.or_else(|| (names.len() == 1).then(|| names[0].clone()))?;
+    Some((names, default))
+}
+
 /// A service the configuration files tag: its class, or for `_instanceof` the
 /// type whose implementations carry the tag, and the tag's attributes.
 pub(crate) struct Tagged {

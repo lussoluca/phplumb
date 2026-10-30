@@ -2057,3 +2057,135 @@ fn tagged_handlers_handle_their_messages() {
         );
     }
 }
+
+const BUSES: &str = "framework:\n    messenger:\n        default_bus: command.bus\n        buses:\n            command.bus: ~\n            query.bus: ~\n";
+
+fn bus_handler(name: &str, bus: &str) -> String {
+    format!(
+        "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\n#[AsMessageHandler(bus: '{bus}')]\nfinal class {name}\n{{\n    public function __invoke(Ping $message): void\n    {{\n    }}\n}}\n"
+    )
+}
+
+fn bus_sender(name: &str, constructor: &str, receiver: &str) -> String {
+    format!(
+        "<?php\nnamespace App\\Service;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nuse Symfony\\Component\\DependencyInjection\\Attribute\\Target;\nfinal class {name}\n{{\n    private MessageBusInterface $bus;\n\n    public function __construct({constructor})\n    {{\n    }}\n\n    public function send(MessageBusInterface $queryBus): void\n    {{\n        {receiver}->dispatch(new Ping());\n    }}\n}}\n"
+    )
+}
+
+fn bus_symfony() -> (TempDir, PathBuf) {
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    messenger_symfony(&[
+        ("config/packages/messenger.yaml", BUSES),
+        (
+            "src/Handler/CommandHandler.php",
+            leak(bus_handler("CommandHandler", "command.bus")),
+        ),
+        (
+            "src/Handler/QueryHandler.php",
+            leak(bus_handler("QueryHandler", "query.bus")),
+        ),
+        (
+            "src/Service/QuerySender.php",
+            leak(bus_sender(
+                "QuerySender",
+                "private MessageBusInterface $queryBus",
+                "$this->queryBus",
+            )),
+        ),
+        (
+            "src/Service/ParameterSender.php",
+            leak(bus_sender("ParameterSender", "", "$queryBus")),
+        ),
+        (
+            "src/Service/AssignedSender.php",
+            leak(bus_sender(
+                "AssignedSender",
+                "MessageBusInterface $queryBus",
+                "$this->bus",
+            )),
+        ),
+        (
+            "src/Service/TargetSender.php",
+            leak(bus_sender(
+                "TargetSender",
+                "#[Target('query.bus')] private MessageBusInterface $other",
+                "$this->other",
+            )),
+        ),
+    ])
+}
+
+#[test]
+fn bus_handlers_list_only_dispatches_of_their_bus() {
+    let (_dir, root) = bus_symfony();
+    let mut index = auto(&root);
+    let dispatch =
+        |index: &mut Index, file: &str| handler_definitions(index, &root, file, "dispatch(");
+
+    assert_eq!(
+        dispatch(&mut index, "src/Service/QuerySender.php"),
+        [
+            named("PingHandler.php", "__invoke"),
+            named("QueryHandler.php", "__invoke")
+        ]
+    );
+    assert_eq!(
+        dispatch(&mut index, "src/Service/ParameterSender.php"),
+        [
+            named("PingHandler.php", "__invoke"),
+            named("QueryHandler.php", "__invoke")
+        ]
+    );
+    // `$bus` names no bus: the default one.
+    assert_eq!(
+        dispatch(&mut index, "src/Service/Sender.php"),
+        [
+            named("CommandHandler.php", "__invoke"),
+            named("PingHandler.php", "__invoke")
+        ]
+    );
+    let query = handler_definitions(
+        &mut index,
+        &root,
+        "src/Handler/QueryHandler.php",
+        "__invoke",
+    );
+    assert!(
+        query.iter().all(|(file, _)| file != "Sender.php"),
+        "{query:?}"
+    );
+    assert!(
+        query.contains(&named("QuerySender.php", "dispatch")),
+        "{query:?}"
+    );
+}
+
+#[test]
+fn buses_the_module_cannot_tell_keep_every_handler() {
+    let (_dir, root) = bus_symfony();
+    let mut index = auto(&root);
+    for file in [
+        "src/Service/AssignedSender.php",
+        "src/Service/TargetSender.php",
+    ] {
+        assert_eq!(
+            handler_definitions(&mut index, &root, file, "dispatch("),
+            [
+                named("CommandHandler.php", "__invoke"),
+                named("PingHandler.php", "__invoke"),
+                named("QueryHandler.php", "__invoke")
+            ],
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn handlers_without_bus_stay_listed() {
+    let (_dir, root) = bus_symfony();
+    let mut index = auto(&root);
+    let all = handler_definitions(&mut index, &root, "src/Handler/PingHandler.php", "__invoke");
+    for file in ["QuerySender.php", "Sender.php", "AssignedSender.php"] {
+        assert!(all.contains(&named(file, "dispatch")), "{file} {all:?}");
+    }
+}

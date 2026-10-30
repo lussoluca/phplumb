@@ -15,11 +15,13 @@ use crate::summary::{Declaration, Member, MemberKind, SymbolKind};
 /// The attribute that marks a message handler.
 const HANDLER_ATTRIBUTE: &str = "Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler";
 
-/// A handler method, its name and the message classes it handles.
+/// A handler method, its name, the message classes it handles, and the bus it is
+/// limited to.
 struct Handler {
     location: Location,
     name: String,
     handles: Vec<String>,
+    bus: Option<String>,
 }
 
 #[derive(Default)]
@@ -94,7 +96,8 @@ impl Handlers {
             .iter()
             .find(|(_, _, m)| m.name.eq_ignore_ascii_case(name))
         {
-            self.add(file, method, attribute("handles").map(str::to_string));
+            let handles = attribute("handles").map(str::to_string);
+            self.add(file, method, handles, attribute("bus").map(str::to_string));
         }
     }
 
@@ -133,13 +136,18 @@ impl Handlers {
             Some(_) => return,
             None => None,
         };
-        self.add(path, method, handles);
+        let bus = match argument(attribute, "bus", 0) {
+            Some(MetaValue::String(bus)) => Some(bus.clone()),
+            Some(MetaValue::Null) | None => None,
+            Some(_) => return,
+        };
+        self.add(path, method, handles, bus);
     }
 
     /// The handler `method`, handling the class `handles` names or the classes of
-    /// its first parameter's declared type, as `MessengerPass` reads it. Symfony
-    /// registers public methods only.
-    fn add(&mut self, path: &Path, method: &Member, handles: Option<String>) {
+    /// its first parameter's declared type, as `MessengerPass` reads it, on `bus`
+    /// or on every bus. Symfony registers public methods only.
+    fn add(&mut self, path: &Path, method: &Member, handles: Option<String>, bus: Option<String>) {
         if !is_public(method) {
             return;
         }
@@ -163,24 +171,45 @@ impl Handlers {
             },
             name: method.name.clone(),
             handles,
+            bus,
         });
     }
 
     /// The handlers whose handled class `message` is, extends or implements, or,
     /// for an interface or abstract class, one of its subtypes, each with its method
-    /// name.
-    pub(crate) fn of(&self, index: &Index, message: &str) -> Vec<(Location, String)> {
+    /// name; with a `bus`, those of other buses are left out.
+    pub(crate) fn of(
+        &self,
+        index: &Index,
+        message: &str,
+        bus: Option<&str>,
+    ) -> Vec<(Location, String)> {
         let mut found: Vec<(Location, String)> = Vec::new();
         for handler in &self.list {
-            let handles = handler
-                .handles
-                .iter()
-                .any(|class| may_carry(index, message, class));
+            let on_bus = match (&handler.bus, bus) {
+                (Some(own), Some(bus)) => own == bus,
+                _ => true,
+            };
+            let handles = on_bus
+                && handler
+                    .handles
+                    .iter()
+                    .any(|class| may_carry(index, message, class));
             if handles && !found.iter().any(|(known, _)| *known == handler.location) {
                 found.push((handler.location.clone(), handler.name.clone()));
             }
         }
         found
+    }
+
+    /// The bus of each handler of the method whose name starts at `start` in
+    /// `path`, none for one on every bus.
+    pub(crate) fn buses_of(&self, path: &Path, start: u32) -> Vec<Option<String>> {
+        self.list
+            .iter()
+            .filter(|handler| handler.location.path == path && handler.location.start == start)
+            .map(|handler| handler.bus.clone())
+            .collect()
     }
 
     /// The classes the handler method whose name starts at `start` in `path`
