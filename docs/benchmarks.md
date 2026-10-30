@@ -2,6 +2,10 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-30, batch I2 Doctrine mappings
+
+Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issue #52. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged.
+
 ## 2026-10-30, batch I1 Doctrine repositories
 
 Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #53, #54, #55 and #56. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged.

@@ -47,6 +47,7 @@ use crate::frameworks::{
 };
 use crate::generics::{array_element, element_type, entry_type, substitute, supertype_args};
 use crate::index::{Index, Location};
+use crate::metadata::MetaValue;
 use crate::phpdoc::{TypeExpr, array_of, parse_docblock, parse_type};
 use crate::summary::{
     FileSummary, Member, MemberKind, NameKind, NameRef, SymbolKind, pick_type, summarize,
@@ -194,6 +195,21 @@ pub(crate) fn attribute_strings(
         let Some(attribute_name) = summary.names.iter().find(|n| n.start == name_start) else {
             continue;
         };
+        let (holder, holder_type) = attribute_holder(summary, name_start);
+        let arguments: Vec<(Option<String>, MetaValue)> = list
+            .arguments
+            .iter()
+            .filter_map(|argument| match argument {
+                PartialArgument::Positional(argument) => {
+                    Some((None, attribute_value(summary, argument.value)))
+                }
+                PartialArgument::Named(argument) => Some((
+                    Some(String::from_utf8_lossy(argument.name.value).into_owned()),
+                    attribute_value(summary, argument.value),
+                )),
+                _ => None,
+            })
+            .collect();
         for (position, argument) in list.arguments.iter().enumerate() {
             let (key, value) = match argument {
                 PartialArgument::Positional(argument) => (None, argument.value),
@@ -217,12 +233,46 @@ pub(crate) fn attribute_strings(
                     position,
                     value: String::from_utf8_lossy(text).into_owned(),
                     start: span.start.offset + 1,
+                    holder: holder.clone(),
+                    holder_type: holder_type.clone(),
+                    arguments: arguments.clone(),
                 },
                 span.end.offset - 1,
             ));
         }
     }
     found
+}
+
+/// The class whose declaration, or one of whose members, holds `start`, and the
+/// declared type of the property that holds it.
+fn attribute_holder(summary: &FileSummary, start: u32) -> (Option<String>, Option<TypeExpr>) {
+    let Some(class) = summary.enclosing_class(start).and_then(|c| c.fqn.clone()) else {
+        return (None, None);
+    };
+    let property = summary
+        .declarations
+        .iter()
+        .filter(|d| d.fqn.eq_ignore_ascii_case(&class))
+        .filter_map(|d| d.class.as_ref())
+        .flat_map(|shape| &shape.members)
+        .find(|m| m.kind == MemberKind::Property && m.range.0 <= start && start <= m.range.1);
+    (Some(class), property.and_then(|m| m.ty.clone()))
+}
+
+/// The value of an attribute argument: a string literal, or `X::class` resolved
+/// through the file's names.
+fn attribute_value(summary: &FileSummary, value: &Expression<'_>) -> MetaValue {
+    match value {
+        Expression::Literal(Literal::String(literal)) => literal
+            .value
+            .map(|text| MetaValue::String(String::from_utf8_lossy(text).into_owned()))
+            .unwrap_or(MetaValue::Other),
+        Expression::Access(access) => class_offset(access)
+            .and_then(|at| summary.names.iter().find(|n| n.start == at))
+            .map_or(MetaValue::Other, |name| MetaValue::Class(name.fqn.clone())),
+        _ => MetaValue::Other,
+    }
 }
 
 /// A method call under the cursor: what it targets, its literal arguments and

@@ -27,6 +27,7 @@ use crate::frameworks::{
     Project, ReceiverName,
 };
 use crate::index::{Index, Location};
+use crate::metadata::MetaValue;
 use crate::phpdoc::TypeExpr;
 use crate::summary::{FileSummary, NameRef, RefKey, summarize};
 
@@ -209,6 +210,89 @@ fn definitions_of(files: &[PathBuf]) -> Definitions {
         }
     }
     definitions
+}
+
+/// Doctrine's association attributes, whose `targetEntity`, `inversedBy` and
+/// `mappedBy` name a class and properties.
+const ORM_ASSOCIATIONS: [&str; 4] = [
+    "Doctrine\\ORM\\Mapping\\ManyToOne",
+    "Doctrine\\ORM\\Mapping\\OneToMany",
+    "Doctrine\\ORM\\Mapping\\OneToOne",
+    "Doctrine\\ORM\\Mapping\\ManyToMany",
+];
+
+/// The class or property a string of a Doctrine association attribute names: the
+/// target entity, qualified with the entity's namespace, or a property of it for
+/// `inversedBy` and `mappedBy`. The target is the `targetEntity` argument, else
+/// the declared type of the property for a to-one association. A positional
+/// argument is named by the attribute class's constructor, whose order differs
+/// between ORM versions. None for other attributes.
+fn doctrine_attribute_targets(
+    index: &Index,
+    found: &AttributeString,
+) -> Option<Vec<(Location, String)>> {
+    if !ORM_ASSOCIATIONS
+        .iter()
+        .any(|attribute| found.attribute.eq_ignore_ascii_case(attribute))
+    {
+        return None;
+    }
+    let holder = found.holder.as_deref()?;
+    let parameters = constructor_parameters(index, &found.attribute);
+    let name_of = |key: Option<&str>, position: usize| -> Option<String> {
+        key.map(str::to_string)
+            .or_else(|| parameters.get(position).cloned())
+    };
+    let target_argument = found
+        .arguments
+        .iter()
+        .enumerate()
+        .find(|(position, (key, _))| {
+            name_of(key.as_deref(), *position).as_deref() == Some("targetEntity")
+        })
+        .map(|(_, (_, value))| value);
+    let to_one = found.attribute.ends_with("ToOne");
+    let target = match target_argument {
+        Some(MetaValue::Class(class)) => Some(class.clone()),
+        Some(MetaValue::String(class)) => Some(doctrine::qualify(holder, class)),
+        _ if to_one => found
+            .holder_type
+            .as_ref()
+            .and_then(|ty| crate::infer::class_names(ty).into_iter().next()),
+        _ => None,
+    };
+    Some(
+        match name_of(found.key.as_deref(), found.position).as_deref() {
+            Some("targetEntity") => class_targets(index, &doctrine::qualify(holder, &found.value)),
+            Some("inversedBy" | "mappedBy") => target
+                .map(|target| property_targets(index, &target, &found.value))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
+    )
+}
+
+/// The parameter names of `class`'s constructor, in order; none when the index
+/// lacks the class.
+fn constructor_parameters(index: &Index, class: &str) -> Vec<String> {
+    index
+        .classes_named(class)
+        .first()
+        .and_then(|found| found.declaration.class.as_ref())
+        .and_then(|shape| {
+            shape.members.iter().find(|member| {
+                member.kind == crate::summary::MemberKind::Method
+                    && member.name.eq_ignore_ascii_case("__construct")
+            })
+        })
+        .map(|constructor| {
+            constructor
+                .params
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The interface message buses are autowired by.
@@ -910,7 +994,13 @@ impl Symfony {
             self.bundles_key = key;
             self.bundle_definitions = OnceLock::new();
         }
-        self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
+        self.mappings = Mappings::read(
+            index,
+            &filter,
+            &self.mapping_files,
+            &files,
+            &self.config_files,
+        );
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);
         let tagged =
@@ -994,6 +1084,7 @@ impl Framework for Symfony {
             path.is_dir()
                 || path.extension().is_none()
                 || is_doctrine_xml(path)
+                || doctrine::is_doctrine_yaml(path)
                 || self.mapping_files.iter().any(|file| file.starts_with(path))
         });
         if mappings_moved {
@@ -1014,13 +1105,16 @@ impl Framework for Symfony {
     }
 
     /// `getRepository(X::class)` returns the repository the mappings declare for `X`,
-    /// when the index knows that class.
+    /// when the index knows that class; `getRepository('Alias:X')` does for `X` in
+    /// the alias's namespace.
     fn call_type(&self, index: &Index, call: &FrameworkCall<'_>) -> Option<TypeExpr> {
         if !calls_one_of(index, call, &REPOSITORY_METHODS) {
             return None;
         }
-        let entity = call.strings.first()?.as_deref()?;
-        let repository = self.mappings.repository_for(index, entity)?;
+        let entity = self
+            .mappings
+            .entity_named(call.strings.first()?.as_deref()?)?;
+        let repository = self.mappings.repository_for(index, &entity)?;
         index
             .has_class(repository)
             .then(|| TypeExpr::Named(repository.to_string()))
@@ -1087,6 +1181,9 @@ impl Framework for Symfony {
                 Some(4) => self.parameter_locations(index, &found.value),
                 _ => Vec::new(),
             };
+        }
+        if let Some(targets) = doctrine_attribute_targets(index, found) {
+            return targets;
         }
         let template = found.key.as_deref() == Some("template") || first;
         if found.attribute.eq_ignore_ascii_case(TEMPLATE_ATTRIBUTE) && template {
@@ -1180,6 +1277,20 @@ impl Framework for Symfony {
         source: &[u8],
         offset: u32,
     ) -> Vec<(Location, String)> {
+        if doctrine::is_doctrine_yaml(path) {
+            let named = std::str::from_utf8(source)
+                .ok()
+                .and_then(yaml::parse)
+                .and_then(|root| doctrine::yaml_named_at(&root, offset));
+            // Other class names in the mapping open as in any YAML file.
+            match named {
+                Some(doctrine::Named::Class(class)) => return class_targets(index, &class),
+                Some(doctrine::Named::Property(class, property)) => {
+                    return property_targets(index, &class, &property);
+                }
+                None => {}
+            }
+        }
         if crate::filter::is_yaml(path) {
             return self.yaml_targets(index, path, source, offset);
         }

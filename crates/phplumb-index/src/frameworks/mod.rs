@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::diagnostics::Diagnostic;
 use crate::filter::PHP_EXTENSION;
 use crate::index::{Index, Location};
-use crate::metadata::Metadata;
+use crate::metadata::{MetaValue, Metadata};
 use crate::phpdoc::TypeExpr;
 use crate::summary::{Declaration, FileSummary, Member, NameRef, RefKey};
 
@@ -133,6 +133,12 @@ pub struct AttributeString {
     pub value: String,
     /// Where the value starts, inside the quotes.
     pub start: u32,
+    /// The class whose declaration, or one of whose members, carries the attribute.
+    pub holder: Option<String>,
+    /// The declared type of the property the attribute is on.
+    pub holder_type: Option<TypeExpr>,
+    /// All the attribute's arguments.
+    pub arguments: Vec<(Option<String>, MetaValue)>,
 }
 
 /// A method call found in the index, with its literal arguments.
