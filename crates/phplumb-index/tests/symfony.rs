@@ -1678,3 +1678,122 @@ fn concrete_messages_skip_handlers_of_subclasses() {
         )]
     );
 }
+
+#[test]
+fn bare_class_handler_attributes_list_their_dispatches() {
+    let mut index = build();
+    assert_eq!(
+        lines_of(
+            &mut index,
+            "src/Handler/SendEmailHandler.php",
+            8,
+            "AsMessageHandler"
+        ),
+        lines_of(
+            &mut index,
+            "src/Handler/SendEmailHandler.php",
+            11,
+            "__invoke"
+        )
+    );
+}
+
+#[test]
+fn bare_attributes_without_dispatches_open_their_class() {
+    let mut index = build();
+    assert_eq!(
+        definition_on_line(
+            &mut index,
+            "src/Handler/BaseHandler.php",
+            8,
+            "AsMessageHandler"
+        ),
+        [pair(
+            "vendor/symfony/messenger/Attribute/AsMessageHandler.php",
+            "AsMessageHandler"
+        )]
+    );
+}
+
+/// Go to definition at `needle` on line `line` of `file` in the copy at `root`,
+/// as (path relative to `root`, text) pairs sorted.
+fn definitions_in_copy(
+    index: &mut Index,
+    root: &Path,
+    file: &str,
+    line: usize,
+    needle: &str,
+) -> Vec<(String, String)> {
+    let path = root.join(file);
+    let source = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&source).into_owned();
+    let line_start: usize = text
+        .split_inclusive('\n')
+        .take(line - 1)
+        .map(str::len)
+        .sum();
+    let offset = (line_start + text[line_start..].find(needle).unwrap() + 1) as u32;
+    let mut found: Vec<(String, String)> = index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| {
+            let content = std::fs::read(&location.path).unwrap();
+            let relative = location.path.strip_prefix(root).unwrap_or(&location.path);
+            (
+                relative.display().to_string(),
+                String::from_utf8_lossy(&content[location.start as usize..location.end as usize])
+                    .into_owned(),
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn dispatch_on_other_objects_lists_nothing() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "src/Service/Events.php",
+        "<?php\n\nnamespace App\\Service;\n\nuse App\\Message\\SendEmail;\n\nfinal class Events\n{\n    public function fire(): void\n    {\n        $this->dispatch(new SendEmail());\n    }\n\n    public function dispatch(object $event): void\n    {\n    }\n}\n",
+    );
+
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, "src/Service/Events.php", 11, "dispatch"),
+        [pair("src/Service/Events.php", "dispatch")]
+    );
+    let handler = "src/Handler/SendEmailHandler.php";
+    let dispatches = definitions_in_copy(&mut index, &root, handler, 11, "__invoke");
+    assert!(
+        dispatches
+            .iter()
+            .all(|(path, _)| path != "src/Service/Events.php"),
+        "{dispatches:?}"
+    );
+}
+
+#[test]
+fn multi_line_and_null_safe_dispatches_list_their_handlers() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "src/Service/Multi.php",
+        "<?php\n\nnamespace App\\Service;\n\nuse App\\Message\\SendEmail;\nuse App\\Message\\SendSms;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\n\nfinal class Multi\n{\n    public function __construct(private ?MessageBusInterface $bus)\n    {\n    }\n\n    public function run(): void\n    {\n        $this->bus\n            ->dispatch(\n                new SendEmail()\n            );\n        $this->bus?->dispatch(new SendSms());\n    }\n}\n",
+    );
+    let messages = "src/Controller/MessagesController.php";
+    let multi = "src/Service/Multi.php";
+
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, multi, 18, "dispatch"),
+        definitions_in_copy(&mut index, &root, messages, 19, "dispatch")
+    );
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, multi, 21, "dispatch"),
+        definitions_in_copy(&mut index, &root, messages, 20, "dispatch")
+    );
+    let explicit = definitions_in_copy(&mut index, &root, "src/Handler/Explicit.php", 11, "run");
+    assert!(explicit.contains(&pair(multi, "dispatch")), "{explicit:?}");
+}
