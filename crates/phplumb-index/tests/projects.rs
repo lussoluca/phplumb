@@ -2189,3 +2189,152 @@ fn handlers_without_bus_stay_listed() {
         assert!(all.contains(&named(file, "dispatch")), "{file} {all:?}");
     }
 }
+
+const QUERY_BUS: &str = "<?php\nnamespace App\\Bus;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\ninterface QueryBus extends MessageBusInterface\n{\n}\n";
+
+fn sender_class(name: &str, body: &str) -> String {
+    format!(
+        "<?php\nnamespace App\\Service;\nuse App\\Bus\\QueryBus;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nfinal class {name}\n{{\n{body}\n}}\n"
+    )
+}
+
+/// The handlers of the `dispatch(` in `sender`, on `bus_symfony` with `files`.
+fn bus_case(files: &[(&str, String)], sender: &str) -> Vec<(String, String)> {
+    let (_dir, root) = bus_symfony();
+    for (file, content) in files {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let mut index = auto(&root);
+    handler_definitions(&mut index, &root, sender, "dispatch(")
+}
+
+fn every_handler() -> Vec<(String, String)> {
+    vec![
+        named("CommandHandler.php", "__invoke"),
+        named("PingHandler.php", "__invoke"),
+        named("QueryHandler.php", "__invoke"),
+    ]
+}
+
+#[test]
+fn unread_messenger_configuration_keeps_every_handler() {
+    let found = bus_case(
+        &[(
+            "config/packages/messenger.php",
+            "<?php\nreturn static function (): void {};\n".to_string(),
+        )],
+        "src/Service/QuerySender.php",
+    );
+    assert_eq!(found, every_handler());
+    let found = bus_case(
+        &[(
+            "config/packages/messenger.yaml",
+            format!(
+                "{BUSES}\nwhen@test:\n    framework:\n        messenger:\n            default_bus: query.bus\n"
+            ),
+        )],
+        "src/Service/Sender.php",
+    );
+    assert_eq!(found, every_handler());
+}
+
+#[test]
+fn bus_constants_and_parsed_names_are_read() {
+    let constant = bus_case(
+        &[
+            (
+                "src/Bus/Buses.php",
+                "<?php\nnamespace App\\Bus;\nfinal class Buses\n{\n    public const QUERY = 'query.bus';\n}\n".to_string(),
+            ),
+            (
+                "src/Handler/QueryHandler.php",
+                "<?php\nnamespace App\\Handler;\nuse App\\Bus\\Buses;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\n#[AsMessageHandler(bus: Buses::QUERY)]\nfinal class QueryHandler\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n".to_string(),
+            ),
+        ],
+        "src/Service/QuerySender.php",
+    );
+    assert_eq!(
+        constant,
+        [
+            named("PingHandler.php", "__invoke"),
+            named("QueryHandler.php", "__invoke")
+        ]
+    );
+    let snake = bus_case(
+        &[(
+            "src/Service/SnakeSender.php",
+            sender_class(
+                "SnakeSender",
+                "    public function __construct(private MessageBusInterface $query_bus)\n    {\n    }\n\n    public function send(): void\n    {\n        $this->query_bus->dispatch(new Ping());\n    }",
+            ),
+        )],
+        "src/Service/SnakeSender.php",
+    );
+    assert_eq!(
+        snake,
+        [
+            named("PingHandler.php", "__invoke"),
+            named("QueryHandler.php", "__invoke")
+        ]
+    );
+}
+
+#[test]
+fn buses_symfony_does_not_autowire_by_name_stay_unknown() {
+    let cases = [
+        (
+            "HelperSender",
+            "    public function __construct(private MessageBusInterface $queryBus)\n    {\n    }\n\n    public function run(): void\n    {\n        $this->send($this->queryBus);\n    }\n\n    private function send(MessageBusInterface $bus): void\n    {\n        $bus->dispatch(new Ping());\n    }",
+        ),
+        (
+            "TypedSender",
+            "    public function __construct(private QueryBus $bus)\n    {\n    }\n\n    public function send(): void\n    {\n        $this->bus->dispatch(new Ping());\n    }",
+        ),
+        (
+            "SwappedSender",
+            "    private MessageBusInterface $bus;\n\n    public function __construct(MessageBusInterface $bus, MessageBusInterface $queryBus)\n    {\n        $this->bus = $queryBus;\n    }\n\n    public function send(): void\n    {\n        $this->bus->dispatch(new Ping());\n    }",
+        ),
+    ];
+    for (name, body) in cases {
+        let file = format!("src/Service/{name}.php");
+        let found = bus_case(
+            &[
+                ("src/Bus/QueryBus.php", QUERY_BUS.to_string()),
+                (file.as_str(), sender_class(name, body)),
+            ],
+            &file,
+        );
+        assert_eq!(found, every_handler(), "{name}");
+    }
+    let bound = bus_case(
+        &[(
+            "config/services.yaml",
+            "parameters:\n    app.name: x\n\nservices:\n    _defaults:\n        bind:\n            $bus: '@query.bus'\n".to_string(),
+        )],
+        "src/Service/Sender.php",
+    );
+    assert_eq!(bound, every_handler());
+}
+
+#[test]
+fn prototype_tags_make_handlers() {
+    let found = bus_case(
+        &[
+            (
+                "config/services.yaml",
+                "parameters:\n    app.name: x\n\nservices:\n    App\\Tagged\\:\n        resource: '../src/Tagged/'\n        tags: [messenger.message_handler]\n".to_string(),
+            ),
+            (
+                "src/Tagged/PrototypeHandler.php",
+                "<?php\nnamespace App\\Tagged;\nuse App\\Message\\Ping;\nfinal class PrototypeHandler\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n".to_string(),
+            ),
+        ],
+        "src/Service/Sender.php",
+    );
+    assert!(
+        found.contains(&named("PrototypeHandler.php", "__invoke")),
+        "{found:?}"
+    );
+}

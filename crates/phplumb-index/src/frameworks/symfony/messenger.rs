@@ -54,7 +54,22 @@ impl Handlers {
             }
         }
         for service in tagged {
-            if service.instanceof {
+            if let Some(resource) = &service.resource {
+                let namespace = format!("{}\\", service.class.trim_end_matches('\\'));
+                for (path, declaration) in index.declarations() {
+                    let in_namespace = declaration
+                        .fqn
+                        .get(..namespace.len())
+                        .is_some_and(|start| start.eq_ignore_ascii_case(&namespace));
+                    if declaration.kind == SymbolKind::Class
+                        && in_namespace
+                        && index.filter().under_root(path).starts_with(resource)
+                        && filter.in_scope(path)
+                    {
+                        handlers.read_tagged(index, path, declaration, &service.attributes);
+                    }
+                }
+            } else if service.instanceof {
                 for (path, declaration) in index.declarations() {
                     if declaration.kind == SymbolKind::Class
                         && filter.in_scope(path)
@@ -119,18 +134,27 @@ impl Handlers {
                 .iter()
                 .find(|(_, _, m)| m.name.eq_ignore_ascii_case(name))
             {
-                self.add_attributed(file, method, attribute);
+                self.add_attributed(index, &class.fqn, file, method, attribute);
             }
         }
-        for (file, _, method) in &methods {
+        for (file, owner, method) in &methods {
             for attribute in method.metadata.iter().filter(|m| is_handler(m)) {
-                self.add_attributed(file, method, attribute);
+                self.add_attributed(index, owner, file, method, attribute);
             }
         }
     }
 
-    /// The handler an `#[AsMessageHandler]` `attribute` makes of `method`.
-    fn add_attributed(&mut self, path: &Path, method: &Member, attribute: &Metadata) {
+    /// The handler an `#[AsMessageHandler]` `attribute` makes of `method`, `self::`
+    /// in it naming `owner`. A bus the module cannot read leaves the handler on
+    /// every bus.
+    fn add_attributed(
+        &mut self,
+        index: &Index,
+        owner: &str,
+        path: &Path,
+        method: &Member,
+        attribute: &Metadata,
+    ) {
         let handles = match argument(attribute, "handles", 2) {
             Some(MetaValue::Class(class) | MetaValue::String(class)) => Some(class.clone()),
             Some(_) => return,
@@ -138,8 +162,18 @@ impl Handlers {
         };
         let bus = match argument(attribute, "bus", 0) {
             Some(MetaValue::String(bus)) => Some(bus.clone()),
-            Some(MetaValue::Null) | None => None,
-            Some(_) => return,
+            Some(MetaValue::Constant { class, name }) => {
+                let class = if class == "self" {
+                    owner
+                } else {
+                    class.as_str()
+                };
+                index
+                    .find_member(class, MemberKind::Constant, name)
+                    .first()
+                    .and_then(|(_, member)| member.value.clone())
+            }
+            _ => None,
         };
         self.add(path, method, handles, bus);
     }
@@ -200,6 +234,13 @@ impl Handlers {
             }
         }
         found
+    }
+
+    /// The buses handlers are limited to.
+    pub(crate) fn buses(&self) -> impl Iterator<Item = &str> {
+        self.list
+            .iter()
+            .filter_map(|handler| handler.bus.as_deref())
     }
 
     /// The bus of each handler of the method whose name starts at `start` in

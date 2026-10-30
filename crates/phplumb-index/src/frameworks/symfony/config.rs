@@ -130,10 +130,10 @@ pub(crate) fn read_services(
 /// The bus Symfony adds when the configuration defines none.
 const DEFAULT_BUS: &str = "messenger.bus.default";
 
-/// The message buses the configuration files define under `framework.messenger`,
-/// also inside `when@<env>` blocks, and the default one: `default_bus`, or the only
-/// bus. Without buses, the one Symfony adds; none when several buses have no
-/// default.
+/// The message buses the configuration files define under `framework.messenger`
+/// and the default one: `default_bus`, or the only bus. Without buses, the one
+/// Symfony adds; none when several buses have no default, or when a `when@<env>`
+/// block changes them.
 pub(crate) fn buses(
     files: &[PathBuf],
     config_files: &ConfigFiles,
@@ -147,10 +147,15 @@ pub(crate) fn buses(
         let Some(root) = &parsed.yaml else {
             continue;
         };
-        for block in top_blocks(root) {
+        for (position, block) in top_blocks(root).into_iter().enumerate() {
             let Some(messenger) = block.get("framework").and_then(|f| f.get("messenger")) else {
                 continue;
             };
+            let changes_buses =
+                messenger.get("buses").is_some() || messenger.get("default_bus").is_some();
+            if position > 0 && changes_buses {
+                return None;
+            }
             if let Some(Yaml::Map(buses)) = messenger.get("buses") {
                 for name in buses.iter().filter_map(|(key, _)| key.text()) {
                     if !names.iter().any(|known| known == name) {
@@ -175,6 +180,9 @@ pub(crate) fn buses(
 pub(crate) struct Tagged {
     pub class: String,
     pub instanceof: bool,
+    /// For a prototype, the directory its `resource` loads, `class` being its
+    /// namespace.
+    pub resource: Option<PathBuf>,
     pub attributes: Vec<(String, String)>,
 }
 
@@ -215,9 +223,26 @@ pub(crate) fn tagged_services(
                             found.push(Tagged {
                                 class: class.trim_start_matches('\\').to_string(),
                                 instanceof: true,
+                                resource: None,
                                 attributes,
                             });
                         }
+                    }
+                    continue;
+                }
+                if let Some(resource) = value.get("resource").and_then(Yaml::text) {
+                    // A prototype: the classes of a namespace loaded from a directory.
+                    let namespace = value.get("namespace").and_then(Yaml::text).unwrap_or(id);
+                    let dir = file
+                        .parent()
+                        .map(|parent| normalize(&parent.join(resource)));
+                    for attributes in tags_of(value, tag) {
+                        found.push(Tagged {
+                            class: namespace.trim_start_matches('\\').to_string(),
+                            instanceof: false,
+                            resource: dir.clone(),
+                            attributes,
+                        });
                     }
                     continue;
                 }
@@ -230,6 +255,7 @@ pub(crate) fn tagged_services(
                     found.push(Tagged {
                         class: class.trim_start_matches('\\').to_string(),
                         instanceof: false,
+                        resource: None,
                         attributes,
                     });
                 }
@@ -237,6 +263,77 @@ pub(crate) fn tagged_services(
         }
     }
     found
+}
+
+/// `path` with `.` and `..` components resolved without touching the disk.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The argument names the configuration binds or passes by name, `$name` keys of
+/// `bind` and `arguments` maps, and the classes of services given `arguments` or
+/// `bind`, so an argument of theirs may be wired otherwise than by name.
+pub(crate) fn bindings(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+) -> (Vec<String>, Vec<String>) {
+    let mut names: Vec<String> = Vec::new();
+    let mut classes: Vec<String> = Vec::new();
+    for file in files {
+        let Some(parsed) = config_files.get(file) else {
+            continue;
+        };
+        let Some(root) = &parsed.yaml else {
+            continue;
+        };
+        for block in top_blocks(root) {
+            let Some(Yaml::Map(entries)) = block.get("services") else {
+                continue;
+            };
+            let mut services: Vec<(&str, &Yaml)> = Vec::new();
+            for (key, value) in entries {
+                let Some(id) = key.text() else {
+                    continue;
+                };
+                if id == "_instanceof" {
+                    if let Yaml::Map(types) = value {
+                        services.extend(types.iter().filter_map(|(k, v)| Some((k.text()?, v))));
+                    }
+                } else {
+                    services.push((id, value));
+                }
+            }
+            for (id, service) in services {
+                let mut wired = false;
+                for key in ["bind", "arguments"] {
+                    let Some(map) = service.get(key) else {
+                        continue;
+                    };
+                    wired = true;
+                    if let Yaml::Map(entries) = map {
+                        for name in entries.iter().filter_map(|(k, _)| k.text()) {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                if wired {
+                    let class = service.get("class").and_then(Yaml::text).unwrap_or(id);
+                    classes.push(class.trim_start_matches('\\').to_string());
+                }
+            }
+        }
+    }
+    (names, classes)
 }
 
 /// The attributes of each `tag` in the `tags` of `service`.
@@ -363,7 +460,13 @@ pub(crate) fn has_unread_configuration(
         .flatten()
         .flatten()
         .map(|entry| entry.path())
-        .any(|path| path.is_dir() || path.file_name().and_then(|n| n.to_str()).is_some_and(php));
+        .any(|path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            path.is_dir() || php(name) || name.ends_with(".yml") || name.ends_with(".xml")
+        });
     let imports = files.iter().any(|file| {
         config_files.get(file).is_some_and(|parsed| {
             parsed

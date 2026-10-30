@@ -101,6 +101,9 @@ const MESSAGE_CALLS: [(&str, &str, usize); 5] = [
     ),
 ];
 
+/// The interface message buses are autowired by.
+const MESSAGE_BUS: &str = "Symfony\\Component\\Messenger\\MessageBusInterface";
+
 /// The name of the argument Symfony autowires the bus `bus` to:
 /// `registerAliasForArgument()` turns `command.bus` into `commandBus`.
 fn bus_alias(bus: &str) -> String {
@@ -299,6 +302,9 @@ pub struct Symfony {
     handlers: Handlers,
     /// The message buses and the default one; none when they cannot be told.
     buses: Option<(Vec<String>, String)>,
+    /// The argument names the configuration binds, and the classes whose
+    /// arguments it wires.
+    bindings: (Vec<String>, Vec<String>),
     /// Parameter definitions, by name.
     parameters: HashMap<String, Vec<RouteTarget>>,
     /// Whether configuration the module does not read may define parameters.
@@ -435,9 +441,11 @@ impl Symfony {
     }
 
     /// The bus a call made on `receiver` from `caller` goes through, when the
-    /// module can tell: the receiver is a constructor parameter, promoted, or a
-    /// parameter of the calling method, without attributes, so Symfony autowires it
-    /// by name, to the bus with that name as its alias or else to the default bus.
+    /// module can tell: a promoted constructor property typed `MessageBusInterface`
+    /// without attributes, which Symfony autowires by name to the bus with that
+    /// alias or else to the default bus, or a parameter of the calling method named
+    /// like a bus alias; none when the configuration binds the name or wires the
+    /// class's arguments.
     fn bus_of(
         &self,
         index: &Index,
@@ -446,25 +454,52 @@ impl Symfony {
     ) -> Option<String> {
         let (buses, default) = self.buses.as_ref()?;
         let (class, method) = caller?.split_once("::")?;
-        let (function, name) = match receiver? {
-            ReceiverName::Property(name) => ("__construct", name),
-            ReceiverName::Variable(name) => (method, name),
+        let (function, name, property) = match receiver? {
+            ReceiverName::Property(name) => ("__construct", name, true),
+            ReceiverName::Variable(name) => (method, name, false),
         };
+        let (bound, wired) = &self.bindings;
+        if bound.iter().any(|key| key.ends_with(&format!("${name}")))
+            || wired.iter().any(|wired| wired.eq_ignore_ascii_case(class))
+        {
+            return None;
+        }
         let (found, member) = index
             .find_member(class, crate::summary::MemberKind::Method, function)
             .into_iter()
             .next()?;
+        let position = member.params.iter().position(|(param, _)| param == name)?;
+        let typed = member
+            .hints
+            .get(position)?
+            .as_ref()
+            .is_some_and(|hint| crate::infer::class_names(hint) == [MESSAGE_BUS]);
+        if !typed {
+            return None;
+        }
+        if property {
+            // Promoted: the property is declared by the constructor parameter.
+            let (_, declared) = index
+                .find_member(class, crate::summary::MemberKind::Property, name)
+                .into_iter()
+                .next()?;
+            if declared.range.0 < member.range.0 || declared.range.1 > member.range.1 {
+                return None;
+            }
+        }
         // The index keeps no signatures: the declaration is read from its file.
         let text = std::fs::read(found.path).ok()?;
         let (start, end) = member.range;
         let declaration = String::from_utf8_lossy(text.get(start as usize..end as usize)?);
-        if !member.params.iter().any(|(param, _)| param == name)
-            || parameter_has_attribute(&declaration, name)
-        {
+        if parameter_has_attribute(&declaration, name) {
             return None;
         }
-        let bus = buses.iter().find(|bus| bus_alias(bus) == *name);
-        Some(bus.unwrap_or(default).clone())
+        let alias = bus_alias(name);
+        match buses.iter().find(|bus| bus_alias(bus) == alias) {
+            Some(bus) => Some(bus.clone()),
+            None if property => Some(default.clone()),
+            None => None,
+        }
     }
 
     /// The calls of the project that send a message, `MESSAGE_CALLS`, whose message
@@ -486,22 +521,26 @@ impl Symfony {
                     strings: &call.strings,
                     receiver: Some(&call.receiver),
                 };
-                let bus = self.bus_of(index, call.receiver_name.as_ref(), call.caller.as_deref());
-                let on_bus = bus.is_none_or(|bus| {
-                    buses
-                        .iter()
-                        .any(|own| own.as_ref().is_none_or(|own| *own == bus))
-                });
-                on_bus
-                    && message_position(index, &found).is_some_and(|position| {
-                        messages(index, &call.arguments, &call.wrapped, position)
-                            .iter()
-                            .any(|message| {
-                                handled
+                // The bus is read only when a handler here is limited to one.
+                let on_bus = || {
+                    buses.iter().all(Option::is_none)
+                        || self
+                            .bus_of(index, call.receiver_name.as_ref(), call.caller.as_deref())
+                            .is_none_or(|bus| {
+                                buses
                                     .iter()
-                                    .any(|class| messenger::may_carry(index, message, class))
+                                    .any(|own| own.as_ref().is_none_or(|own| *own == bus))
                             })
-                    })
+                };
+                message_position(index, &found).is_some_and(|position| {
+                    messages(index, &call.arguments, &call.wrapped, position)
+                        .iter()
+                        .any(|message| {
+                            handled
+                                .iter()
+                                .any(|class| messenger::may_carry(index, message, class))
+                        })
+                }) && on_bus()
             })
             .map(|call| {
                 let name = call.targets.iter().find_map(|target| match target {
@@ -623,7 +662,16 @@ impl Symfony {
         let tagged =
             config::tagged_services(&files, &self.config_files, "messenger.message_handler");
         self.handlers = Handlers::read(index, &filter, &tagged);
-        self.buses = config::buses(&files, &self.config_files);
+        // Handlers limited to a bus the configuration does not define leave the buses
+        // unknown, as does configuration the module does not read.
+        self.buses = config::buses(&files, &self.config_files)
+            .filter(|_| !self.parameters_unknown)
+            .filter(|(names, _)| {
+                self.handlers
+                    .buses()
+                    .all(|bus| names.iter().any(|name| name == bus))
+            });
+        self.bindings = config::bindings(&files, &self.config_files);
     }
 }
 
@@ -791,7 +839,10 @@ impl Framework for Symfony {
         let Some(position) = message_position(index, call) else {
             return Vec::new();
         };
-        let bus = self.bus_of(index, arguments.receiver, arguments.caller);
+        let bus = match self.handlers.buses().next() {
+            Some(_) => self.bus_of(index, arguments.receiver, arguments.caller),
+            None => None,
+        };
         let mut found: Vec<(Location, String)> = Vec::new();
         for class in messages(index, arguments.types, arguments.wrapped, position) {
             for (location, name) in self.handlers.of(index, &class, bus.as_deref()) {
