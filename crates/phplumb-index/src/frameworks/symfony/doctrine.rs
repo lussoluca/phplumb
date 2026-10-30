@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::files::ConfigFiles;
 use crate::filter::{PathFilter, is_doctrine_xml};
+use crate::frameworks::yaml::{Step, Yaml, scalar_at};
 use crate::index::Index;
 use crate::metadata::MetaValue;
 use crate::summary::SymbolKind;
@@ -148,6 +149,60 @@ const ASSOCIATION_PARTS: [&str; 8] = [
     "order-by-field",
 ];
 
+/// Whether `path` is a Doctrine YAML mapping file.
+pub(crate) fn is_doctrine_yaml(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|n| n.ends_with(".orm.yml") || n.ends_with(".orm.yaml"))
+}
+
+/// The association keys of a YAML mapping.
+const YAML_ASSOCIATIONS: [&str; 4] = ["manyToOne", "oneToMany", "oneToOne", "manyToMany"];
+
+/// The class or property the scalar under `offset` of a YAML mapping file names,
+/// as `named_at` reads XML mappings.
+pub(crate) fn yaml_named_at(root: &Yaml, offset: u32) -> Option<Named> {
+    let (steps, Yaml::Scalar { value, .. }) = scalar_at(root, offset)? else {
+        return None;
+    };
+    let itself = steps.last() == Some(&Step::KeyItself);
+    let keys: Vec<&str> = steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Key(key) => Some(*key),
+            _ => None,
+        })
+        .collect();
+    let entity = |name: &str| name.trim_start_matches('\\').to_string();
+    match (keys.as_slice(), itself) {
+        ([], true) => Some(Named::Class(entity(value))),
+        ([mapped, "repositoryClass"], false) => Some(Named::Class(qualify(mapped, value))),
+        ([mapped, section], true)
+            if matches!(*section, "fields" | "id" | "embedded")
+                || YAML_ASSOCIATIONS.contains(section) =>
+        {
+            Some(Named::Property(entity(mapped), value.clone()))
+        }
+        ([mapped, section, _, "targetEntity"], false) if YAML_ASSOCIATIONS.contains(section) => {
+            Some(Named::Class(qualify(mapped, value)))
+        }
+        ([mapped, "embedded", _, "class"], false) => Some(Named::Class(qualify(mapped, value))),
+        ([mapped, section, property, "inversedBy" | "mappedBy"], false)
+            if YAML_ASSOCIATIONS.contains(section) =>
+        {
+            let target = root
+                .get(mapped)?
+                .get(section)?
+                .get(property)?
+                .get("targetEntity")
+                .and_then(Yaml::text)?;
+            Some(Named::Property(qualify(mapped, target), value.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// What the attribute value under `offset` of a mapping file names.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Named {
@@ -258,6 +313,29 @@ impl Mappings {
             let Some(parsed) = config_files.get(file) else {
                 continue;
             };
+            if is_doctrine_yaml(file) {
+                // Each top-level key maps a class, its `type` saying how.
+                let Some(Yaml::Map(entries)) = &parsed.yaml else {
+                    continue;
+                };
+                for (key, mapping) in entries {
+                    let Some(class) = key.text() else {
+                        continue;
+                    };
+                    let found = match mapping.get("type").and_then(Yaml::text) {
+                        Some("entity") => &mut mappings.entities,
+                        Some("mappedSuperclass") => &mut mappings.superclasses,
+                        _ => continue,
+                    };
+                    let class = class.trim_start_matches('\\');
+                    let repository = mapping
+                        .get("repositoryClass")
+                        .and_then(Yaml::text)
+                        .map(|repository| qualify(class, repository));
+                    record(found, class, repository);
+                }
+                continue;
+            }
             for element in elements(&parsed.text) {
                 let found = match element.name.as_str() {
                     "entity" => &mut mappings.entities,
@@ -362,7 +440,7 @@ pub(crate) fn qualify(mapped: &str, name: &str) -> String {
 pub(crate) fn mapping_files(index: &Index, dir: &Path, filter: &PathFilter) -> Vec<PathBuf> {
     index
         .framework_files_under(dir)
-        .filter(|path| is_doctrine_xml(path) && filter.in_scope(path))
+        .filter(|path| (is_doctrine_xml(path) || is_doctrine_yaml(path)) && filter.in_scope(path))
         .filter(|path| {
             path.strip_prefix(dir)
                 .is_ok_and(|relative| !relative.starts_with("var"))

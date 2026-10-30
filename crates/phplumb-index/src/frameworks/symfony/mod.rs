@@ -1046,6 +1046,7 @@ impl Framework for Symfony {
             path.is_dir()
                 || path.extension().is_none()
                 || is_doctrine_xml(path)
+                || doctrine::is_doctrine_yaml(path)
                 || self.mapping_files.iter().any(|file| file.starts_with(path))
         });
         if mappings_moved {
@@ -1235,6 +1236,19 @@ impl Framework for Symfony {
         source: &[u8],
         offset: u32,
     ) -> Vec<(Location, String)> {
+        if doctrine::is_doctrine_yaml(path) {
+            let named = std::str::from_utf8(source)
+                .ok()
+                .and_then(yaml::parse)
+                .and_then(|root| doctrine::yaml_named_at(&root, offset));
+            return match named {
+                Some(doctrine::Named::Class(class)) => class_targets(index, &class),
+                Some(doctrine::Named::Property(class, property)) => {
+                    property_targets(index, &class, &property)
+                }
+                None => Vec::new(),
+            };
+        }
         if crate::filter::is_yaml(path) {
             return self.yaml_targets(index, path, source, offset);
         }

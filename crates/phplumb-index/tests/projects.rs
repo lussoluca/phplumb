@@ -3072,3 +3072,54 @@ fn association_attributes_lead_to_classes_and_properties() {
         ["Post.php:author"]
     );
 }
+
+const POST_YAML: &str = "App\\Entity\\Post:\n    type: entity\n    repositoryClass: App\\Repository\\PostRepository\n    fields:\n        title: { type: string }\n    manyToOne:\n        author:\n            targetEntity: Author\n            inversedBy: posts\n";
+
+#[test]
+fn yaml_mappings_navigate_and_type_repositories() {
+    for file in ["config/doctrine/Post.orm.yml", "mappings/Post.orm.yaml"] {
+        let (_dir, root) = doctrine_symfony(&[
+            (
+                "src/Entity/Post.php",
+                "<?php\nnamespace App\\Entity;\nclass Post\n{\n    private $title;\n    private $author;\n}\n",
+            ),
+            (
+                "src/Entity/Author.php",
+                "<?php\nnamespace App\\Entity;\nclass Author\n{\n    private $posts;\n}\n",
+            ),
+            (file, POST_YAML),
+        ]);
+        assert_eq!(find_recent(&root, 0), [REPOSITORY], "{file}");
+        let mut index = auto(&root);
+        let path = root.join(file);
+        let source = fs::read(&path).unwrap();
+        let text = String::from_utf8_lossy(&source).into_owned();
+        let mut at = |needle: &str| -> Vec<String> {
+            let offset = text.find(needle).unwrap() as u32 + 1;
+            index
+                .definition(&path, &source, offset)
+                .into_iter()
+                .map(|location| {
+                    let target = fs::read(&location.path).unwrap();
+                    format!(
+                        "{}:{}",
+                        location.path.file_name().unwrap().to_string_lossy(),
+                        String::from_utf8_lossy(
+                            &target[location.start as usize..location.end as usize]
+                        )
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(at("App\\Entity\\Post:"), ["Post.php:Post"], "{file}");
+        assert_eq!(
+            at("App\\Repository"),
+            ["PostRepository.php:PostRepository"],
+            "{file}"
+        );
+        assert_eq!(at("title:"), ["Post.php:title"], "{file}");
+        assert_eq!(at("author:"), ["Post.php:author"], "{file}");
+        assert_eq!(at("Author\n"), ["Author.php:Author"], "{file}");
+        assert_eq!(at("posts"), ["Author.php:posts"], "{file}");
+    }
+}
