@@ -1897,3 +1897,78 @@ fn handlers_under_a_symlinked_root_list_their_dispatches() {
         [named("PingHandler.php", "__invoke")]
     );
 }
+
+const WIDE: &str = "<?php\nnamespace App\\Service;\nuse App\\Message\\Sub\\Deep;\nuse App\\MessageX;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nfinal class Wide\n{\n    public function __construct(private MessageBusInterface $bus)\n    {\n    }\n\n    public function deep(): void\n    {\n        $this->bus->dispatch(new Deep());\n    }\n\n    public function other(): void\n    {\n        $this->bus->dispatch(new MessageX());\n    }\n}\n";
+
+fn wildcard_symfony(handles: &str) -> (TempDir, PathBuf) {
+    let handler = format!(
+        "<?php\nnamespace App\\Handler;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\nfinal class WideHandler\n{{\n    #[AsMessageHandler(handles: '{handles}')]\n    public function onAny(object $message): void\n    {{\n    }}\n}}\n"
+    );
+    let handler: &'static str = Box::leak(handler.into_boxed_str());
+    messenger_symfony(&[
+        (
+            "src/Message/Sub/Deep.php",
+            "<?php\nnamespace App\\Message\\Sub;\nfinal class Deep\n{\n}\n",
+        ),
+        (
+            "src/MessageX.php",
+            "<?php\nnamespace App;\nfinal class MessageX\n{\n}\n",
+        ),
+        ("src/Service/Wide.php", WIDE),
+        ("src/Handler/WideHandler.php", handler),
+    ])
+}
+
+#[test]
+fn wildcard_handlers_handle_every_message() {
+    let (_dir, root) = wildcard_symfony("*");
+    let mut index = auto(&root);
+
+    for needle in ["dispatch(new Deep", "dispatch(new MessageX"] {
+        assert!(
+            handler_definitions(&mut index, &root, "src/Service/Wide.php", needle)
+                .contains(&named("WideHandler.php", "onAny")),
+            "{needle}"
+        );
+    }
+    assert_eq!(
+        handler_definitions(&mut index, &root, "src/Handler/WideHandler.php", "onAny"),
+        [
+            named("Sender.php", "dispatch"),
+            named("Wide.php", "dispatch"),
+            named("Wide.php", "dispatch")
+        ]
+    );
+}
+
+#[test]
+fn namespace_wildcard_handlers_handle_their_namespace() {
+    let (_dir, root) = wildcard_symfony("App\\\\Message\\\\*");
+    let mut index = auto(&root);
+
+    assert_eq!(
+        handler_definitions(
+            &mut index,
+            &root,
+            "src/Service/Wide.php",
+            "dispatch(new Deep"
+        ),
+        [named("WideHandler.php", "onAny")]
+    );
+    assert!(
+        !handler_definitions(
+            &mut index,
+            &root,
+            "src/Service/Wide.php",
+            "dispatch(new MessageX"
+        )
+        .contains(&named("WideHandler.php", "onAny"))
+    );
+    assert_eq!(
+        handler_definitions(&mut index, &root, "src/Handler/WideHandler.php", "onAny"),
+        [
+            named("Sender.php", "dispatch"),
+            named("Wide.php", "dispatch")
+        ]
+    );
+}

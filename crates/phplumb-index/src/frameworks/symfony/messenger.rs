@@ -149,8 +149,18 @@ impl Handlers {
 
 /// Whether a message typed `message` may be an instance of `class`: `message` is,
 /// extends or implements it, or, being an interface or abstract class, is one of
-/// its supertypes.
+/// its supertypes. `class` may be a wildcard, `*` for every message and `Ns\*` for
+/// the classes of a namespace and those below it, as `HandlersLocator` lists them.
 pub(crate) fn may_carry(index: &Index, message: &str, class: &str) -> bool {
+    if class == "*" {
+        return true;
+    }
+    if let Some(namespace) = class.replace("\\\\", "\\").strip_suffix('*') {
+        return message.len() > namespace.len()
+            && message
+                .get(..namespace.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(namespace));
+    }
     is_a(index, message, &[class]) || (is_open(index, message) && is_a(index, class, &[message]))
 }
 
