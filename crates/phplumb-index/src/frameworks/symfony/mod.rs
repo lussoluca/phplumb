@@ -16,6 +16,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use crate::diagnostics::Diagnostic;
 use crate::filter::{is_doctrine_xml, is_yaml};
@@ -103,8 +104,8 @@ const MESSAGE_CALLS: [(&str, &str, usize); 5] = [
     ),
 ];
 
-/// What the PHP and XML files below `dirs` define, each file once, in path order.
-fn definitions_below(dirs: &[PathBuf]) -> Definitions {
+/// The files below `dirs`, each once, in path order.
+fn files_below(dirs: &[PathBuf]) -> Vec<PathBuf> {
     fn walk(dir: &Path, seen: &mut Vec<PathBuf>, found: &mut Vec<PathBuf>) {
         let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         if seen.contains(&real) {
@@ -131,6 +132,62 @@ fn definitions_below(dirs: &[PathBuf]) -> Definitions {
     for dir in dirs {
         walk(dir, &mut seen, &mut files);
     }
+    files
+}
+
+/// The PHP and XML configuration files of `config` the kernel loads:
+/// `packages/*` and `packages/<env>/*`, and `services.*` and `services_<env>.*`
+/// when there is no `services.yaml`.
+fn project_definition_files(config: &Path) -> Vec<PathBuf> {
+    let listed = |dir: &Path| -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        files.sort();
+        files
+    };
+    let packages = config.join("packages");
+    let mut files = listed(&packages);
+    let mut environments: Vec<PathBuf> = std::fs::read_dir(&packages)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    environments.sort();
+    for environment in environments {
+        files.extend(listed(&environment));
+    }
+    let yaml = ["services.yaml", "services.yml"]
+        .iter()
+        .any(|name| config.join(name).is_file());
+    if !yaml {
+        files.extend(listed(config).into_iter().filter(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem == "services" || stem.starts_with("services_"))
+        }));
+    }
+    files
+}
+
+/// When `config/bundles.php` and `composer.lock` of the project at `dir` last
+/// changed.
+fn bundles_key(dir: &Path) -> Option<(Option<SystemTime>, Option<SystemTime>)> {
+    let modified = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    Some((
+        modified(dir.join("config/bundles.php")),
+        modified(dir.join("composer.lock")),
+    ))
+}
+
+/// What the PHP and XML files among `files` define.
+fn definitions_of(files: &[PathBuf]) -> Definitions {
     let mut definitions = Definitions::default();
     for file in files {
         let extension = file
@@ -139,13 +196,13 @@ fn definitions_below(dirs: &[PathBuf]) -> Definitions {
             .map(str::to_ascii_lowercase);
         match extension.as_deref() {
             Some("php") => {
-                if let Ok(source) = std::fs::read(&file) {
-                    definitions.read_php(&file, &source);
+                if let Ok(source) = std::fs::read(file) {
+                    definitions.read_php(file, &source);
                 }
             }
             Some("xml") => {
-                if let Ok(text) = std::fs::read_to_string(&file) {
-                    definitions.read_xml(&file, &text);
+                if let Ok(text) = std::fs::read_to_string(file) {
+                    definitions.read_xml(file, &text);
                 }
             }
             _ => {}
@@ -251,6 +308,10 @@ fn messages(
 }
 
 /// Classes whose `setParameter()` defines a container parameter.
+/// The parameter bag, whose `set()` defines a parameter.
+const PARAMETER_BAG: &str =
+    "Symfony\\Component\\DependencyInjection\\ParameterBag\\ParameterBagInterface";
+
 const PARAMETER_HOLDERS: [&str; 4] = [
     "Symfony\\Component\\DependencyInjection\\Container",
     "Symfony\\Component\\DependencyInjection\\ContainerBuilder",
@@ -358,8 +419,11 @@ pub struct Symfony {
     /// The parameters, services and aliases of the project's PHP and XML
     /// configuration.
     definitions: Definitions,
-    /// Those of the bundles' configuration, read on the first lookup after a read.
+    /// Those of the bundles' configuration, read on the first lookup after the
+    /// bundles or the dependencies change.
     bundle_definitions: OnceLock<Definitions>,
+    /// When `config/bundles.php` and `composer.lock` last changed.
+    bundles_key: Option<(Option<SystemTime>, Option<SystemTime>)>,
     /// Each service alias and the service it stands for.
     aliases: HashMap<String, Vec<String>>,
     /// The argument names the configuration binds, and the classes whose
@@ -413,6 +477,12 @@ impl Symfony {
             || self.parameters.contains_key(name)
             || name.starts_with("kernel.")
             || name.starts_with("env(")
+        {
+            return false;
+        }
+        // Parameters PHP or XML configuration defines, the project's or a bundle's.
+        if self.definitions.parameters.contains_key(name)
+            || self.bundle_definitions(index).parameters.contains_key(name)
         {
             return false;
         }
@@ -470,9 +540,16 @@ impl Symfony {
                     for call in calls {
                         let (start, end) = (call.location.start, call.location.end);
                         let method = String::from_utf8_lossy(&source[start as usize..end as usize]);
+                        // A container's `set()` registers a service; a bag's sets a parameter.
+                        let setter = method.eq_ignore_ascii_case("setParameter");
+                        let holders: &[&str] = if setter {
+                            &PARAMETER_HOLDERS
+                        } else {
+                            &[PARAMETER_BAG]
+                        };
                         let holder = call.targets.iter().any(|target| {
                             matches!(target, CallTarget::Method { class, .. }
-                                if is_a(index, class, &PARAMETER_HOLDERS))
+                                if is_a(index, class, holders))
                         });
                         let unknown =
                             call.targets.is_empty() && method.eq_ignore_ascii_case("setParameter");
@@ -643,7 +720,7 @@ impl Symfony {
                 .flat_map(|dir| [dir.join("Resources/config"), dir.join("config")])
                 .filter(|dir| dir.is_dir())
                 .collect();
-            definitions_below(&dirs)
+            definitions_of(&files_below(&dirs))
         })
     }
 
@@ -660,7 +737,13 @@ impl Symfony {
                 found.extend(targets_of(defined));
             }
         }
-        found
+        let mut unique: Vec<(Location, String)> = Vec::new();
+        for target in found {
+            if !unique.contains(&target) {
+                unique.push(target);
+            }
+        }
+        unique
     }
 
     /// The definition of the service `id`, or the class when the id names one that no
@@ -814,8 +897,14 @@ impl Symfony {
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
         self.aliases = config::read_aliases(&files, &self.config_files);
-        self.definitions = definitions_below(&[self.project.dir.join("config")]);
-        self.bundle_definitions = OnceLock::new();
+        self.definitions =
+            definitions_of(&project_definition_files(&self.project.dir.join("config")));
+        // Bundle configuration changes with the bundles and the dependencies only.
+        let key = bundles_key(&self.project.dir);
+        if self.bundles_key != key {
+            self.bundles_key = key;
+            self.bundle_definitions = OnceLock::new();
+        }
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);

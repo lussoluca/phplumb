@@ -679,6 +679,23 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Vec<&'ast Assignment<'arena>>> for Varia
     }
 }
 
+/// Where the class `X::class` names starts, at `X`; none for another constant.
+fn class_offset(access: &Access<'_>) -> Option<u32> {
+    let Access::ClassConstant(access) = access else {
+        return None;
+    };
+    let ClassLikeConstantSelector::Identifier(name) = &access.constant else {
+        return None;
+    };
+    if !name.value.eq_ignore_ascii_case(b"class") {
+        return None;
+    }
+    match access.class {
+        Expression::Identifier(class) => Some(class.span().start.offset),
+        _ => None,
+    }
+}
+
 /// The parameters, services and aliases a PHP configurator file defines: `set()`
 /// on a chain from `parameters()` or `services()`, also through a variable assigned
 /// one, with a literal name or `X::class`, and `alias()` with two literal names.
@@ -700,9 +717,11 @@ pub(crate) fn configurator_definitions(source: &[u8]) -> ConfiguratorDefinitions
         Expression::Variable(Variable::Direct(variable)) => Some(variable.name.to_vec()),
         _ => None,
     };
-    // The configurator a chain ends on, past the variables assigned one.
-    let mut variables: Vec<(Vec<u8>, Configurator)> = Vec::new();
-    let chain = |mut expression: &Expression<'_>, variables: &[(Vec<u8>, Configurator)]| loop {
+    // The configurator a chain ends on, past the variables assigned one: a variable
+    // stands for its latest assignment before the use.
+    let mut variables: Vec<(Vec<u8>, Option<Configurator>, u32)> = Vec::new();
+    let chain = |mut expression: &Expression<'_>,
+                 variables: &[(Vec<u8>, Option<Configurator>, u32)]| loop {
         match expression {
             Expression::Call(Call::Method(call)) => match method_name(&call.method).as_deref() {
                 Some("parameters") => return Some(Configurator::Parameters),
@@ -710,20 +729,22 @@ pub(crate) fn configurator_definitions(source: &[u8]) -> ConfiguratorDefinitions
                 _ => expression = call.object,
             },
             Expression::Variable(Variable::Direct(variable)) => {
+                let at = variable.span.start.offset;
                 return variables
                     .iter()
-                    .find(|(name, _)| name.as_slice() == variable.name)
-                    .map(|(_, kind)| *kind);
+                    .filter(|(name, _, assigned)| {
+                        name.as_slice() == variable.name && *assigned < at
+                    })
+                    .max_by_key(|(_, _, assigned)| *assigned)
+                    .and_then(|(_, kind, _)| *kind);
             }
             _ => return None,
         }
     };
     for assignment in &assignments {
-        if let (Some(name), Some(kind)) = (
-            variable_name(assignment.lhs),
-            chain(assignment.rhs, &variables),
-        ) {
-            variables.push((name, kind));
+        if let Some(name) = variable_name(assignment.lhs) {
+            let kind = chain(assignment.rhs, &variables);
+            variables.push((name, kind, assignment.lhs.span().start.offset));
         }
     }
     let class_at = |offset: u32| {
@@ -739,10 +760,7 @@ pub(crate) fn configurator_definitions(source: &[u8]) -> ConfiguratorDefinitions
             let value = String::from_utf8_lossy(literal.value?).into_owned();
             Some((value, span.start.offset + 1, span.end.offset - 1))
         }
-        Expression::Access(Access::ClassConstant(access)) => match access.class {
-            Expression::Identifier(class) => class_at(class.span().start.offset),
-            _ => None,
-        },
+        Expression::Access(access) => class_at(class_offset(access)?),
         _ => None,
     };
     let mut found = ConfiguratorDefinitions::default();
@@ -962,23 +980,15 @@ pub(crate) fn php_routes(summary: &FileSummary, source: &[u8]) -> PhpRoutes {
                     Some(Expression::Literal(Literal::String(literal))) => literal
                         .value
                         .map(|v| String::from_utf8_lossy(v).into_owned()),
-                    Some(Expression::Access(Access::ClassConstant(access))) => match access.class {
-                        Expression::Identifier(class) => class_at(class.span().start.offset),
-                        _ => None,
-                    },
+                    Some(Expression::Access(access)) => class_offset(access).and_then(class_at),
                     Some(Expression::Array(array)) => {
                         let mut elements = array.elements.iter().filter_map(|e| match e {
                             ArrayElement::Value(e) => Some(e.value),
                             _ => None,
                         });
                         let class = match elements.next() {
-                            Some(Expression::Access(Access::ClassConstant(access))) => {
-                                match access.class {
-                                    Expression::Identifier(class) => {
-                                        class_at(class.span().start.offset)
-                                    }
-                                    _ => None,
-                                }
+                            Some(Expression::Access(access)) => {
+                                class_offset(access).and_then(class_at)
                             }
                             _ => None,
                         };

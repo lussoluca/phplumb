@@ -2497,7 +2497,7 @@ fn parameters_set_from_php_lead_to_their_call() {
 fn php_and_xml_configuration_define_targets() {
     let (_dir, root) = broken_symfony(&[
         (
-            "config/services.php",
+            "config/packages/app.php",
             "<?php\nreturn static function ($container): void {\n    $container->parameters()->set('app.nowhere', 1);\n    $container->services()->set('app.php_service', \\stdClass::class);\n};\n",
         ),
         (
@@ -2523,11 +2523,11 @@ fn php_and_xml_configuration_define_targets() {
 
     assert_eq!(
         at(&mut index, "src/Controller/Uses.php", "app.nowhere"),
-        [root.join("config/services.php")]
+        [root.join("config/packages/app.php")]
     );
     assert_eq!(
         at(&mut index, "config/packages/refs.yaml", "app.php_service"),
-        [root.join("config/services.php")]
+        [root.join("config/packages/app.php")]
     );
     assert_eq!(
         at(&mut index, "config/packages/refs.yaml", "app.xml_service"),
@@ -2617,4 +2617,99 @@ fn instanceof_and_bind_references_lead_to_their_definitions() {
         .map(|d| d.message)
         .collect();
     assert_eq!(messages, ["Undefined parameter 'app.missing'"]);
+}
+
+#[test]
+fn container_service_sets_are_no_parameters() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "lib/ContainerBuilder.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection;\nclass ContainerBuilder\n{\n    public function setParameter(string $name, mixed $value): void {}\n    public function set(string $id, ?object $service): void {}\n}\n",
+        ),
+        (
+            "src/Pass.php",
+            "<?php\nnamespace App;\nuse Symfony\\Component\\DependencyInjection\\ContainerBuilder;\nclass Pass\n{\n    public function process(ContainerBuilder $container): void\n    {\n        $container->setParameter('app.other', 1);\n        $container->set('app.nowhere', new \\stdClass());\n        $container->set(Pass::class, new \\stdClass());\n    }\n}\n",
+        ),
+    ]);
+    let mut index = auto(&root);
+    let path = root.join("src/Controller/Uses.php");
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source)
+        .find("app.nowhere")
+        .unwrap() as u32
+        + 1;
+
+    assert!(index.definition(&path, &source, offset).is_empty());
+    assert_eq!(broken_messages(&root), CERTAIN);
+}
+
+#[test]
+fn bundle_parameters_are_defined() {
+    // Without the configurator class, which in project code makes names unknown.
+    let routing = BUNDLE_SERVICES
+        .replace("ContainerConfigurator $container", "$container")
+        .replace(
+            "use Symfony\\Component\\DependencyInjection\\Loader\\Configurator\\ContainerConfigurator;\n",
+            "",
+        );
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/framework-bundle/Resources/config/routing.php",
+            routing.as_str(),
+        ),
+        (
+            "src/Controller/Uses.php",
+            "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->getParameter('router.request_context.host');\n        $this->getParameter('router.request_context.nowhere');\n    }\n}\n",
+        ),
+        (
+            "config/services.yaml",
+            "parameters:\n    router.request_context.scheme: https\n",
+        ),
+    ]);
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'router.request_context.nowhere'"]
+    );
+}
+
+#[test]
+fn php_services_files_beside_yaml_define_nothing() {
+    let (_dir, root) = broken_symfony(&[(
+        "config/services.php",
+        "<?php\nreturn static function ($container): void {\n    $container->parameters()->set('app.nowhere', 1);\n};\n",
+    )]);
+    let mut index = auto(&root);
+    let path = root.join("src/Controller/Uses.php");
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source)
+        .find("app.nowhere")
+        .unwrap() as u32
+        + 1;
+    assert!(index.definition(&path, &source, offset).is_empty());
+}
+
+#[test]
+fn configuration_read_twice_gives_each_target_once() {
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "config/bundles.php",
+            "<?php\nreturn [\n    App\\AppBundle::class => ['all' => true],\n];\n",
+        ),
+        (
+            "src/AppBundle.php",
+            "<?php\nnamespace App;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AppBundle extends AbstractBundle {}\n",
+        ),
+        (
+            "config/packages/app.php",
+            "<?php\nreturn static function ($container): void {\n    $container->parameters()->set('app.nowhere', 1);\n};\n",
+        ),
+    ]);
+    let mut index = auto(&root);
+    let path = root.join("src/Controller/Uses.php");
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source)
+        .find("app.nowhere")
+        .unwrap() as u32
+        + 1;
+    assert_eq!(index.definition(&path, &source, offset).len(), 1);
 }

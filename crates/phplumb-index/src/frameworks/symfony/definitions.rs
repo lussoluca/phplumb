@@ -130,6 +130,38 @@ return static function (ContainerConfigurator $container, string $name): void {
     }
 
     #[test]
+    fn constants_are_no_names() {
+        let source = br#"<?php
+use Acme\Ext;
+return static function ($container): void {
+    $container->services()
+        ->set(Ext::AUTHENTICATOR_ID, Ext::class)
+        ->alias(Ext::class, Ext::CLIENT_ID);
+};
+"#;
+        let mut found = Definitions::default();
+        found.read_php(Path::new("/c/services.php"), source);
+        assert!(found.services.is_empty());
+        assert!(found.aliases.is_empty());
+    }
+
+    #[test]
+    fn variables_take_their_latest_configurator() {
+        let source = br#"<?php
+return static function ($container): void {
+    $s = $container->parameters();
+    $s->set('app.p', 1);
+    $s = $container->services();
+    $s->set('app.svc', \stdClass::class);
+};
+"#;
+        let mut found = Definitions::default();
+        found.read_php(Path::new("/c/services.php"), source);
+        assert_eq!(names(&found.parameters), ["app.p"]);
+        assert_eq!(names(&found.services), ["app.svc"]);
+    }
+
+    #[test]
     fn reads_xml_service_files() {
         let text = r#"<container>
   <parameters><parameter key="app.x">1</parameter></parameters>
