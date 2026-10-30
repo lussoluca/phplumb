@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::bundles;
 use super::config::top_blocks;
+use super::doctrine::elements;
 use super::files::ConfigFiles;
 
 use crate::filter::{PathFilter, is_yaml};
@@ -41,8 +42,8 @@ const LOGOUT_LOADER: &str = "security.route_loader.logout";
 enum Import {
     /// Routes the module reads anyway: attribute routes of project code.
     Read,
-    /// YAML and PHP route files of the project, with the prefix the import and the
-    /// imports leading to it give their names.
+    /// YAML, XML and PHP route files, with the prefix the import and the imports
+    /// leading to it give their names.
     Files(Vec<PathBuf>, String),
     /// Attribute routes of project classes in a directory, or of one class, under
     /// the prefix the import and the imports leading to it give their names.
@@ -332,6 +333,8 @@ impl Routes {
         self.reading.push(real);
         if is_php(file) {
             self.read_php(sources.index, file, prefix);
+        } else if is_xml(file) {
+            self.read_xml(sources, file, prefix);
         } else {
             self.read_yaml(sources, file, prefix);
         }
@@ -382,24 +385,10 @@ impl Routes {
                 continue;
             };
             if value.get("resource").is_some() {
-                match import(sources, file, value, prefix) {
-                    Import::Read => {}
-                    Import::Symfony => self.symfony = true,
-                    Import::Logout => {
-                        // Other firewalls may come from configuration not read.
-                        self.symfony = true;
-                        self.read_logout(sources);
-                    }
-                    Import::Unknown => self.unknown = true,
-                    Import::Files(files, prefix) => {
-                        for imported in &files {
-                            self.read_file(sources, imported, &prefix);
-                        }
-                    }
-                    Import::Prefixed(resource, prefix) => {
-                        self.prefix_attribute_routes(&resource, &prefix)
-                    }
-                }
+                self.follow(
+                    sources,
+                    import(sources, file, &ImportSpec::of(value), prefix),
+                );
                 continue;
             }
             // A name prefix also prefixes the route an alias stands for.
@@ -434,6 +423,93 @@ impl Routes {
                 .and_then(Yaml::text);
             if let Some(target) = controller.and_then(|c| controller_target(sources.index, c)) {
                 self.add(full, target);
+            }
+        }
+    }
+
+    /// Reads what an import loads.
+    fn follow(&mut self, sources: &Sources, import: Import) {
+        match import {
+            Import::Read => {}
+            Import::Symfony => self.symfony = true,
+            Import::Logout => {
+                // Other firewalls may come from configuration not read.
+                self.symfony = true;
+                self.read_logout(sources);
+            }
+            Import::Unknown => self.unknown = true,
+            Import::Files(files, prefix) => {
+                for imported in &files {
+                    self.read_file(sources, imported, &prefix);
+                }
+            }
+            Import::Prefixed(resource, prefix) => self.prefix_attribute_routes(&resource, &prefix),
+        }
+    }
+
+    /// The routes of one XML route file, with `prefix` before their names: each
+    /// `<route id>`, also inside `<when>`, with its `controller` attribute or
+    /// `_controller` default, aliases, and imports read as in YAML files.
+    fn read_xml(&mut self, sources: &Sources, file: &Path, prefix: &str) {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            self.unknown = true;
+            return;
+        };
+        // The route whose child elements follow.
+        let mut route: Option<String> = None;
+        for element in elements(&text) {
+            match element.name.as_str() {
+                "route" => {
+                    route = None;
+                    let id = element.attributes.iter().find(|(key, ..)| key == "id");
+                    let Some((_, id, start, end)) = id else {
+                        self.unknown = true;
+                        continue;
+                    };
+                    let full = format!("{prefix}{id}");
+                    if let Some(alias) = element.attribute("alias") {
+                        self.aliases.push((full, format!("{prefix}{alias}")));
+                        continue;
+                    }
+                    self.add(
+                        full.clone(),
+                        RouteTarget {
+                            location: Location {
+                                path: file.to_path_buf(),
+                                start: *start,
+                                end: *end,
+                            },
+                            text: id.clone(),
+                        },
+                    );
+                    let controller = element.attribute("controller");
+                    if let Some(target) =
+                        controller.and_then(|c| controller_target(sources.index, c))
+                    {
+                        self.add(full.clone(), target);
+                    }
+                    route = Some(full);
+                }
+                "default" if element.attribute("key") == Some("_controller") => {
+                    let Some(full) = route.clone() else {
+                        continue;
+                    };
+                    let rest = &text[element.end as usize..];
+                    let controller = rest[..rest.find('<').unwrap_or(rest.len())].trim();
+                    if let Some(target) = controller_target(sources.index, controller) {
+                        self.add(full, target);
+                    }
+                }
+                "import" => {
+                    route = None;
+                    let spec = ImportSpec {
+                        resource: element.attribute("resource"),
+                        kind: element.attribute("type"),
+                        name_prefix: Some(element.attribute("name-prefix")),
+                    };
+                    self.follow(sources, import(sources, file, &spec, prefix));
+                }
+                _ => {}
             }
         }
     }
@@ -568,22 +644,41 @@ fn method_target(path: &Path, method: &Member) -> RouteTarget {
     }
 }
 
-/// What the import `value` of the route file `file`, read under the prefix `outer`,
+/// What a route import names: its resource, its `type`, and its name prefix,
+/// `Some(None)` when there is none and `None` when the module cannot read it.
+struct ImportSpec<'a> {
+    resource: Option<&'a str>,
+    kind: Option<&'a str>,
+    name_prefix: Option<Option<&'a str>>,
+}
+
+impl<'a> ImportSpec<'a> {
+    /// The import a YAML route file's entry `value` makes.
+    fn of(value: &'a Yaml) -> ImportSpec<'a> {
+        let resource = value.get("resource");
+        ImportSpec {
+            resource: resource
+                .and_then(Yaml::text)
+                .or_else(|| resource?.get("path")?.text()),
+            kind: value.get("type").and_then(Yaml::text),
+            name_prefix: match value.get("name_prefix") {
+                None => Some(None),
+                Some(prefix) => prefix.text().map(Some),
+            },
+        }
+    }
+}
+
+/// What the import `spec` of the route file `file`, read under the prefix `outer`,
 /// loads.
-fn import(sources: &Sources, file: &Path, value: &Yaml, outer: &str) -> Import {
+fn import(sources: &Sources, file: &Path, spec: &ImportSpec, outer: &str) -> Import {
     // A prefix the module cannot read leaves the imported names unknown.
-    let prefix = match value.get("name_prefix") {
-        None => outer.to_string(),
-        Some(prefix) => match prefix.text() {
-            Some(prefix) => format!("{outer}{prefix}"),
-            None => return Import::Unknown,
-        },
+    let prefix = match spec.name_prefix {
+        Some(None) => outer.to_string(),
+        Some(Some(prefix)) => format!("{outer}{prefix}"),
+        None => return Import::Unknown,
     };
-    let resource = value.get("resource");
-    let Some(resource) = resource
-        .and_then(Yaml::text)
-        .or_else(|| resource?.get("path")?.text())
-    else {
+    let Some(resource) = spec.resource else {
         return Import::Unknown;
     };
     if resource == "routing.controllers" {
@@ -600,7 +695,7 @@ fn import(sources: &Sources, file: &Path, value: &Yaml, outer: &str) -> Import {
             Import::Unknown
         };
     }
-    let kind = value.get("type").and_then(Yaml::text);
+    let kind = spec.kind;
     if let Some(bundled) = resource.strip_prefix('@') {
         // A bundle's routes the module cannot read: unknown, or Symfony's `_` names.
         let symfony = SYMFONY_RESOURCES.iter().any(|r| resource.starts_with(r));
@@ -613,7 +708,7 @@ fn import(sources: &Sources, file: &Path, value: &Yaml, outer: &str) -> Import {
             }
         };
         if resource.contains(['*', '?', '{', '['])
-            || kind.is_some_and(|k| !matches!(k, "yaml" | "php" | "directory"))
+            || kind.is_some_and(|k| !matches!(k, "yaml" | "xml" | "php" | "directory"))
         {
             return unread();
         }
@@ -662,7 +757,7 @@ fn import(sources: &Sources, file: &Path, value: &Yaml, outer: &str) -> Import {
             Import::Prefixed(attributes, prefix)
         };
     }
-    if !in_project || kind.is_some_and(|k| !matches!(k, "yaml" | "php" | "directory")) {
+    if !in_project || kind.is_some_and(|k| !matches!(k, "yaml" | "xml" | "php" | "directory")) {
         return Import::Unknown;
     }
     resource_files(&resolved).map_or(Import::Unknown, |files| Import::Files(files, prefix))
@@ -674,7 +769,7 @@ fn resource_files(path: &Path) -> Option<Vec<PathBuf>> {
     if path.is_dir() {
         return route_files_below(path);
     }
-    (path.is_file() && (is_yaml(path) || is_php(path))).then(|| vec![path.to_path_buf()])
+    (path.is_file() && is_route_file(path)).then(|| vec![path.to_path_buf()])
 }
 
 /// The route files below `dir`, as Symfony's directory loader imports them, in path
@@ -704,7 +799,7 @@ fn route_files_below(dir: &Path) -> Option<Vec<PathBuf>> {
         paths.iter().all(|path| {
             if path.is_dir() {
                 walk(path, seen, found)
-            } else if is_yaml(path) || is_php(path) {
+            } else if is_route_file(path) {
                 found.push(path.clone());
                 true
             } else {
@@ -714,6 +809,18 @@ fn route_files_below(dir: &Path) -> Option<Vec<PathBuf>> {
     }
     let mut found = Vec::new();
     walk(dir, &mut Vec::new(), &mut found).then_some(found)
+}
+
+/// Whether `path` is a route file the module reads: YAML, XML or PHP.
+fn is_route_file(path: &Path) -> bool {
+    is_yaml(path) || is_xml(path) || is_php(path)
+}
+
+/// Whether `path` is an XML file.
+fn is_xml(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("xml"))
 }
 
 /// Whether `path` is a PHP file.

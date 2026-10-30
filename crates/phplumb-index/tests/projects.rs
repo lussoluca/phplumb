@@ -1399,7 +1399,7 @@ fn directory_imports_with_unread_files_silence_route_diagnostics() {
             "config/routes.yaml",
             "home:\n    path: /\nlegacy:\n    resource: '../modules/legacy/'\n    type: directory\n",
         ),
-        ("modules/legacy/x.xml", "<routes/>\n"),
+        ("modules/legacy/x.txt", "routes\n"),
     ]);
 
     assert_eq!(
@@ -1549,6 +1549,75 @@ fn bundle_routes_lead_to_their_definitions() {
 
     assert_eq!(route_files_of(&index, "_preview_error"), ["_preview_error"]);
     assert!(route_missing(&index, "_missing"));
+}
+
+const BLOG_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<routes xmlns=\"http://symfony.com/schema/routing\">\n    <route id=\"blog_list\" path=\"/blog\" controller=\"App\\Controller\\Blog::list\"/>\n    <route id=\"blog_show\" path=\"/blog/{slug}\">\n        <default key=\"_controller\">App\\Controller\\Blog::show</default>\n    </route>\n    <when env=\"dev\">\n        <route id=\"blog_debug\" path=\"/debug\"/>\n    </when>\n    <route id=\"blog_old\" alias=\"blog_list\"/>\n    <import resource=\"admin.xml\" name-prefix=\"admin_\"/>\n</routes>\n";
+
+/// A Symfony project whose `config/routes.yaml` imports `config/blog/blog.xml`.
+fn xml_routed_symfony(blog: &str, files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let mut all = vec![
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nblog:\n    resource: blog/blog.xml\n",
+        ),
+        ("config/blog/blog.xml", blog),
+        (
+            "config/blog/admin.xml",
+            "<routes>\n    <route id=\"panel\" path=\"/admin\"/>\n</routes>\n",
+        ),
+        (
+            "src/Controller/Blog.php",
+            "<?php\nnamespace App\\Controller;\nclass Blog\n{\n    public function list(): void {}\n    public function show(): void {}\n}\n",
+        ),
+    ];
+    all.extend_from_slice(files);
+    broken_symfony(&all)
+}
+
+#[test]
+fn xml_route_files_define_routes() {
+    let (_dir, root) = xml_routed_symfony(BLOG_XML, &[]);
+    let index = auto(&root);
+    assert_eq!(route_files_of(&index, "blog_list"), ["blog_list", "list"]);
+    assert_eq!(route_files_of(&index, "blog_show"), ["blog_show", "show"]);
+    assert_eq!(route_files_of(&index, "blog_debug"), ["blog_debug"]);
+    assert_eq!(route_files_of(&index, "blog_old"), ["blog_list", "list"]);
+    assert_eq!(route_files_of(&index, "admin_panel"), ["panel"]);
+    assert!(route_files_of(&index, "panel").is_empty());
+    assert_eq!(broken_messages(&root), CERTAIN);
+}
+
+#[test]
+fn unreadable_xml_routes_stay_unknown() {
+    for import in [
+        "<import resource=\"../src/*.xml\"/>",
+        "<import resource=\"../src/Controller/\" type=\"annotation\"/>",
+    ] {
+        let blog = format!("<routes>\n    {import}\n</routes>\n");
+        let (_dir, root) = xml_routed_symfony(&blog, &[]);
+        assert_eq!(
+            broken_messages(&root),
+            ["Undefined parameter 'app.nowhere'"],
+            "{import}"
+        );
+    }
+}
+
+#[test]
+fn xml_bundle_route_imports_are_read() {
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/framework-bundle/Resources/config/routing/errors.xml",
+            "<routes>\n    <route id=\"_preview_error\" path=\"/{code}.{_format}\" controller=\"error_controller::preview\"/>\n</routes>\n",
+        ),
+        (
+            "config/routes/framework.yaml",
+            "when@dev:\n    _errors:\n        resource: '@FrameworkBundle/Resources/config/routing/errors.xml'\n        prefix: /_error\n",
+        ),
+    ]);
+    let index = auto(&root);
+    assert_eq!(route_files_of(&index, "_preview_error"), ["_preview_error"]);
+    assert!(route_missing(&index, "_nowhere"));
 }
 
 #[test]
