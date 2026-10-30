@@ -77,28 +77,64 @@ const REPOSITORY_METHODS: [(&str, &[&str]); 2] = [
     ("Doctrine\\Persistence\\ManagerRegistry", &["getRepository"]),
 ];
 
-/// The methods whose argument 0 is a message to handle: a bus's, and
-/// `HandleTrait`'s.
-const DISPATCH: [(&str, &[&str]); 2] = [
+/// The methods that send a message to its handlers, by declaring class, with the
+/// position of the message: a bus's `dispatch()`, `HandleTrait::handle()`, and the
+/// Scheduler's recurring messages.
+const MESSAGE_CALLS: [(&str, &str, usize); 5] = [
     (
         "Symfony\\Component\\Messenger\\MessageBusInterface",
-        &["dispatch"],
+        "dispatch",
+        0,
     ),
-    ("Symfony\\Component\\Messenger\\HandleTrait", &["handle"]),
+    ("Symfony\\Component\\Messenger\\HandleTrait", "handle", 0),
+    (
+        "Symfony\\Component\\Scheduler\\RecurringMessage",
+        "every",
+        1,
+    ),
+    ("Symfony\\Component\\Scheduler\\RecurringMessage", "cron", 1),
+    (
+        "Symfony\\Component\\Scheduler\\RecurringMessage",
+        "trigger",
+        1,
+    ),
 ];
+
+/// Lowercased names of the `MESSAGE_CALLS` methods.
+const MESSAGE_METHODS: [&str; 5] = ["dispatch", "handle", "every", "cron", "trigger"];
+
+/// The position of the message of `call`, when it is one of `MESSAGE_CALLS`.
+fn message_position(index: &Index, call: &FrameworkCall<'_>) -> Option<usize> {
+    call.targets.iter().find_map(|target| {
+        let CallTarget::Method { class, name } = target else {
+            return None;
+        };
+        MESSAGE_CALLS
+            .iter()
+            .find(|(owner, method, _)| {
+                method.eq_ignore_ascii_case(name) && is_a(index, class, &[owner])
+            })
+            .map(|(_, _, position)| *position)
+    })
+}
 
 /// The envelope a message may be dispatched in.
 const ENVELOPE: &str = "Symfony\\Component\\Messenger\\Envelope";
 
-/// The message classes a dispatch's first argument holds: the type of the message
+/// The message classes the argument at `position` holds: the type of the message
 /// an `Envelope` built in place wraps.
-fn messages(index: &Index, arguments: &[TypeExpr], wrapped: &[Option<TypeExpr>]) -> Vec<String> {
-    let Some(message) = arguments.first() else {
+fn messages(
+    index: &Index,
+    arguments: &[TypeExpr],
+    wrapped: &[Option<TypeExpr>],
+    position: usize,
+) -> Vec<String> {
+    let Some(message) = arguments.get(position) else {
         return Vec::new();
     };
     let classes = crate::infer::class_names(message);
     let enveloped = classes.iter().any(|class| is_a(index, class, &[ENVELOPE]));
-    match wrapped.first() {
+    match wrapped.get(position) {
         Some(Some(inner)) if enveloped => crate::infer::class_names(inner),
         _ => classes,
     }
@@ -342,12 +378,12 @@ impl Symfony {
         self.handlers.handled_by(path, start)
     }
 
-    /// The `dispatch()` and `HandleTrait::handle()` calls of the project whose
-    /// message may be one of `handled`, at their method name.
+    /// The calls of the project that send a message, `MESSAGE_CALLS`, whose message
+    /// may be one of `handled`, at their method name.
     fn dispatches(&self, index: &Index, handled: &[String]) -> Vec<(Location, String)> {
         let handled: Vec<&str> = handled.iter().map(String::as_str).collect();
         index
-            .calls_named(&["dispatch", "handle"], &self.project)
+            .calls_named(&MESSAGE_METHODS, &self.project)
             .into_iter()
             .filter(|call| {
                 let found = FrameworkCall {
@@ -355,14 +391,15 @@ impl Symfony {
                     strings: &call.strings,
                     receiver: Some(&call.receiver),
                 };
-                calls_one_of(index, &found, &DISPATCH)
-                    && messages(index, &call.arguments, &call.wrapped)
+                message_position(index, &found).is_some_and(|position| {
+                    messages(index, &call.arguments, &call.wrapped, position)
                         .iter()
                         .any(|message| {
                             handled
                                 .iter()
                                 .any(|class| messenger::may_carry(index, message, class))
                         })
+                })
             })
             .map(|call| {
                 let name = call.targets.iter().find_map(|target| match target {
@@ -562,7 +599,7 @@ impl Framework for Symfony {
     }
 
     fn targeted_methods(&self) -> &'static [&'static str] {
-        &["dispatch", "handle"]
+        &MESSAGE_METHODS
     }
 
     /// `getRepository(X::class)` returns the repository the mappings declare for `X`,
@@ -638,7 +675,8 @@ impl Framework for Symfony {
         Vec::new()
     }
 
-    /// A `dispatch()` on a message bus lists the handlers of its message.
+    /// A call that sends a message, such as `dispatch()` on a message bus, lists the
+    /// handlers of its message.
     fn call_targets(
         &self,
         index: &Index,
@@ -646,11 +684,11 @@ impl Framework for Symfony {
         arguments: &[TypeExpr],
         wrapped: &[Option<TypeExpr>],
     ) -> Vec<(Location, String)> {
-        if !calls_one_of(index, call, &DISPATCH) {
+        let Some(position) = message_position(index, call) else {
             return Vec::new();
-        }
+        };
         let mut found: Vec<(Location, String)> = Vec::new();
-        for class in messages(index, arguments, wrapped) {
+        for class in messages(index, arguments, wrapped, position) {
             for (location, name) in self.handlers.of(index, &class) {
                 if !found.iter().any(|(known, _)| *known == location) {
                     found.push((location, name));

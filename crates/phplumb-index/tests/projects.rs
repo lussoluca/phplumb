@@ -1972,3 +1972,31 @@ fn namespace_wildcard_handlers_handle_their_namespace() {
         ]
     );
 }
+
+const RECURRING_MESSAGE: &str = "<?php\nnamespace Symfony\\Component\\Scheduler;\nfinal class RecurringMessage\n{\n    public static function every(string $frequency, object $message): self { return new self(); }\n    public static function cron(string $expression, object $message): self { return new self(); }\n}\n";
+const SCHEDULE: &str = "<?php\nnamespace App\\Service;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Scheduler\\RecurringMessage;\nfinal class Schedule\n{\n    public function messages(): array\n    {\n        return [\n            RecurringMessage::every('1 minute', new Ping()),\n            RecurringMessage::cron(message: new Ping(), expression: '* * * * *'),\n        ];\n    }\n}\n";
+
+#[test]
+fn recurring_messages_reach_their_handlers() {
+    let (_dir, root) = messenger_symfony(&[
+        ("lib/RecurringMessage.php", RECURRING_MESSAGE),
+        ("src/Service/Schedule.php", SCHEDULE),
+    ]);
+    let mut index = auto(&root);
+
+    for needle in ["every(", "cron("] {
+        assert_eq!(
+            handler_definitions(&mut index, &root, "src/Service/Schedule.php", needle),
+            [named("PingHandler.php", "__invoke")],
+            "{needle}"
+        );
+    }
+    assert_eq!(
+        handler_definitions(&mut index, &root, "src/Handler/PingHandler.php", "__invoke"),
+        [
+            named("Schedule.php", "cron"),
+            named("Schedule.php", "every"),
+            named("Sender.php", "dispatch")
+        ]
+    );
+}

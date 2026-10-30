@@ -1759,6 +1759,13 @@ impl Index {
                 .unwrap_or_default();
         }
         if let Some(member) = summary.static_refs.iter().find(|r| covers(r.start, r.end)) {
+            // Only a definition request: a framework may answer for a static call too.
+            if declarations
+                && member.kind == MemberKind::Method
+                && let Some(found) = self.framework_call(path, &summary, source, offset)
+            {
+                return found;
+            }
             let anonymous = summary.enclosing_class(offset).filter(|r| r.fqn.is_none());
             if let (ClassSel::SelfKw | ClassSel::StaticKw, Some(range)) = (&member.class, anonymous)
             {

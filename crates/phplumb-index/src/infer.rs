@@ -231,8 +231,7 @@ pub(crate) struct CallAt {
     pub wrapped: Vec<Option<TypeExpr>>,
 }
 
-/// The method or null-safe call whose name holds `offset`; static calls resolve
-/// before this is asked.
+/// The method, null-safe or static call whose name holds `offset`.
 pub(crate) fn call_at(
     index: &Index,
     path: &Path,
