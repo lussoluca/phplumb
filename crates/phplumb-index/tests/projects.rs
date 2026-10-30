@@ -588,6 +588,49 @@ fn parameters_set_through_untyped_variables_are_known() {
 }
 
 #[test]
+fn exceptions_silence_only_their_try_blocks() {
+    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nuse Symfony\\Component\\Routing\\Exception\\RouteNotFoundException;\nuse Symfony\\Component\\DependencyInjection\\Exception\\ParameterNotFoundException;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->redirectToRoute('missing_route');\n        try {\n            $this->redirectToRoute('caught_route');\n        } catch (RouteNotFoundException $e) {\n        }\n        try {\n            $this->redirectToRoute('thrown_route');\n        } catch (\\Throwable $e) {\n        }\n        try {\n            $this->redirectToRoute('other_route');\n        } catch (ParameterNotFoundException $e) {\n        }\n        $this->getParameter('app.nowhere');\n        try {\n            $this->getParameter('app.caught');\n        } catch (\\Exception $e) {\n        }\n    }\n}\n";
+    let stubs = [
+        (
+            "lib/RouteNotFoundException.php",
+            "<?php\nnamespace Symfony\\Component\\Routing\\Exception;\nclass RouteNotFoundException extends \\InvalidArgumentException\n{\n}\n",
+        ),
+        (
+            "lib/ParameterNotFoundException.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Exception;\nclass ParameterNotFoundException extends \\InvalidArgumentException\n{\n}\n",
+        ),
+        (
+            "lib/UrlGenerator.php",
+            "<?php\nnamespace Symfony\\Component\\Routing\\Generator;\nclass UrlGenerator\n{\n}\n",
+        ),
+    ];
+    let project = |uses: &str| {
+        let mut all = stubs.to_vec();
+        all.push(("src/Controller/Uses.php", uses));
+        broken_symfony(&all)
+    };
+    let (_dir, root) = project(uses);
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined route 'other_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+    // A file that builds its own router may name its own routes.
+    let builder = uses.replace(
+        "use Symfony\\Component\\Routing\\Exception\\RouteNotFoundException;",
+        "use Symfony\\Component\\Routing\\Exception\\RouteNotFoundException;\nuse Symfony\\Component\\Routing\\Generator\\UrlGenerator;",
+    ).replace("    public function run(): void\n    {\n", "    public function run(): void\n    {\n        new UrlGenerator();\n");
+    let (_dir, root) = project(&builder);
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'app.nowhere'"]
+    );
+}
+
+#[test]
 fn unknown_route_imports_silence_route_diagnostics() {
     let (_dir, root) = broken_symfony(&[(
         "config/routes/acme.yaml",

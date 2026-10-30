@@ -10,28 +10,43 @@ use super::{
     TEMPLATE_METHODS, TemplateStatus, calls_one_of, config,
 };
 use crate::diagnostics::{Diagnostic, Severity};
+use crate::frameworks::ancestry::is_a;
 use crate::frameworks::yaml::{self, Yaml};
 use crate::frameworks::{FrameworkCall, mentions, mentions_member};
 use crate::index::Index;
 use crate::infer;
 use crate::summary::FileSummary;
 
-/// Classes that leave a file's names of one kind unchecked: the exception a
-/// missing route, template or parameter throws, which the file may catch, and the
-/// classes a file uses to build its own router or Twig environment, as tests do.
-const ROUTE_NOT_FOUND: [&str; 3] = [
-    "Symfony\\Component\\Routing\\Exception\\RouteNotFoundException",
+/// The exception a missing route, template or parameter throws: a call inside a
+/// `try` that catches it, or one of its ancestors, stays unchecked.
+const ROUTE_NOT_FOUND: &str = "Symfony\\Component\\Routing\\Exception\\RouteNotFoundException";
+const TEMPLATE_NOT_FOUND: &str = "Twig\\Error\\LoaderError";
+const PARAMETER_NOT_FOUND: &str =
+    "Symfony\\Component\\DependencyInjection\\Exception\\ParameterNotFoundException";
+
+/// The classes a file uses to build its own router or Twig environment, as tests
+/// do, which leave its route or template names unchecked.
+const ROUTER_BUILDERS: [&str; 2] = [
     "Symfony\\Component\\Routing\\Generator\\UrlGenerator",
     "Symfony\\Component\\Routing\\RouteCollection",
 ];
-const TEMPLATE_NOT_FOUND: [&str; 4] = [
-    "Twig\\Error\\LoaderError",
+const TWIG_BUILDERS: [&str; 3] = [
     "Twig\\Loader\\ArrayLoader",
     "Twig\\Loader\\ChainLoader",
     "Twig\\Loader\\FilesystemLoader",
 ];
-const PARAMETER_NOT_FOUND: [&str; 1] =
-    ["Symfony\\Component\\DependencyInjection\\Exception\\ParameterNotFoundException"];
+
+/// The classes every exception is: a `catch` of one catches anything.
+const ANY_EXCEPTION: [&str; 2] = ["Throwable", "Exception"];
+
+/// Whether a `catch` of `caught` catches `exception`.
+fn catches(index: &Index, caught: &str, exception: &str) -> bool {
+    caught.eq_ignore_ascii_case(exception)
+        || ANY_EXCEPTION
+            .iter()
+            .any(|any| caught.eq_ignore_ascii_case(any))
+        || is_a(index, exception, &[caught])
+}
 
 pub(super) fn find(
     symfony: &Symfony,
@@ -44,9 +59,21 @@ pub(super) fn find(
     if index.has_exclusions() {
         return Vec::new();
     }
-    let routes = !mentions(summary, &ROUTE_NOT_FOUND);
-    let templates = !mentions(summary, &TEMPLATE_NOT_FOUND);
-    let parameters = !mentions(summary, &PARAMETER_NOT_FOUND);
+    let routes = !mentions(summary, &ROUTER_BUILDERS);
+    let templates = !mentions(summary, &TWIG_BUILDERS);
+    let caught = if source.windows(5).any(|w| w.eq_ignore_ascii_case(b"catch")) {
+        infer::caught_ranges(source, summary)
+    } else {
+        Vec::new()
+    };
+    // Whether the call at `offset` sits in a `try` that catches `exception`.
+    let handled = |offset: u32, exception: &str| {
+        caught.iter().any(|(start, end, classes)| {
+            *start <= offset
+                && offset < *end
+                && classes.iter().any(|class| catches(index, class, exception))
+        })
+    };
     let names: Vec<&str> = ROUTE_METHODS
         .iter()
         .chain(&TEMPLATE_METHODS)
@@ -70,14 +97,22 @@ pub(super) fn find(
             receiver: Some(&call.receiver),
         };
         let calls = |methods: &[(&str, &[&str])]| calls_one_of(index, &framework, methods);
-        let message = if routes && calls(&ROUTE_METHODS) && symfony.route_missing(name) {
+        let at = range.0;
+        let message = if routes
+            && calls(&ROUTE_METHODS)
+            && !handled(at, ROUTE_NOT_FOUND)
+            && symfony.route_missing(name)
+        {
             format!("Undefined route '{name}'")
         } else if templates
             && calls(&TEMPLATE_METHODS)
+            && !handled(at, TEMPLATE_NOT_FOUND)
             && symfony.template_status(name) == TemplateStatus::Missing
         {
             format!("Undefined template '{name}'")
-        } else if parameters && calls(&PARAMETER_METHODS) && symfony.parameter_missing(index, name)
+        } else if calls(&PARAMETER_METHODS)
+            && !handled(at, PARAMETER_NOT_FOUND)
+            && symfony.parameter_missing(index, name)
         {
             format!("Undefined parameter '{name}'")
         } else {
@@ -93,7 +128,8 @@ pub(super) fn find(
     for (attribute, end) in attributes {
         let first = attribute.key.is_none() && attribute.position == 0;
         let key = attribute.key.as_deref();
-        if parameters && attribute.attribute.eq_ignore_ascii_case(AUTOWIRE_ATTRIBUTE) {
+        // The container resolves attribute parameters when it compiles: no `try` sees them.
+        if attribute.attribute.eq_ignore_ascii_case(AUTOWIRE_ATTRIBUTE) {
             if key == Some("param") && symfony.parameter_missing(index, &attribute.value) {
                 found.push(diagnostic(
                     (attribute.start, end),

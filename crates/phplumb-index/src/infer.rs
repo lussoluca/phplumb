@@ -1426,6 +1426,49 @@ enum CallRef<'ast, 'arena> {
     Static(&'ast StaticMethodCall<'arena>),
 }
 
+/// Each `try` body of `source` with the classes its `catch` clauses name, as
+/// `summary` resolves them.
+pub(crate) fn caught_ranges(source: &[u8], summary: &FileSummary) -> Vec<(u32, u32, Vec<String>)> {
+    let arena = LocalArena::new();
+    let program = parse_file_content(&arena, FileId::zero(), source);
+    let mut blocks: Vec<&Try<'_>> = Vec::new();
+    TryBlocks.walk_program(program, &mut blocks);
+    blocks
+        .into_iter()
+        .map(|r#try| {
+            let body = r#try.block.span();
+            let classes = r#try
+                .catch_clauses
+                .iter()
+                .flat_map(|clause| {
+                    let (start, end) = (
+                        clause.left_parenthesis.end.offset,
+                        clause.right_parenthesis.start.offset,
+                    );
+                    summary
+                        .names
+                        .iter()
+                        .filter(move |name| {
+                            name.kind == NameKind::ClassLike
+                                && start <= name.start
+                                && name.end <= end
+                        })
+                        .map(|name| name.fqn.clone())
+                })
+                .collect();
+            (body.start.offset, body.end.offset, classes)
+        })
+        .collect()
+}
+
+struct TryBlocks;
+
+impl<'ast, 'arena> Walker<'ast, 'arena, Vec<&'ast Try<'arena>>> for TryBlocks {
+    fn walk_in_try(&self, r#try: &'ast Try<'arena>, found: &mut Vec<&'ast Try<'arena>>) {
+        found.push(r#try);
+    }
+}
+
 struct CallsWithArguments;
 
 impl<'ast, 'arena> Walker<'ast, 'arena, Vec<CallRef<'ast, 'arena>>> for CallsWithArguments {
