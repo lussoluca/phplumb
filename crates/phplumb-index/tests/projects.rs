@@ -2713,3 +2713,134 @@ fn configuration_read_twice_gives_each_target_once() {
         + 1;
     assert_eq!(index.definition(&path, &source, offset).len(), 1);
 }
+
+const OBJECT_MANAGER: &str = "<?php\nnamespace Doctrine\\Persistence;\ninterface ObjectManager\n{\n    public function getRepository(string $className): ObjectRepository;\n}\n";
+const OBJECT_REPOSITORY: &str = "<?php\nnamespace Doctrine\\Persistence;\ninterface ObjectRepository\n{\n    public function find(mixed $id): ?object;\n}\n";
+const MANAGER_REGISTRY: &str = "<?php\nnamespace Doctrine\\Persistence;\ninterface ManagerRegistry\n{\n    public function getRepository(string $persistentObject, ?string $persistentManagerName = null): ObjectRepository;\n}\n";
+const ORM_ENTITY: &str = "<?php\nnamespace Doctrine\\ORM\\Mapping;\n#[\\Attribute]\nfinal class Entity\n{\n    public function __construct(?string $repositoryClass = null, bool $readOnly = false) {}\n}\n";
+const ORM_MAPPED_SUPERCLASS: &str = "<?php\nnamespace Doctrine\\ORM\\Mapping;\n#[\\Attribute]\nfinal class MappedSuperclass\n{\n    public function __construct(?string $repositoryClass = null) {}\n}\n";
+const POST_REPOSITORY: &str = "<?php\nnamespace App\\Repository;\nclass PostRepository\n{\n    public function findRecent(): array { return []; }\n}\n";
+const LOADER: &str = "<?php\nnamespace App\\Service;\nuse App\\Entity\\Post;\nuse Doctrine\\Persistence\\ManagerRegistry;\nuse Doctrine\\Persistence\\ObjectManager;\nfinal class Loader\n{\n    public function __construct(private ObjectManager $em, private ManagerRegistry $registry)\n    {\n    }\n\n    public function load(): void\n    {\n        $this->em->getRepository(Post::class)->findRecent();\n        $this->registry->getRepository(Post::class)->findRecent();\n    }\n}\n";
+
+/// A Symfony project with Doctrine's classes, `PostRepository`, a loader asking
+/// `getRepository(Post::class)` through an object manager and a registry, and
+/// `files`.
+fn doctrine_symfony(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let mut all = vec![
+        ("lib/ObjectManager.php", OBJECT_MANAGER),
+        ("lib/ObjectRepository.php", OBJECT_REPOSITORY),
+        ("lib/ManagerRegistry.php", MANAGER_REGISTRY),
+        ("lib/Entity.php", ORM_ENTITY),
+        ("lib/MappedSuperclass.php", ORM_MAPPED_SUPERCLASS),
+        ("src/Repository/PostRepository.php", POST_REPOSITORY),
+        ("src/Service/Loader.php", LOADER),
+    ];
+    all.extend_from_slice(files);
+    broken_symfony(&all)
+}
+
+/// Where `findRecent` of the `nth` `getRepository(Post::class)` call leads.
+fn find_recent(root: &Path, nth: usize) -> Vec<String> {
+    let mut index = auto(root);
+    let path = root.join("src/Service/Loader.php");
+    let source = fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&source).into_owned();
+    let offset = text.match_indices("findRecent").nth(nth).unwrap().0 as u32 + 1;
+    index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| {
+            location
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+const REPOSITORY: &str = "PostRepository.php";
+
+#[test]
+fn mapped_superclass_repositories_reach_their_entities() {
+    let xml = [
+        (
+            "config/doctrine/Base.orm.xml",
+            "<doctrine-mapping><mapped-superclass name=\"App\\Entity\\Base\" repository-class=\"App\\Repository\\PostRepository\"/></doctrine-mapping>\n",
+        ),
+        (
+            "config/doctrine/Post.orm.xml",
+            "<doctrine-mapping><entity name=\"App\\Entity\\Post\"/></doctrine-mapping>\n",
+        ),
+        (
+            "src/Entity/Base.php",
+            "<?php\nnamespace App\\Entity;\nabstract class Base\n{\n}\n",
+        ),
+        (
+            "src/Entity/Post.php",
+            "<?php\nnamespace App\\Entity;\nclass Post extends Base\n{\n}\n",
+        ),
+    ];
+    let (_dir, root) = doctrine_symfony(&xml);
+    assert_eq!(find_recent(&root, 0), [REPOSITORY]);
+
+    let attribute = [
+        (
+            "src/Entity/Base.php",
+            "<?php\nnamespace App\\Entity;\nuse App\\Repository\\PostRepository;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\MappedSuperclass(repositoryClass: PostRepository::class)]\nabstract class Base\n{\n}\n",
+        ),
+        (
+            "src/Entity/Post.php",
+            "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\Entity]\nclass Post extends Base\n{\n}\n",
+        ),
+    ];
+    let (_dir, root) = doctrine_symfony(&attribute);
+    assert_eq!(find_recent(&root, 0), [REPOSITORY]);
+
+    // A plain parent class declares no repository.
+    let plain = [
+        (
+            "src/Entity/Base.php",
+            "<?php\nnamespace App\\Entity;\nabstract class Base\n{\n}\n",
+        ),
+        (
+            "src/Entity/Post.php",
+            "<?php\nnamespace App\\Entity;\nclass Post extends Base\n{\n}\n",
+        ),
+    ];
+    let (_dir, root) = doctrine_symfony(&plain);
+    assert!(find_recent(&root, 0).is_empty());
+}
+
+#[test]
+fn positional_entity_repositories_are_read() {
+    let (_dir, root) = doctrine_symfony(&[(
+        "src/Entity/Post.php",
+        "<?php\nnamespace App\\Entity;\nuse App\\Repository\\PostRepository;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\Entity(PostRepository::class)]\nclass Post\n{\n}\n",
+    )]);
+    assert_eq!(find_recent(&root, 0), [REPOSITORY]);
+}
+
+#[test]
+fn annotation_repositories_are_read() {
+    let (_dir, root) = doctrine_symfony(&[(
+        "src/Entity/Post.php",
+        "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\n/**\n * @ORM\\Entity(repositoryClass=\"App\\Repository\\PostRepository\")\n */\nclass Post\n{\n}\n",
+    )]);
+    assert_eq!(find_recent(&root, 0), [REPOSITORY]);
+    let (_dir, root) = doctrine_symfony(&[(
+        "src/Entity/Post.php",
+        "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\n// @ORM\\Entity(repositoryClass=\"App\\Repository\\PostRepository\")\nclass Post\n{\n}\n",
+    )]);
+    assert!(find_recent(&root, 0).is_empty());
+}
+
+#[test]
+fn manager_registry_repositories_are_typed() {
+    let (_dir, root) = doctrine_symfony(&[(
+        "src/Entity/Post.php",
+        "<?php\nnamespace App\\Entity;\nuse App\\Repository\\PostRepository;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\Entity(repositoryClass: PostRepository::class)]\nclass Post\n{\n}\n",
+    )]);
+    assert_eq!(find_recent(&root, 1), [REPOSITORY]);
+}

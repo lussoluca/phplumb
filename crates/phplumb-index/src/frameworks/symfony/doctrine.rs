@@ -14,6 +14,9 @@ use crate::summary::SymbolKind;
 /// The attribute that maps an entity class.
 const ENTITY_ATTRIBUTE: &str = "Doctrine\\ORM\\Mapping\\Entity";
 
+/// The attribute that maps a mapped superclass, whose repository its entities take.
+const MAPPED_SUPERCLASS_ATTRIBUTE: &str = "Doctrine\\ORM\\Mapping\\MappedSuperclass";
+
 /// An XML element of a mapping file: its name, its attributes with each value and
 /// the value's range inside the quotes.
 #[derive(Debug, PartialEq, Eq)]
@@ -185,36 +188,41 @@ pub(crate) fn named_at(text: &str, offset: u32) -> Option<Named> {
     None
 }
 
-/// What the mappings declare: each entity's repository class.
+/// What the mappings declare: each entity's repository class, and each mapped
+/// superclass's, which its entities without their own take.
 #[derive(Default)]
 pub(crate) struct Mappings {
     repositories: HashMap<String, String>,
+    superclasses: HashMap<String, String>,
 }
 
 impl Mappings {
-    /// The `repository-class` of every entity in the project's `*.orm.xml` files,
-    /// then the `repositoryClass` of `#[ORM\Entity]` attributes of project classes.
+    /// The `repository-class` of every entity and mapped superclass in the project's
+    /// `*.orm.xml` files, then the repository of the `#[ORM\Entity]`,
+    /// `@ORM\Entity` and `#[ORM\MappedSuperclass]` mappings of project classes.
     pub(crate) fn read(
         index: &Index,
         filter: &PathFilter,
         files: &[PathBuf],
         config_files: &ConfigFiles,
     ) -> Mappings {
-        let mut repositories = HashMap::new();
+        let mut mappings = Mappings::default();
         for file in files {
             let Some(parsed) = config_files.get(file) else {
                 continue;
             };
             for element in elements(&parsed.text) {
-                if element.name != "entity" {
-                    continue;
-                }
+                let found = match element.name.as_str() {
+                    "entity" => &mut mappings.repositories,
+                    "mapped-superclass" => &mut mappings.superclasses,
+                    _ => continue,
+                };
                 if let (Some(entity), Some(repository)) = (
                     element.attribute("name"),
                     element.attribute("repository-class"),
                 ) {
                     let entity = entity.trim_start_matches('\\');
-                    repositories.insert(entity.to_ascii_lowercase(), qualify(entity, repository));
+                    found.insert(entity.to_ascii_lowercase(), qualify(entity, repository));
                 }
             }
         }
@@ -225,20 +233,56 @@ impl Mappings {
             let Some(shape) = &declaration.class else {
                 continue;
             };
-            let repository = shape
-                .metadata
-                .iter()
-                .filter(|m| !m.annotation && m.name.eq_ignore_ascii_case(ENTITY_ATTRIBUTE))
-                .find_map(|m| match m.argument("repositoryClass") {
-                    Some(MetaValue::Class(class)) => Some(class.clone()),
-                    Some(MetaValue::String(class)) => Some(qualify(&declaration.fqn, class)),
-                    _ => None,
-                });
-            if let Some(repository) = repository {
-                repositories.insert(declaration.fqn.to_ascii_lowercase(), repository);
+            // `#[ORM\Entity]`, `@ORM\Entity` and `#[ORM\MappedSuperclass]`, the
+            // repository named or first.
+            for metadata in &shape.metadata {
+                let found = if metadata.name.eq_ignore_ascii_case(ENTITY_ATTRIBUTE) {
+                    &mut mappings.repositories
+                } else if metadata
+                    .name
+                    .eq_ignore_ascii_case(MAPPED_SUPERCLASS_ATTRIBUTE)
+                {
+                    &mut mappings.superclasses
+                } else {
+                    continue;
+                };
+                let first = metadata
+                    .arguments
+                    .first()
+                    .filter(|(key, _)| key.is_none())
+                    .map(|(_, value)| value);
+                let repository = match metadata.argument("repositoryClass").or(first) {
+                    Some(MetaValue::Class(class)) => class.clone(),
+                    Some(MetaValue::String(class)) => qualify(&declaration.fqn, class),
+                    _ => continue,
+                };
+                found.insert(declaration.fqn.to_ascii_lowercase(), repository);
             }
         }
-        Mappings { repositories }
+        mappings
+    }
+
+    /// The repository of `entity`: its own, else the nearest mapped superclass
+    /// ancestor's.
+    pub(crate) fn repository_for(&self, index: &Index, entity: &str) -> Option<&str> {
+        if let Some(own) = self.repository_of(entity) {
+            return Some(own);
+        }
+        let mut next = index
+            .classes_named(entity)
+            .first()
+            .and_then(|found| found.declaration.class.as_ref()?.parent.clone());
+        for _ in 0..16 {
+            let parent = next.take()?;
+            if let Some(repository) = self.superclasses.get(&parent.to_ascii_lowercase()) {
+                return Some(repository);
+            }
+            next = index
+                .classes_named(&parent)
+                .first()
+                .and_then(|found| found.declaration.class.as_ref()?.parent.clone());
+        }
+        None
     }
 
     pub(crate) fn repository_of(&self, entity: &str) -> Option<&str> {

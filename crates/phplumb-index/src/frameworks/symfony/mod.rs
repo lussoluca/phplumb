@@ -1011,7 +1011,7 @@ impl Framework for Symfony {
             return None;
         }
         let entity = call.strings.first()?.as_deref()?;
-        let repository = self.repository_of(entity)?;
+        let repository = self.mappings.repository_for(index, entity)?;
         index
             .has_class(repository)
             .then(|| TypeExpr::Named(repository.to_string()))
