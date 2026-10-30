@@ -510,6 +510,37 @@ fn router_resource_keeps_routes_unknown() {
 }
 
 #[test]
+fn parameters_set_through_untyped_variables_are_known() {
+    let setup = "<?php\nnamespace App\\Setup;\nuse Doctrine\\ORM\\Query;\nfinal class Setup\n{\n    public function configure($c, Query $query, $name): void\n    {\n        $c->setParameter('app.extra', 1);\n        $query->setParameter('app.other', 1);\n        $c->setParameter($name, 1);\n    }\n}\n";
+    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->getParameter('app.extra');\n        $this->getParameter('app.other');\n        $this->getParameter('app.missing');\n    }\n}\n";
+    let (_dir, root) = broken_symfony(&[
+        (
+            "lib/Query.php",
+            "<?php\nnamespace Doctrine\\ORM;\nclass Query\n{\n    public function setParameter($key, $value): static\n    {\n        return $this;\n    }\n}\n",
+        ),
+        ("src/Setup/Setup.php", setup),
+        ("src/Controller/Uses.php", uses),
+    ]);
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined parameter 'app.other'",
+            "Undefined parameter 'app.missing'"
+        ]
+    );
+    let mut index = auto(&root);
+    let path = root.join("src/Controller/Uses.php");
+    let source = fs::read(&path).unwrap();
+    let offset = uses.find("app.extra").unwrap() as u32 + 1;
+    let found: Vec<PathBuf> = index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| location.path)
+        .collect();
+    assert_eq!(found, [root.join("src/Setup/Setup.php")]);
+}
+
+#[test]
 fn unknown_route_imports_silence_route_diagnostics() {
     let (_dir, root) = broken_symfony(&[(
         "config/routes/acme.yaml",

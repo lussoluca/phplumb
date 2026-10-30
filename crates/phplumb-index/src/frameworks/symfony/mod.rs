@@ -657,16 +657,23 @@ impl Symfony {
                     .iter()
                     .flat_map(|class| index.candidate_files(&RefKey::Class(class.to_string())))
                     .collect();
-                let mut files: Vec<&Path> = ["setParameter", "getParameterBag"]
-                    .iter()
-                    .flat_map(|name| index.candidate_files(&RefKey::Member(name.to_string())))
-                    .filter(|path| holders.contains(path))
+                // `setParameter()` may be called on an untyped container anywhere; a
+                // parameter bag is reached from a container class.
+                let setters = index.candidate_files(&RefKey::Member("setParameter".to_string()));
+                let bags = index
+                    .candidate_files(&RefKey::Member("getParameterBag".to_string()))
+                    .into_iter()
+                    .filter(|path| holders.contains(path));
+                let mut files: Vec<&Path> = setters
+                    .into_iter()
+                    .chain(bags)
                     .filter(|path| self.is_source(index, path))
                     .collect();
                 files.sort();
                 files.dedup();
                 let mut names: HashMap<String, Vec<RouteTarget>> = HashMap::new();
                 for path in files {
+                    let named_container = holders.contains(&path);
                     let source = std::fs::read(path).ok()?;
                     let summary = summarize(&source);
                     let calls = crate::infer::calls_named(
@@ -693,7 +700,15 @@ impl Symfony {
                         let unknown =
                             call.targets.is_empty() && method.eq_ignore_ascii_case("setParameter");
                         if holder || unknown {
-                            let name = call.strings.first().cloned().flatten()?;
+                            let Some(name) = call.strings.first().cloned().flatten() else {
+                                // A computed name on a container may be any parameter;
+                                // an untyped receiver in a file that names no container
+                                // is more likely another class, such as a query.
+                                if holder || named_container {
+                                    return None;
+                                }
+                                continue;
+                            };
                             let target =
                                 call.ranges.first().copied().flatten().map(|(start, end)| {
                                     RouteTarget {
