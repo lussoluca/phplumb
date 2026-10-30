@@ -38,8 +38,10 @@ pub(crate) struct Templates {
     /// `default_path`, which the module leaves out.
     main_unknown: bool,
     /// The positions in `paths` of the bundles' entries, whose templates are not
-    /// the project's.
+    /// the project's unless the bundle lives in `source_dir`.
     bundled: Vec<usize>,
+    /// The project's `src` directory, where its own bundles live.
+    source_dir: PathBuf,
 }
 
 impl Templates {
@@ -53,6 +55,7 @@ impl Templates {
         let dir = &project.dir;
         let mut templates = Templates {
             unknown: has_unread_twig_configuration(&dir.join("config/packages"), config_files),
+            source_dir: dir.join("src"),
             ..Templates::default()
         };
         let mut default_path = format!("{PROJECT_DIR}/templates");
@@ -233,13 +236,63 @@ impl Templates {
         }
     }
 
+    /// Whether a file matches the template name `pattern`, `*` standing for any
+    /// text, in the directories of its namespace, as Twig's loader would find one
+    /// for some value.
+    pub(crate) fn pattern_status(&self, pattern: &str) -> TemplateStatus {
+        let pattern = pattern.replace('\\', "/");
+        let (namespace, rest) = match pattern.strip_prefix('@') {
+            Some(named) => match named.split_once('/') {
+                Some((namespace, rest)) if !namespace.contains('*') => (Some(namespace), rest),
+                _ => return TemplateStatus::Unknown,
+            },
+            None => (None, pattern.as_str()),
+        };
+        // Steps the module does not resolve against each file.
+        if rest.split('/').any(|part| matches!(part, "." | "..")) {
+            return TemplateStatus::Unknown;
+        }
+        let rest = rest.trim_start_matches('/');
+        let mut configured = false;
+        for (_, dir) in self
+            .paths
+            .iter()
+            .filter(|(ns, _)| ns.as_deref() == namespace)
+        {
+            configured = true;
+            let Some(dir) = dir else {
+                return TemplateStatus::Unknown;
+            };
+            let found = files_below(dir).into_iter().find(|file| {
+                file.strip_prefix(dir)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .is_some_and(|name| super::twig::matches(rest, &name.replace('\\', "/")))
+            });
+            if let Some(file) = found {
+                return TemplateStatus::Found(file);
+            }
+        }
+        if configured && !self.unknown && !(namespace.is_none() && self.main_unknown) {
+            TemplateStatus::Missing
+        } else {
+            TemplateStatus::Unknown
+        }
+    }
+
     /// Whether `path` is inside one of the project's template directories: the
-    /// configured ones, `default_path` and the form themes, not those of bundles.
+    /// configured ones, `default_path`, the form themes and those of the bundles in
+    /// the project's `src`.
     pub(crate) fn holds(&self, path: &Path) -> bool {
         self.paths
             .iter()
             .enumerate()
-            .filter(|(position, _)| !self.bundled.contains(position))
+            .filter(|(position, (_, dir))| {
+                !self.bundled.contains(position)
+                    || dir
+                        .as_deref()
+                        .is_some_and(|dir| dir.starts_with(&self.source_dir))
+            })
             .filter_map(|(_, (_, dir))| dir.as_deref())
             .any(|dir| path.starts_with(dir))
     }
@@ -293,6 +346,32 @@ fn has_unread_twig_configuration(packages: &Path, config_files: &ConfigFiles) ->
             })
         })
     })
+}
+
+/// Every file below `dir`, each directory read once by real path.
+fn files_below(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, seen: &mut Vec<PathBuf>, found: &mut Vec<PathBuf>) {
+        let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if seen.contains(&real) {
+            return;
+        }
+        seen.push(real);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                walk(&path, seen, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, &mut Vec::new(), &mut found);
+    found
 }
 
 /// `name` with runs of `/` collapsed, as Twig's loader normalizes it; none when a

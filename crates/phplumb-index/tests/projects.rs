@@ -2080,6 +2080,81 @@ fn unresolved_bundle_namespaces_stay_unknown() {
     }
 }
 
+/// The diagnostics of `file` in the project at `root`.
+fn messages_of(root: &Path, file: &str) -> Vec<String> {
+    let index = auto(root);
+    let path = root.join(file);
+    let source = fs::read(&path).unwrap();
+    index
+        .diagnostics(&path, &source)
+        .into_iter()
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn interpolated_twig_names_are_checked() {
+    let page = "{{ path(\"blog_#{x}\") }}\n{{ path(\"shop_#{x}\") }}\n{% include \"blocks/#{t}.html.twig\" %}\n{% include \"cards/#{t}.html.twig\" %}\n";
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nblog_list:\n    path: /blog\n",
+        ),
+        ("templates/blocks/a.html.twig", "a\n"),
+        ("templates/page.html.twig", page),
+        TWIG_BRIDGE,
+    ]);
+    assert_eq!(
+        messages_of(&root, "templates/page.html.twig"),
+        [
+            "Undefined route 'shop_#{x}'",
+            "Undefined template 'cards/#{t}.html.twig'"
+        ]
+    );
+}
+
+#[test]
+fn template_lists_are_checked() {
+    let page = "{{ include(['a.html.twig', 'b.html.twig']) }}\n{{ include(['c.html.twig', 'exists.html.twig']) }}\n{% include 'x.html.twig' ignore missing %}\n{% include ['d.html.twig', 'e.html.twig'] %}\n";
+    let (_dir, root) = broken_symfony(&[
+        ("templates/exists.html.twig", "exists\n"),
+        ("templates/page.html.twig", page),
+        TWIG_BRIDGE,
+    ]);
+    assert_eq!(
+        messages_of(&root, "templates/page.html.twig"),
+        [
+            "Undefined template 'a.html.twig'",
+            "Undefined template 'b.html.twig'",
+            "Undefined template 'd.html.twig'",
+            "Undefined template 'e.html.twig'"
+        ]
+    );
+}
+
+#[test]
+fn project_bundle_templates_are_checked() {
+    let include = "{% include 'nowhere.html.twig' %}\n";
+    let (_dir, root) = templated_bundles(&[
+        (
+            "config/bundles.php",
+            "<?php\nreturn [\n    Symfony\\Bundle\\FrameworkBundle\\FrameworkBundle::class => ['all' => true],\n    Acme\\AcmeBundle::class => ['all' => true],\n    App\\AdminBundle\\AdminBundle::class => ['all' => true],\n];\n",
+        ),
+        (
+            "src/AdminBundle/AdminBundle.php",
+            "<?php\nnamespace App\\AdminBundle;\nuse Symfony\\Component\\HttpKernel\\Bundle\\Bundle;\nclass AdminBundle extends Bundle {}\n",
+        ),
+        ("src/AdminBundle/templates/panel.html.twig", include),
+        ("tests/fixtures/page.html.twig", include),
+    ]);
+    assert_eq!(
+        messages_of(&root, "src/AdminBundle/templates/panel.html.twig"),
+        ["Undefined template 'nowhere.html.twig'"]
+    );
+    assert!(messages_of(&root, "tests/fixtures/page.html.twig").is_empty());
+    assert!(messages_of(&root, "lib/acme/templates/card.html.twig").is_empty());
+}
+
 #[test]
 fn bundle_templates_get_no_diagnostics() {
     let (_dir, root) = templated_bundles(&[]);

@@ -167,6 +167,18 @@ impl Routes {
             .is_some_and(|(base, _)| !self.targets(base).is_empty())
     }
 
+    /// Whether no route name matches `pattern`, `*` standing for any text, as far
+    /// as every source of route names was read.
+    pub(crate) fn pattern_missing(&self, pattern: &str) -> bool {
+        if self.unknown || (self.symfony && pattern.starts_with(['_', '*'])) {
+            return false;
+        }
+        !self
+            .by_name
+            .keys()
+            .any(|name| super::twig::matches(pattern, name))
+    }
+
     fn add(&mut self, name: String, target: RouteTarget) {
         let targets = self.by_name.entry(name).or_default();
         if !targets.contains(&target) {

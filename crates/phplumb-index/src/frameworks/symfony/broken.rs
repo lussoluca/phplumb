@@ -141,21 +141,53 @@ pub(super) fn find_in_twig(
     if index.has_exclusions() || !symfony.templates.holds(&index.filter().under_root(path)) {
         return Vec::new();
     }
-    twig::names(source)
-        .into_iter()
-        .filter_map(|(kind, name, start, end)| {
-            let message = match kind {
-                TwigName::Route if symfony.route_missing(&name) => {
-                    format!("Undefined route '{name}'")
+    /// An element of a template list, with whether its template is missing.
+    struct Element {
+        name: String,
+        range: (u32, u32),
+        missing: bool,
+    }
+    let mut found = Vec::new();
+    let mut lists: Vec<(usize, Vec<Element>)> = Vec::new();
+    for (kind, name, start, end) in twig::names(source) {
+        let missing = |name: &str| symfony.template_status(name) == TemplateStatus::Missing;
+        let message = match kind {
+            TwigName::Route if symfony.route_missing(&name) => format!("Undefined route '{name}'"),
+            TwigName::RoutePattern if symfony.routes.pattern_missing(&twig::pattern(&name)) => {
+                format!("Undefined route '{name}'")
+            }
+            TwigName::Template if missing(&name) => format!("Undefined template '{name}'"),
+            TwigName::TemplatePattern
+                if symfony.templates.pattern_status(&twig::pattern(&name))
+                    == TemplateStatus::Missing =>
+            {
+                format!("Undefined template '{name}'")
+            }
+            TwigName::Choice(list) => {
+                let element = Element {
+                    missing: missing(&name),
+                    name,
+                    range: (start, end),
+                };
+                match lists.iter_mut().find(|(open, _)| *open == list) {
+                    Some((_, elements)) => elements.push(element),
+                    None => lists.push((list, vec![element])),
                 }
-                TwigName::Template if symfony.template_status(&name) == TemplateStatus::Missing => {
-                    format!("Undefined template '{name}'")
-                }
-                _ => return None,
-            };
-            Some(diagnostic((start, end), message))
-        })
-        .collect()
+                continue;
+            }
+            _ => continue,
+        };
+        found.push(diagnostic((start, end), message));
+    }
+    for (_, elements) in lists {
+        if elements.iter().all(|element| element.missing) {
+            for element in elements {
+                let message = format!("Undefined template '{}'", element.name);
+                found.push(diagnostic(element.range, message));
+            }
+        }
+    }
+    found
 }
 
 /// Parameters written as `%name%` in YAML configuration under `config`.
