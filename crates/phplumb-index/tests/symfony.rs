@@ -1952,3 +1952,59 @@ fn other_template_arguments_give_nothing() {
         ["extra/base.html.twig"]
     );
 }
+
+#[test]
+fn escaped_autowire_values_lead_to_their_parameters() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "src/Service/Escaped.php",
+        "<?php\nnamespace App\\Service;\nuse Symfony\\Component\\DependencyInjection\\Attribute\\Autowire;\nfinal class Escaped\n{\n    public function __construct(#[Autowire('@@%app.name%')] string $a)\n    {\n    }\n}\n",
+    );
+    let found = definitions_in_copy(&mut index, &root, "src/Service/Escaped.php", 6, "app.name%");
+    assert!(
+        found.contains(&pair("config/services.yaml", "app.name")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn nested_imports_keys_keep_their_parameters() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "config/packages/some_bundle.yaml",
+        "some_bundle:\n    imports: ['%app.name%']\n",
+    );
+    let found = definitions_in_copy(
+        &mut index,
+        &root,
+        "config/packages/some_bundle.yaml",
+        2,
+        "app.name",
+    );
+    assert!(
+        found.contains(&pair("config/services.yaml", "app.name")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn aliases_defined_twice_lead_to_both_services() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "config/services_test.yaml",
+        "services:\n    app.a: ~\n    app.b: ~\n    app.x: '@app.a'\n    app.y:\n        arguments: ['@app.x']\n\nwhen@test:\n    services:\n        app.x: '@app.b'\n",
+    );
+    let found = definitions_in_copy(&mut index, &root, "config/services_test.yaml", 6, "app.x");
+    for id in ["app.a", "app.b"] {
+        assert!(
+            found.contains(&pair("config/services_test.yaml", id)),
+            "{id} {found:?}"
+        );
+    }
+}

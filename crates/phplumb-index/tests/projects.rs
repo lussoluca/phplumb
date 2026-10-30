@@ -2238,6 +2238,14 @@ fn unread_messenger_configuration_keeps_every_handler() {
         "src/Service/Sender.php",
     );
     assert_eq!(found, every_handler());
+    let found = bus_case(
+        &[(
+            "config/packages/test/messenger.yaml",
+            "framework:\n    messenger:\n        default_bus: query.bus\n".to_string(),
+        )],
+        "src/Service/Sender.php",
+    );
+    assert_eq!(found, every_handler());
 }
 
 #[test]
@@ -2440,4 +2448,15 @@ fn unreadable_imports_keep_names_unknown() {
             "{import}"
         );
     }
+}
+
+#[test]
+fn files_the_kernel_does_not_load_define_nothing() {
+    assert_eq!(
+        parameter_messages(&[(
+            "config/services.dist.yaml",
+            "parameters:\n    app.nowhere: 1\n"
+        )]),
+        [NOWHERE]
+    );
 }

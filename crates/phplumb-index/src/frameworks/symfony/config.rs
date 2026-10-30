@@ -1,5 +1,6 @@
-//! Symfony's YAML configuration: the parameters `config/services*.yaml` and
-//! `config/packages/*.yaml` define, and parameter names written as `%name%`.
+//! Symfony's YAML configuration: the files the kernel loads and those they import,
+//! the parameters, services, aliases and tags they define, and parameter names
+//! written as `%name%`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,8 @@ pub(crate) fn config_files(
     let config = project.dir.join("config");
     let yaml = |name: &str| name.ends_with(".yaml") || name.ends_with(".yml");
     let mut files = files_named(&config, |name| {
-        yaml(name) && (name.starts_with("services.") || name.starts_with("services_"))
+        let stem = name.trim_end_matches(".yaml").trim_end_matches(".yml");
+        yaml(name) && (stem == "services" || stem.starts_with("services_"))
     });
     let packages = config.join("packages");
     files.extend(files_named(&packages, yaml));
@@ -246,13 +248,20 @@ pub(crate) fn buses(
         let Some(root) = &parsed.yaml else {
             continue;
         };
+        // A file of an environment directory changes the buses of that environment
+        // only, as a `when@<env>` block does.
+        let environment = file
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "packages");
         for (position, block) in top_blocks(root).into_iter().enumerate() {
             let Some(messenger) = block.get("framework").and_then(|f| f.get("messenger")) else {
                 continue;
             };
             let changes_buses =
                 messenger.get("buses").is_some() || messenger.get("default_bus").is_some();
-            if position > 0 && changes_buses {
+            if (environment || position > 0) && changes_buses {
                 return None;
             }
             if let Some(Yaml::Map(buses)) = messenger.get("buses") {
@@ -478,12 +487,12 @@ pub(crate) fn service_reference(value: &str) -> Option<&str> {
 
 /// The aliases the configuration files define under `services:`, also inside
 /// `when@<env>` blocks: `id: '@other'` and `id: { alias: other }`, each id with the
-/// service it stands for.
+/// services it stands for in one environment or another.
 pub(crate) fn read_aliases(
     files: &[PathBuf],
     config_files: &ConfigFiles,
-) -> HashMap<String, String> {
-    let mut found: HashMap<String, String> = HashMap::new();
+) -> HashMap<String, Vec<String>> {
+    let mut found: HashMap<String, Vec<String>> = HashMap::new();
     for file in files {
         let Some(parsed) = config_files.get(file) else {
             continue;
@@ -504,7 +513,10 @@ pub(crate) fn read_aliases(
                     _ => value.get("alias").and_then(Yaml::text),
                 };
                 if let Some(target) = target {
-                    found.insert(id.to_string(), target.to_string());
+                    let targets = found.entry(id.to_string()).or_default();
+                    if !targets.iter().any(|known| known == target) {
+                        targets.push(target.to_string());
+                    }
                 }
             }
         }

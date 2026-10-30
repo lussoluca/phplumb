@@ -303,7 +303,7 @@ pub struct Symfony {
     /// The message buses and the default one; none when they cannot be told.
     buses: Option<(Vec<String>, String)>,
     /// Each service alias and the service it stands for.
-    aliases: HashMap<String, String>,
+    aliases: HashMap<String, Vec<String>>,
     /// The argument names the configuration binds, and the classes whose
     /// arguments it wires.
     bindings: (Vec<String>, Vec<String>),
@@ -567,11 +567,12 @@ impl Symfony {
     pub fn service_targets(&self, index: &Index, id: &str) -> Vec<(Location, String)> {
         let mut found: Vec<(Location, String)> = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
-        let mut next = Some(id);
-        // An alias also leads to the service it stands for, through a chain of them.
-        while let Some(id) = next.take() {
+        let mut next = vec![id];
+        // An alias also leads to the services it stands for, through chains of them.
+        while !next.is_empty() {
+            let id = next.remove(0);
             if seen.contains(&id) {
-                break;
+                continue;
             }
             seen.push(id);
             let targets = match self.services.get(id) {
@@ -584,7 +585,13 @@ impl Symfony {
                     found.push(target);
                 }
             }
-            next = self.aliases.get(id).map(String::as_str);
+            next.extend(
+                self.aliases
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            );
         }
         found
     }
@@ -614,7 +621,14 @@ impl Symfony {
             return Vec::new();
         };
         // An import's resource opens the file it loads.
-        if steps.contains(&yaml::Step::Key("imports")) {
+        let imports = match steps.as_slice() {
+            [yaml::Step::Key("imports"), ..] => true,
+            [yaml::Step::Key(environment), yaml::Step::Key("imports"), ..] => {
+                environment.starts_with("when@")
+            }
+            _ => false,
+        };
+        if imports {
             return config::imported_file(path, value)
                 .filter(|file| file.is_file())
                 .into_iter()
@@ -847,9 +861,11 @@ impl Framework for Symfony {
             };
             return match position {
                 // A value `@id` names a service, `@@` escapes an `@`.
-                Some(0) if found.value.starts_with('@') => config::service_reference(&found.value)
-                    .map(|id| self.service_targets(index, id))
-                    .unwrap_or_default(),
+                Some(0) if found.value.starts_with('@') && !found.value.starts_with("@@") => {
+                    config::service_reference(&found.value)
+                        .map(|id| self.service_targets(index, id))
+                        .unwrap_or_default()
+                }
                 Some(0) => self.value_parameter_targets(found, offset),
                 Some(1) => self.service_targets(index, &found.value),
                 Some(4) => targets_of(self.parameter_targets(&found.value)),
