@@ -493,6 +493,51 @@ fn kernel_overrides_keep_names_unknown() {
 }
 
 #[test]
+fn kernel_overrides_through_traits_and_interfaces_keep_names_unknown() {
+    let config_dir = "    public function getConfigDir()\n    {\n        return [];\n    }\n";
+    // Symfony's own trait declares these methods for every kernel.
+    let micro = format!(
+        "<?php\nnamespace Symfony\\Bundle\\FrameworkBundle\\Kernel;\ntrait MicroKernelTrait\n{{\n{config_dir}}}\n"
+    );
+    let base = [
+        (
+            "lib/HttpKernel.php",
+            "<?php\nnamespace Symfony\\Component\\HttpKernel;\nabstract class Kernel\n{\n}\n",
+        ),
+        (
+            "lib/DiKernel.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Kernel;\ninterface KernelInterface\n{\n}\n",
+        ),
+        (
+            "vendor/symfony/framework-bundle/Kernel/MicroKernelTrait.php",
+            micro.as_str(),
+        ),
+        ("templates/home.html.twig", "home\n"),
+        TWIG_BRIDGE,
+    ];
+    let project = |files: &[(&str, &str)]| {
+        let mut all = base.to_vec();
+        all.extend_from_slice(files);
+        broken_symfony(&all)
+    };
+    let micro_kernel = "<?php\nnamespace App;\nuse Symfony\\Bundle\\FrameworkBundle\\Kernel\\MicroKernelTrait;\nuse Symfony\\Component\\HttpKernel\\Kernel as BaseKernel;\nclass Kernel extends BaseKernel\n{\n    use MicroKernelTrait;\n}\n";
+    let (_dir, root) = project(&[("src/Kernel.php", micro_kernel)]);
+    assert_eq!(
+        broken_messages(&root),
+        [UNDEFINED_ROUTE, UNDEFINED_PARAMETER]
+    );
+    let own_trait = format!("<?php\nnamespace App;\ntrait Paths\n{{\n{config_dir}}}\n");
+    let kernel = "<?php\nnamespace App;\nuse Symfony\\Component\\HttpKernel\\Kernel as BaseKernel;\nclass Kernel extends BaseKernel\n{\n    use Paths;\n}\n";
+    let (_dir, root) = project(&[("src/Paths.php", &own_trait), ("src/Kernel.php", kernel)]);
+    assert!(broken_messages(&root).is_empty());
+    let di_kernel = format!(
+        "<?php\nnamespace App;\nuse Symfony\\Component\\DependencyInjection\\Kernel\\KernelInterface;\nclass Kernel implements KernelInterface\n{{\n{config_dir}}}\n"
+    );
+    let (_dir, root) = project(&[("src/Kernel.php", &di_kernel)]);
+    assert!(broken_messages(&root).is_empty());
+}
+
+#[test]
 fn router_resource_keeps_routes_unknown() {
     let other =
         "framework:\n    router:\n        resource: '%kernel.project_dir%/config/routing.php'\n";
@@ -537,7 +582,9 @@ fn parameters_set_through_untyped_variables_are_known() {
         .into_iter()
         .map(|location| location.path)
         .collect();
-    assert_eq!(found, [root.join("src/Setup/Setup.php")]);
+    // The receiver may be another class, such as a query: the name stays known,
+    // with no jump to the call.
+    assert!(found.is_empty());
 }
 
 #[test]

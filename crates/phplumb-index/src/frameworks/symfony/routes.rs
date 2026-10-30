@@ -758,7 +758,7 @@ fn has_unread_route_files(config: &Path) -> bool {
 }
 
 /// Whether `class` declares a method named `name`.
-pub(crate) fn declares_method(class: &Declaration, name: &str) -> bool {
+fn declares_method(class: &Declaration, name: &str) -> bool {
     class.class.as_ref().is_some_and(|shape| {
         shape
             .members

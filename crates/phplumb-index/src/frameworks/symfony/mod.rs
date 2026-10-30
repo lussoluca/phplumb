@@ -29,7 +29,7 @@ use crate::frameworks::{
 use crate::index::{Index, Location};
 use crate::metadata::MetaValue;
 use crate::phpdoc::TypeExpr;
-use crate::summary::{FileSummary, NameRef, RefKey, SymbolKind, summarize};
+use crate::summary::{FileSummary, MemberKind, NameRef, RefKey, SymbolKind, summarize};
 
 use doctrine::Mappings;
 use files::ConfigFiles;
@@ -296,9 +296,11 @@ fn constructor_parameters(index: &Index, class: &str) -> Vec<String> {
 }
 
 /// The classes a Symfony kernel extends or implements.
-const KERNELS: [&str; 2] = [
+const KERNELS: [&str; 4] = [
     "Symfony\\Component\\HttpKernel\\Kernel",
     "Symfony\\Component\\HttpKernel\\KernelInterface",
+    "Symfony\\Component\\DependencyInjection\\Kernel\\AbstractKernel",
+    "Symfony\\Component\\DependencyInjection\\Kernel\\KernelInterface",
 ];
 
 /// The interface of Twig loaders, which autoconfiguration tags `twig.loader`.
@@ -314,36 +316,6 @@ struct ClassSources {
     routes: bool,
     parameters: bool,
     twig_loader: bool,
-}
-
-fn class_sources(index: &Index, filter: &PathFilter) -> ClassSources {
-    let mut found = ClassSources::default();
-    for (path, declaration) in index.declarations() {
-        let concrete = declaration
-            .class
-            .as_ref()
-            .is_some_and(|shape| !shape.is_abstract);
-        if declaration.kind != SymbolKind::Class || !index.is_project_code(path) {
-            continue;
-        }
-        let declares = |name: &str| routes::declares_method(declaration, name);
-        let config_dir = declares("getConfigDir");
-        let routes = declares("loadRoutes");
-        let parameters = declares("getKernelParameters");
-        let kernel =
-            (config_dir || routes || parameters) && is_a(index, &declaration.fqn, &KERNELS);
-        let twig_loader = concrete && is_a(index, &declaration.fqn, &[TWIG_LOADER]);
-        if !(kernel || twig_loader) || !filter.in_scope(path) {
-            continue;
-        }
-        if kernel {
-            found.config_dir |= config_dir;
-            found.routes |= routes;
-            found.parameters |= parameters;
-        }
-        found.twig_loader |= twig_loader;
-    }
-    found
 }
 
 /// The interface message buses are autowired by.
@@ -638,6 +610,42 @@ impl Symfony {
             .is_some_and(|set| !set.contains_key(name))
     }
 
+    /// What the project's kernels and Twig loaders change. Only subtypes of the
+    /// kernel and loader types are looked at; a kernel method counts when project
+    /// code declares it, in the class, a parent or a trait.
+    fn class_sources(&self, index: &Index, filter: &PathFilter) -> ClassSources {
+        let mut found = ClassSources::default();
+        let ours = |path: &Path| self.is_source(index, path) && filter.in_scope(path);
+        let mut kernels: Vec<String> = Vec::new();
+        for kernel in KERNELS.iter().flat_map(|kernel| index.all_subtypes(kernel)) {
+            let fqn = &kernel.declaration.fqn;
+            if ours(kernel.path) && !kernels.iter().any(|known| known.eq_ignore_ascii_case(fqn)) {
+                kernels.push(fqn.clone());
+            }
+        }
+        for kernel in &kernels {
+            let declares = |name: &str| {
+                index
+                    .find_member(kernel, MemberKind::Method, name)
+                    .iter()
+                    .any(|(owner, _)| ours(owner.path))
+            };
+            found.config_dir |= declares("getConfigDir");
+            found.routes |= declares("loadRoutes");
+            found.parameters |= declares("getKernelParameters");
+        }
+        found.twig_loader = index.all_subtypes(TWIG_LOADER).iter().any(|loader| {
+            loader.declaration.kind == SymbolKind::Class
+                && loader
+                    .declaration
+                    .class
+                    .as_ref()
+                    .is_some_and(|shape| !shape.is_abstract)
+                && ours(loader.path)
+        });
+        found
+    }
+
     /// Whether `path` is code of the project, not a dependency nor what Symfony
     /// generates in `var`, such as the compiled container.
     fn is_source(&self, index: &Index, path: &Path) -> bool {
@@ -647,9 +655,9 @@ impl Symfony {
     }
 
     /// The literal names `setParameter()` calls and parameter bag `set()` calls in
-    /// project code give the container, or none when one of them is computed. Only
-    /// files that mention a container class are read: a `setParameter()` whose
-    /// receiver stays unknown there counts.
+    /// project code give the container, or none when one on a container is
+    /// computed. A `setParameter()` whose receiver stays unknown counts too, and
+    /// leads to its call only in a file that names a container class.
     fn set_parameters(&self, index: &Index) -> Option<&HashMap<String, Vec<RouteTarget>>> {
         self.set_parameters
             .get_or_init(|| {
@@ -709,17 +717,20 @@ impl Symfony {
                                 }
                                 continue;
                             };
+                            // An untyped receiver in a file that names no container
+                            // may be another class: its name counts, with no jump.
+                            let jump = holder || named_container;
                             let target =
-                                call.ranges.first().copied().flatten().map(|(start, end)| {
-                                    RouteTarget {
+                                call.ranges.first().copied().flatten().filter(|_| jump).map(
+                                    |(start, end)| RouteTarget {
                                         location: Location {
                                             path: path.to_path_buf(),
                                             start,
                                             end,
                                         },
                                         text: name.clone(),
-                                    }
-                                });
+                                    },
+                                );
                             names.entry(name).or_default().extend(target);
                         }
                     }
@@ -863,9 +874,6 @@ impl Symfony {
         self.parameters.get(name).map_or(&[], Vec::as_slice)
     }
 
-    /// The parameters, services and aliases the configuration of the bundles of
-    /// `config/bundles.php` defines, in their `Resources/config` and `config`
-    /// directories.
     /// The parameters each bundle's extension sets: the PHP files of the
     /// `DependencyInjection` directory next to the bundle class, compiler passes
     /// included, and the bundle class itself, as an `AbstractBundle` loads its
@@ -892,6 +900,9 @@ impl Symfony {
         })
     }
 
+    /// The parameters, services and aliases the configuration of the bundles of
+    /// `config/bundles.php` defines, in their `Resources/config` and `config`
+    /// directories.
     fn bundle_definitions(&self, index: &Index) -> &Definitions {
         self.bundle_definitions.get_or_init(|| {
             let dirs: Vec<PathBuf> = bundles::bundles(index, &self.project.dir.join("config"))
@@ -1077,7 +1088,7 @@ impl Symfony {
             .iter()
             .flat_map(|class| index.candidate_files(&RefKey::Class(class.to_string())))
             .any(|path| self.is_source(index, path));
-        let classes = class_sources(index, &filter);
+        let classes = self.class_sources(index, &filter);
         self.parameters_unknown = configured_in_php
             || unread_imports
             || config::has_unread_configuration(&self.project)

@@ -250,6 +250,13 @@ mod extension_tests {
         );
         assert!(both.may_set("security.main._indexed"));
         assert!(!both.may_set("security._index"));
+        let stof = || vec![("stof.listener.".to_string(), ".class".to_string())];
+        let format = read("$container->setParameter(sprintf('stof.listener.%s.class', $name), 1);");
+        assert_eq!(format.patterns, stof());
+        assert!(!format.any);
+        let interpolated = read("$container->setParameter(\"stof.listener.{$name}.class\", 1);");
+        assert_eq!(interpolated.patterns, stof());
+        assert!(!interpolated.any);
         assert!(read("$container->setParameter($name, 1);").any);
         let configured = read("$container->parameters()->set('acme.x', 1);");
         assert!(configured.names.contains("acme.x"));
