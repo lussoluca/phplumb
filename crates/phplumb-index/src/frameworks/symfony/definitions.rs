@@ -1,13 +1,46 @@
 //! Services and parameters defined outside YAML: PHP configurator files and XML
 //! service files, the project's and the bundles'.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::RouteTarget;
 use super::doctrine::elements;
 use crate::index::Location;
-use crate::infer::configurator_definitions;
+use crate::infer::{configurator_definitions, parameter_setters};
+
+/// The parameters bundle extensions set from code: names, endings of names
+/// computed from a variable start, and whether one sets a name computed otherwise,
+/// which may be any.
+#[derive(Default)]
+pub(crate) struct ExtensionParameters {
+    pub names: HashSet<String>,
+    pub suffixes: Vec<String>,
+    pub any: bool,
+}
+
+impl ExtensionParameters {
+    /// Adds the parameters the PHP file `source` sets: through `setParameter()`, or
+    /// `set()` on a `parameters()` configurator.
+    pub(crate) fn read_php(&mut self, source: &[u8]) {
+        let setters = parameter_setters(source);
+        self.names.extend(setters.names);
+        for suffix in setters.suffixes {
+            if !self.suffixes.contains(&suffix) {
+                self.suffixes.push(suffix);
+            }
+        }
+        self.any |= setters.computed;
+        let configured = configurator_definitions(source).parameters;
+        self.names
+            .extend(configured.into_iter().map(|(name, ..)| name));
+    }
+
+    /// Whether an extension may set the parameter `name`.
+    pub(crate) fn may_set(&self, name: &str) -> bool {
+        self.any || self.names.contains(name) || self.suffixes.iter().any(|s| name.ends_with(s))
+    }
+}
 
 /// The parameters, services and aliases some files define.
 #[derive(Default)]
@@ -175,5 +208,31 @@ return static function ($container): void {
         assert_eq!(names(&found.parameters), ["app.x"]);
         assert_eq!(names(&found.services), ["app.alias", "app.y"]);
         assert_eq!(found.aliases["app.alias"], ["app.y"]);
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::ExtensionParameters;
+
+    fn read(body: &str) -> ExtensionParameters {
+        let mut found = ExtensionParameters::default();
+        found.read_php(
+            format!("<?php\nfunction load($container, $name, $busId) {{\n{body}\n}}\n").as_bytes(),
+        );
+        found
+    }
+
+    #[test]
+    fn reads_the_parameters_extensions_set() {
+        let literal = read("$container->setParameter('router.resource', 1);");
+        assert!(literal.names.contains("router.resource"));
+        assert!(literal.suffixes.is_empty() && !literal.any);
+        let suffix = read("$container->setParameter($busId.'.middleware', 1);");
+        assert_eq!(suffix.suffixes, [".middleware"]);
+        assert!(!suffix.any);
+        assert!(read("$container->setParameter($name, 1);").any);
+        let configured = read("$container->parameters()->set('acme.x', 1);");
+        assert!(configured.names.contains("acme.x"));
     }
 }

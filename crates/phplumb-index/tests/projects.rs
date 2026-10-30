@@ -1426,6 +1426,37 @@ fn bundled_symfony(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
     broken_symfony(&all)
 }
 
+#[test]
+fn bundle_extension_parameters_stay_silent() {
+    let extension = "<?php\nnamespace Acme\\DependencyInjection;\nclass AcmeExtension\n{\n    public function load(array $configs, $container): void\n    {\n        $container->setParameter('router.resource', 'x');\n        foreach (['command.bus'] as $busId) {\n            $container->setParameter($busId.'.middleware', []);\n        }\n    }\n}\n";
+    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->getParameter('router.resource');\n        $this->getParameter('command.bus.middleware');\n        $this->getParameter('router.missing');\n    }\n}\n";
+    let services =
+        "parameters:\n    app.name: x\n    router.request_context.host: x\n    command.x: y\n";
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/acme/src/DependencyInjection/AcmeExtension.php",
+            extension,
+        ),
+        ("src/Controller/Uses.php", uses),
+        ("config/services.yaml", services),
+    ]);
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'router.missing'"]
+    );
+    // A name the extension computes in full may be any parameter.
+    let computed = extension.replace("$busId.'.middleware'", "$busId");
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/acme/src/DependencyInjection/AcmeExtension.php",
+            &computed,
+        ),
+        ("src/Controller/Uses.php", uses),
+        ("config/services.yaml", services),
+    ]);
+    assert!(broken_messages(&root).is_empty());
+}
+
 fn route_missing(index: &Index, name: &str) -> bool {
     index.framework::<Symfony>().unwrap().route_missing(name)
 }

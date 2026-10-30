@@ -717,7 +717,7 @@ fn route_files_below(dir: &Path) -> Option<Vec<PathBuf>> {
 }
 
 /// Whether `path` is a PHP file.
-fn is_php(path: &Path) -> bool {
+pub(crate) fn is_php(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("php"))

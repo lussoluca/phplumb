@@ -843,6 +843,60 @@ pub(crate) fn configurator_definitions(source: &[u8]) -> ConfiguratorDefinitions
     found
 }
 
+/// The names a file's `setParameter()` calls set: literal ones, the literal end of
+/// one computed from a variable start (`$id.'.middleware'`), and whether another is
+/// computed.
+#[derive(Default)]
+pub(crate) struct ParameterSetters {
+    pub names: Vec<String>,
+    pub suffixes: Vec<String>,
+    pub computed: bool,
+}
+
+/// The parameter names the `setParameter()` calls of `source` set, on any receiver.
+pub(crate) fn parameter_setters(source: &[u8]) -> ParameterSetters {
+    let arena = LocalArena::new();
+    let program = parse_file_content(&arena, FileId::zero(), source);
+    let mut calls: Vec<CallRef<'_, '_>> = Vec::new();
+    CallsWithArguments.walk_program(program, &mut calls);
+    let text = |expression: &Expression<'_>| match expression {
+        Expression::Literal(Literal::String(literal)) => literal
+            .value
+            .map(|value| String::from_utf8_lossy(value).into_owned()),
+        _ => None,
+    };
+    let mut found = ParameterSetters::default();
+    for call in &calls {
+        let CallRef::Method(call) = call else {
+            continue;
+        };
+        let ClassLikeMemberSelector::Identifier(name) = &call.method else {
+            continue;
+        };
+        if !name.value.eq_ignore_ascii_case(b"setParameter") {
+            continue;
+        }
+        let Some(argument) = positional(&call.argument_list, 0) else {
+            found.computed = true;
+            continue;
+        };
+        if let Some(name) = text(argument) {
+            found.names.push(name);
+            continue;
+        }
+        match argument {
+            Expression::Binary(binary) if binary.operator.is_concatenation() => {
+                match text(binary.rhs).filter(|suffix| !suffix.is_empty()) {
+                    Some(suffix) => found.suffixes.push(suffix),
+                    None => found.computed = true,
+                }
+            }
+            _ => found.computed = true,
+        }
+    }
+    found
+}
+
 /// What a Symfony PHP route file defines through its `RoutingConfigurator`.
 #[derive(Default)]
 pub(crate) struct PhpRoutes {

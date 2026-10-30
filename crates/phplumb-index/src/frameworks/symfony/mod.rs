@@ -4,7 +4,7 @@ mod broken;
 mod bundles;
 mod config;
 mod definitions;
-use definitions::Definitions;
+use definitions::{Definitions, ExtensionParameters};
 mod doctrine;
 mod files;
 mod messenger;
@@ -557,6 +557,9 @@ pub struct Symfony {
     /// Those of the bundles' configuration, read on the first lookup after the
     /// bundles or the dependencies change.
     bundle_definitions: OnceLock<Definitions>,
+    /// The parameters the bundles' extensions set from code, read with the bundle
+    /// definitions.
+    extension_parameters: OnceLock<ExtensionParameters>,
     /// When `config/bundles.php` and `composer.lock` last changed.
     bundles_key: Option<(Option<SystemTime>, Option<SystemTime>)>,
     /// Each service alias and the service it stands for.
@@ -618,6 +621,7 @@ impl Symfony {
         // Parameters PHP or XML configuration defines, the project's or a bundle's.
         if self.definitions.parameters.contains_key(name)
             || self.bundle_definitions(index).parameters.contains_key(name)
+            || self.extension_parameters(index).may_set(name)
         {
             return false;
         }
@@ -847,6 +851,32 @@ impl Symfony {
     /// The parameters, services and aliases the configuration of the bundles of
     /// `config/bundles.php` defines, in their `Resources/config` and `config`
     /// directories.
+    /// The parameters each bundle's extension sets: the PHP files of the
+    /// `DependencyInjection` directory next to the bundle class, compiler passes
+    /// included, and the bundle class itself, as an `AbstractBundle` loads its
+    /// extension. A bundle the index lacks adds nothing.
+    fn extension_parameters(&self, index: &Index) -> &ExtensionParameters {
+        self.extension_parameters.get_or_init(|| {
+            let mut found = ExtensionParameters::default();
+            for class in bundles::bundle_classes(&self.project.dir.join("config")) {
+                let Some(bundle) = index.classes_named(&class).into_iter().next() else {
+                    continue;
+                };
+                let Some(dir) = bundle.path.parent() else {
+                    continue;
+                };
+                let code = files_below(&[dir.join("DependencyInjection")]);
+                let files = std::iter::once(bundle.path.to_path_buf()).chain(code);
+                for file in files.filter(|file| routes::is_php(file)) {
+                    if let Ok(source) = std::fs::read(&file) {
+                        found.read_php(&source);
+                    }
+                }
+            }
+            found
+        })
+    }
+
     fn bundle_definitions(&self, index: &Index) -> &Definitions {
         self.bundle_definitions.get_or_init(|| {
             let dirs: Vec<PathBuf> = bundles::bundles(index, &self.project.dir.join("config"))
@@ -1048,6 +1078,7 @@ impl Symfony {
         if self.bundles_key != key {
             self.bundles_key = key;
             self.bundle_definitions = OnceLock::new();
+            self.extension_parameters = OnceLock::new();
         }
         self.mappings = Mappings::read(
             index,

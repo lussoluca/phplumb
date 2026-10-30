@@ -19,23 +19,28 @@ const ABSTRACT_BUNDLES: [&str; 2] = [
 /// directory when that `getPath()` is `Bundle`'s, or its parent when it is an
 /// `AbstractBundle`'s. The directory is none when the module cannot tell.
 pub(crate) fn bundles(index: &Index, config: &Path) -> Vec<(String, Option<PathBuf>)> {
-    let Ok(source) = std::fs::read(config.join("bundles.php")) else {
-        return Vec::new();
-    };
-    let summary = summarize(&source);
     let mut found: Vec<(String, Option<PathBuf>)> = Vec::new();
-    for name in summary
-        .names
-        .iter()
-        .filter(|n| n.kind == NameKind::ClassLike)
-    {
-        let short = name.fqn.rsplit('\\').next().unwrap_or(&name.fqn);
+    for class in bundle_classes(config) {
+        let short = class.rsplit('\\').next().unwrap_or(&class);
         if found.iter().any(|(known, _)| known == short) {
             continue;
         }
-        found.push((short.to_string(), directory(index, &name.fqn)));
+        found.push((short.to_string(), directory(index, &class)));
     }
     found
+}
+
+/// The classes `config/bundles.php` in `config` names, in order.
+pub(crate) fn bundle_classes(config: &Path) -> Vec<String> {
+    let Ok(source) = std::fs::read(config.join("bundles.php")) else {
+        return Vec::new();
+    };
+    summarize(&source)
+        .names
+        .into_iter()
+        .filter(|n| n.kind == NameKind::ClassLike)
+        .map(|n| n.fqn)
+        .collect()
 }
 
 /// The directory of the bundle `name` registered in `config/bundles.php`.
