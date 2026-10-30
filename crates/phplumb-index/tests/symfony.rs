@@ -587,6 +587,7 @@ fn handlers_of_a_message() {
     assert_eq!(
         handlers(&index, "App\\Message\\SendEmail"),
         [
+            pair("src/Handler/HandlesEmail.php", "__invoke"),
             pair("src/Handler/NotifyLogger.php", "handle"),
             pair("src/Handler/SendEmailHandler.php", "__invoke"),
             pair("src/Handler/SmsHandlers.php", "onSms"),
@@ -596,6 +597,7 @@ fn handlers_of_a_message() {
     assert_eq!(
         handlers(&index, "App\\Message\\SendSms"),
         [
+            pair("src/Handler/AbstractSmsHandler.php", "onAbstractSms"),
             pair("src/Handler/Explicit.php", "run"),
             pair("src/Handler/NotifyLogger.php", "handle"),
             pair("src/Handler/SmsHandlers.php", "onSms"),
@@ -647,6 +649,7 @@ fn dispatch_lists_the_handlers() {
     assert_eq!(
         dispatch_targets(&mut index, 19),
         [
+            pair("src/Handler/HandlesEmail.php", "__invoke"),
             pair("src/Handler/NotifyLogger.php", "handle"),
             pair("src/Handler/SendEmailHandler.php", "__invoke"),
             pair("src/Handler/SmsHandlers.php", "onSms"),
@@ -656,6 +659,7 @@ fn dispatch_lists_the_handlers() {
     assert_eq!(
         dispatch_targets(&mut index, 20),
         [
+            pair("src/Handler/AbstractSmsHandler.php", "onAbstractSms"),
             pair("src/Handler/Explicit.php", "run"),
             pair("src/Handler/NotifyLogger.php", "handle"),
             pair("src/Handler/SmsHandlers.php", "onSms"),
@@ -1601,5 +1605,39 @@ fn handle_without_the_trait_lists_nothing() {
     assert_eq!(
         definition_on_line(&mut index, "src/Service/OwnHandle.php", 11, "handle"),
         [pair("src/Service/OwnHandle.php", "handle")]
+    );
+}
+
+#[test]
+fn inherited_handler_methods_handle_for_concrete_classes() {
+    let mut index = build();
+    let sms = dispatch_targets(&mut index, 20);
+    assert_eq!(
+        sms.iter()
+            .filter(|target| target.0 == "src/Handler/AbstractSmsHandler.php")
+            .collect::<Vec<_>>(),
+        [&pair("src/Handler/AbstractSmsHandler.php", "onAbstractSms")]
+    );
+    assert_eq!(
+        lines_of(
+            &mut index,
+            "src/Handler/AbstractSmsHandler.php",
+            11,
+            "onAbstractSms"
+        ),
+        [
+            (14, "handle".to_string()),
+            (20, "dispatch".to_string()),
+            (24, "dispatch".to_string())
+        ]
+    );
+}
+
+#[test]
+fn trait_handler_methods_handle_for_their_class() {
+    let mut index = build();
+    assert!(
+        dispatch_targets(&mut index, 19)
+            .contains(&pair("src/Handler/HandlesEmail.php", "__invoke"))
     );
 }
