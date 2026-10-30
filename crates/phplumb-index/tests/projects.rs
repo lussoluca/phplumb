@@ -1822,3 +1822,78 @@ fn bare_attributes_of_other_classes_on_hooks_open_their_class() {
         [root.join("drupal/modules/custom/mymodule/src/Traced.php")]
     );
 }
+
+const AS_MESSAGE_HANDLER: &str = "<?php\nnamespace Symfony\\Component\\Messenger\\Attribute;\n#[\\Attribute]\nclass AsMessageHandler\n{\n    public function __construct(?string $bus = null, ?string $fromTransport = null, ?string $handles = null, ?string $method = null) {}\n}\n";
+const MESSAGE_BUS: &str = "<?php\nnamespace Symfony\\Component\\Messenger;\ninterface MessageBusInterface\n{\n    public function dispatch(object $message, array $stamps = []): object;\n}\n";
+const PING: &str = "<?php\nnamespace App\\Message;\nfinal class Ping\n{\n}\n";
+const PING_HANDLER: &str = "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\n#[AsMessageHandler]\nfinal class PingHandler\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n";
+const SENDER: &str = "<?php\nnamespace App\\Service;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nfinal class Sender\n{\n    public function __construct(private MessageBusInterface $bus)\n    {\n    }\n\n    public function send(): void\n    {\n        $this->bus->dispatch(new Ping());\n    }\n}\n";
+
+/// `broken_symfony` with Messenger's classes, a `Ping` message, its handler, a
+/// sender, and `files`.
+fn messenger_symfony(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let mut all = vec![
+        ("lib/AsMessageHandler.php", AS_MESSAGE_HANDLER),
+        ("lib/MessageBusInterface.php", MESSAGE_BUS),
+        ("src/Message/Ping.php", PING),
+        ("src/Handler/PingHandler.php", PING_HANDLER),
+        ("src/Service/Sender.php", SENDER),
+    ];
+    all.extend_from_slice(files);
+    broken_symfony(&all)
+}
+
+/// The definitions at the first `needle` in `file` below `root`, as (file name,
+/// text) pairs, sorted.
+fn handler_definitions(
+    index: &mut Index,
+    root: &Path,
+    file: &str,
+    needle: &str,
+) -> Vec<(String, String)> {
+    let path = root.join(file);
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source).find(needle).unwrap() as u32 + 1;
+    let mut found: Vec<(String, String)> = index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| {
+            let text = fs::read(&location.path).unwrap();
+            (
+                location
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                String::from_utf8_lossy(&text[location.start as usize..location.end as usize])
+                    .into_owned(),
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn named(file: &str, text: &str) -> (String, String) {
+    (file.to_string(), text.to_string())
+}
+
+#[cfg(unix)]
+#[test]
+fn handlers_under_a_symlinked_root_list_their_dispatches() {
+    let (_dir, root) = messenger_symfony(&[]);
+    let links = TempDir::new().unwrap();
+    let link = links.path().join("workspace");
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    let mut index = auto(&link);
+
+    assert_eq!(
+        handler_definitions(&mut index, &link, "src/Handler/PingHandler.php", "__invoke"),
+        [named("Sender.php", "dispatch")]
+    );
+    assert_eq!(
+        handler_definitions(&mut index, &link, "src/Service/Sender.php", "dispatch("),
+        [named("PingHandler.php", "__invoke")]
+    );
+}

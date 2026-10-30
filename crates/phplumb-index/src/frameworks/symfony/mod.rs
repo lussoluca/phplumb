@@ -756,16 +756,18 @@ impl Framework for Symfony {
         index: &Index,
         declaration: &FrameworkDeclaration<'_>,
     ) -> Vec<(Location, String)> {
+        // Handlers are stored at the paths the index holds, whatever path the editor
+        // opened the root through.
         let handled = match declaration {
             FrameworkDeclaration::Method { path, member, .. } => {
-                self.handled_by(path, member.name_start)
+                self.handled_by(&index.filter().under_root(path), member.name_start)
             }
             FrameworkDeclaration::Class {
                 path,
                 class,
                 metadata,
             } => messenger::handler_method(class, metadata)
-                .map(|method| self.handled_by(path, method.name_start))
+                .map(|method| self.handled_by(&index.filter().under_root(path), method.name_start))
                 .unwrap_or_default(),
             FrameworkDeclaration::Function { .. } => Vec::new(),
         };
