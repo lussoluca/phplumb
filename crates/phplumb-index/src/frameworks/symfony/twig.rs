@@ -12,6 +12,62 @@ const LIST_TAGS: [&str; 2] = ["extends", "include"];
 pub(crate) enum TwigName {
     Route,
     Template,
+    /// A route name with `#{}` interpolations.
+    RoutePattern,
+    /// A template name with `#{}` interpolations.
+    TemplatePattern,
+    /// An element of a list of templates, by where the list opens: Twig loads the
+    /// first that exists, so the list fails only when every element is missing.
+    Choice(usize),
+}
+
+/// A name with `#{}` interpolations as a pattern, `*` standing for each.
+pub(crate) fn pattern(name: &str) -> String {
+    let mut found = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(at) = rest.find("#{") {
+        found.push_str(&rest[..at]);
+        let mut depth = 0;
+        let mut end = rest.len();
+        for (i, c) in rest[at + 1..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = at + 1 + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !found.ends_with('*') {
+            found.push('*');
+        }
+        rest = &rest[end..];
+    }
+    found.push_str(rest);
+    found
+}
+
+/// Whether `text` matches `pattern`, each `*` standing for any text.
+pub(crate) fn matches(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let [first, middle @ .., last] = parts.as_slice() else {
+        return pattern == text;
+    };
+    if text.len() < first.len() + last.len() || !text.starts_with(first) || !text.ends_with(last) {
+        return false;
+    }
+    let mut rest = &text[first.len()..text.len() - last.len()];
+    for part in middle {
+        let Some(at) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[at + part.len()..];
+    }
+    true
 }
 
 /// Tags whose content Twig outputs as written.
@@ -85,9 +141,10 @@ fn template_use(source: &[u8], literal: &Literal) -> Option<bool> {
 }
 
 /// Every route name and template name `source` writes as a whole literal argument,
-/// with its range inside the quotes. Names a template may lack, in an element of a
-/// list, a branch of a conditional or with `ignore missing`, are left out, as is
-/// text inside `verbatim`.
+/// with its range inside the quotes; names with `#{}` interpolations as patterns,
+/// and the elements of a template list by their list. Names a template may lack,
+/// in a branch of a conditional or with `ignore missing`, are left out, as is text
+/// inside `verbatim`.
 pub(crate) fn names(source: &[u8]) -> Vec<(TwigName, String, u32, u32)> {
     let mut found = Vec::new();
     let mut i = 0;
@@ -132,22 +189,28 @@ pub(crate) fn names(source: &[u8]) -> Vec<(TwigName, String, u32, u32)> {
             // `#{...}` interpolates an expression into a double-quoted string.
             let interpolated = source[literal.quote] == b'"'
                 && find(source, literal.content, b"#{").is_some_and(|at| at < literal.close);
-            if interpolated {
-                continue;
-            }
             // `ignore_missing` is the 4th argument of `include()`, the 2nd of `source()`.
             let lenient = |function: &str, arguments: usize| {
                 is_function_argument(source, &literal, &[function])
                     && argument_count(source, &literal) >= arguments
             };
             let kind = if is_route_argument(source, &literal) {
-                TwigName::Route
+                match interpolated {
+                    true => TwigName::RoutePattern,
+                    false => TwigName::Route,
+                }
             } else if optional || lenient("include", 4) || lenient("source", 2) {
                 continue;
-            } else if template_use(source, &literal) == Some(true) {
-                TwigName::Template
             } else {
-                continue;
+                match (template_use(source, &literal), interpolated) {
+                    (Some(true), false) => TwigName::Template,
+                    (Some(true), true) => TwigName::TemplatePattern,
+                    (Some(false), false) => match list_of(source, &literal) {
+                        Some(open) => TwigName::Choice(open),
+                        None => continue,
+                    },
+                    _ => continue,
+                }
             };
             let (name, start, end) = literal.value(source);
             found.push((kind, name, start, end));
@@ -182,6 +245,79 @@ fn argument_count(source: &[u8], literal: &Literal) -> usize {
 }
 
 /// Whether the literal is an element of a list rather than the tag's argument.
+/// Where the list of templates the literal is an element of opens, for
+/// `include([...])` and `{% include [...] %}` or `{% extends [...] %}`.
+fn list_of(source: &[u8], literal: &Literal) -> Option<usize> {
+    let element = is_function_list_element(source, literal, &["include"])
+        || (is_tag_argument(source, literal) && in_list(source, literal));
+    if !element {
+        return None;
+    }
+    let (block, end) = literal.block;
+    let open = enclosing_open(source, block, literal.quote)?;
+    let close = closing(source, open, end)?;
+    (plain_list(source, open, close) && whole_argument(source, literal, close)).then_some(open)
+}
+
+/// Whether the list between `open` and `close` holds only string literals without
+/// interpolations, so its elements are every template Twig may try.
+fn plain_list(source: &[u8], open: usize, close: usize) -> bool {
+    let mut i = open + 1;
+    while i < close {
+        match source[i] {
+            b',' => i += 1,
+            c if c.is_ascii_whitespace() => i += 1,
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < close && source[i] != quote {
+                    if quote == b'"' && source[i..].starts_with(b"#{") {
+                        return false;
+                    }
+                    i += if source[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether the list closing at `close` is the whole argument the literal's tag or
+/// call takes: the tag goes on with `with`, `only`, `ignore` or ends, and the call
+/// ends or takes other arguments, fewer than the four that bring `ignore_missing`.
+fn whole_argument(source: &[u8], literal: &Literal, close: usize) -> bool {
+    let end = literal.block.1;
+    let after = skip_spaces(source, close + 1, end);
+    if literal.tag {
+        let rest = String::from_utf8_lossy(&source[after..end]);
+        let rest = rest.trim_end_matches(['-', '~']).trim_end();
+        let word = rest.split(|c: char| !c.is_ascii_alphanumeric()).next();
+        return rest.is_empty() || matches!(word, Some("with" | "only" | "ignore"));
+    }
+    let mut arguments = 1;
+    let mut depth = 0;
+    let mut i = after;
+    while i < end {
+        match source[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < end && source[i] != quote {
+                    i += if source[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' if depth == 0 => return arguments < 4,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => arguments += 1,
+            _ if depth == 0 && i == after => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 fn in_list(source: &[u8], literal: &Literal) -> bool {
     let mut i = literal.quote;
     while i > literal.block.0 && source[i - 1].is_ascii_whitespace() {
@@ -658,7 +794,7 @@ fn form_theme(source: &[u8], literal: &Literal) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TwigName, names, route_name_at, template_name_at};
+    use super::{TwigName, matches, names, pattern, route_name_at, template_name_at};
 
     fn route(source: &str, needle: &str) -> Option<String> {
         let offset = source.find(needle).unwrap() as u32 + 1;
@@ -719,6 +855,20 @@ mod tests {
         ] {
             assert_eq!(template(source, needle), None, "{source} {needle}");
         }
+    }
+
+    #[test]
+    fn interpolations_become_patterns() {
+        assert_eq!(pattern("blog_#{x}"), "blog_*");
+        assert_eq!(pattern("#{a}/#{ {k: 1}.k }.html.twig"), "*/*.html.twig");
+        assert_eq!(pattern("#{a}#{b}x"), "*x");
+        assert!(matches("blog_*", "blog_list"));
+        assert!(matches("*/*.twig", "a/b/c.twig"));
+        assert!(matches("a*b*c", "abc"));
+        assert!(!matches("a*b*c", "acb"));
+        assert!(!matches("ab*ba", "aba"));
+        assert!(matches("plain", "plain"));
+        assert!(!matches("plain", "plains"));
     }
 
     #[test]

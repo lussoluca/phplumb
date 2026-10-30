@@ -704,6 +704,8 @@ impl<'ast, 'arena> Walker<'ast, 'arena, Vec<&'ast KeyValueArrayElement<'arena>>>
 #[derive(Default)]
 pub(crate) struct ConfiguratorDefinitions {
     pub parameters: Vec<(String, u32, u32)>,
+    /// Whether a parameter is set under a name the file computes.
+    pub computed_parameters: bool,
     pub services: Vec<(String, u32, u32)>,
     pub aliases: Vec<(String, String)>,
 }
@@ -823,9 +825,10 @@ pub(crate) fn configurator_definitions(source: &[u8]) -> ConfiguratorDefinitions
         };
         let arguments = &call.argument_list;
         match (method_name(&call.method).as_deref(), kind) {
-            (Some("set"), Configurator::Parameters) => {
-                found.parameters.extend(name_at(positional(arguments, 0)));
-            }
+            (Some("set"), Configurator::Parameters) => match name_at(positional(arguments, 0)) {
+                Some(name) => found.parameters.push(name),
+                None => found.computed_parameters = true,
+            },
             (Some("set"), Configurator::Services) => {
                 found.services.extend(name_at(positional(arguments, 0)));
             }
@@ -851,11 +854,16 @@ pub(crate) fn configurator_definitions(source: &[u8]) -> ConfiguratorDefinitions
 pub(crate) struct ParameterSetters {
     pub names: Vec<String>,
     pub patterns: Vec<(String, String)>,
+    /// Names given as a class constant, by class and constant, for the caller to
+    /// look up.
+    pub constants: Vec<(String, String)>,
     pub computed: bool,
 }
 
-/// The parameter names the `setParameter()` calls of `source` set, on any receiver.
+/// The parameter names the `setParameter()` calls of `source` set, on any receiver,
+/// and the `set()` calls on a `getParameterBag()`.
 pub(crate) fn parameter_setters(source: &[u8]) -> ParameterSetters {
+    let summary = summarize(source);
     let arena = LocalArena::new();
     let program = parse_file_content(&arena, FileId::zero(), source);
     let mut calls: Vec<CallRef<'_, '_>> = Vec::new();
@@ -868,7 +876,34 @@ pub(crate) fn parameter_setters(source: &[u8]) -> ParameterSetters {
         let ClassLikeMemberSelector::Identifier(name) = &call.method else {
             continue;
         };
-        if !name.value.eq_ignore_ascii_case(b"setParameter") {
+        let on_bag = matches!(call.object, Expression::Call(Call::Method(bag))
+            if matches!(&bag.method, ClassLikeMemberSelector::Identifier(name)
+                if name.value.eq_ignore_ascii_case(b"getParameterBag")));
+        let setter = name.value.eq_ignore_ascii_case(b"setParameter")
+            || (on_bag && name.value.eq_ignore_ascii_case(b"set"));
+        if !setter {
+            continue;
+        }
+        if let Some(Expression::Access(Access::ClassConstant(access))) =
+            positional(&call.argument_list, 0)
+        {
+            let class = match access.class {
+                Expression::Self_(_) | Expression::Static(_) => summary
+                    .enclosing_class(access.double_colon.start.offset)
+                    .and_then(|class| class.fqn.clone()),
+                Expression::Identifier(identifier) => summary
+                    .names
+                    .iter()
+                    .find(|n| n.start == identifier.span().start.offset)
+                    .map(|n| n.fqn.clone()),
+                _ => None,
+            };
+            match (class, &access.constant) {
+                (Some(class), ClassLikeConstantSelector::Identifier(constant)) => found
+                    .constants
+                    .push((class, String::from_utf8_lossy(constant.value).into_owned())),
+                _ => found.computed = true,
+            }
             continue;
         }
         let shaped = match positional(&call.argument_list, 0) {
@@ -1424,6 +1459,49 @@ enum CallRef<'ast, 'arena> {
     Method(&'ast MethodCall<'arena>),
     NullSafe(&'ast NullSafeMethodCall<'arena>),
     Static(&'ast StaticMethodCall<'arena>),
+}
+
+/// Each `try` body of `source` with the classes its `catch` clauses name, as
+/// `summary` resolves them.
+pub(crate) fn caught_ranges(source: &[u8], summary: &FileSummary) -> Vec<(u32, u32, Vec<String>)> {
+    let arena = LocalArena::new();
+    let program = parse_file_content(&arena, FileId::zero(), source);
+    let mut blocks: Vec<&Try<'_>> = Vec::new();
+    TryBlocks.walk_program(program, &mut blocks);
+    blocks
+        .into_iter()
+        .map(|r#try| {
+            let body = r#try.block.span();
+            let classes = r#try
+                .catch_clauses
+                .iter()
+                .flat_map(|clause| {
+                    let (start, end) = (
+                        clause.left_parenthesis.end.offset,
+                        clause.right_parenthesis.start.offset,
+                    );
+                    summary
+                        .names
+                        .iter()
+                        .filter(move |name| {
+                            name.kind == NameKind::ClassLike
+                                && start <= name.start
+                                && name.end <= end
+                        })
+                        .map(|name| name.fqn.clone())
+                })
+                .collect();
+            (body.start.offset, body.end.offset, classes)
+        })
+        .collect()
+}
+
+struct TryBlocks;
+
+impl<'ast, 'arena> Walker<'ast, 'arena, Vec<&'ast Try<'arena>>> for TryBlocks {
+    fn walk_in_try(&self, r#try: &'ast Try<'arena>, found: &mut Vec<&'ast Try<'arena>>) {
+        found.push(r#try);
+    }
 }
 
 struct CallsWithArguments;

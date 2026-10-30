@@ -588,6 +588,49 @@ fn parameters_set_through_untyped_variables_are_known() {
 }
 
 #[test]
+fn exceptions_silence_only_their_try_blocks() {
+    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nuse Symfony\\Component\\Routing\\Exception\\RouteNotFoundException;\nuse Symfony\\Component\\DependencyInjection\\Exception\\ParameterNotFoundException;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->redirectToRoute('missing_route');\n        try {\n            $this->redirectToRoute('caught_route');\n        } catch (RouteNotFoundException $e) {\n        }\n        try {\n            $this->redirectToRoute('thrown_route');\n        } catch (\\Throwable $e) {\n        }\n        try {\n            $this->redirectToRoute('other_route');\n        } catch (ParameterNotFoundException $e) {\n        }\n        $this->getParameter('app.nowhere');\n        try {\n            $this->getParameter('app.caught');\n        } catch (\\Exception $e) {\n        }\n    }\n}\n";
+    let stubs = [
+        (
+            "lib/RouteNotFoundException.php",
+            "<?php\nnamespace Symfony\\Component\\Routing\\Exception;\nclass RouteNotFoundException extends \\InvalidArgumentException\n{\n}\n",
+        ),
+        (
+            "lib/ParameterNotFoundException.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Exception;\nclass ParameterNotFoundException extends \\InvalidArgumentException\n{\n}\n",
+        ),
+        (
+            "lib/UrlGenerator.php",
+            "<?php\nnamespace Symfony\\Component\\Routing\\Generator;\nclass UrlGenerator\n{\n}\n",
+        ),
+    ];
+    let project = |uses: &str| {
+        let mut all = stubs.to_vec();
+        all.push(("src/Controller/Uses.php", uses));
+        broken_symfony(&all)
+    };
+    let (_dir, root) = project(uses);
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined route 'missing_route'",
+            "Undefined route 'other_route'",
+            "Undefined parameter 'app.nowhere'"
+        ]
+    );
+    // A file that builds its own router may name its own routes.
+    let builder = uses.replace(
+        "use Symfony\\Component\\Routing\\Exception\\RouteNotFoundException;",
+        "use Symfony\\Component\\Routing\\Exception\\RouteNotFoundException;\nuse Symfony\\Component\\Routing\\Generator\\UrlGenerator;",
+    ).replace("    public function run(): void\n    {\n", "    public function run(): void\n    {\n        new UrlGenerator();\n");
+    let (_dir, root) = project(&builder);
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'app.nowhere'"]
+    );
+}
+
+#[test]
 fn unknown_route_imports_silence_route_diagnostics() {
     let (_dir, root) = broken_symfony(&[(
         "config/routes/acme.yaml",
@@ -1399,7 +1442,7 @@ fn directory_imports_with_unread_files_silence_route_diagnostics() {
             "config/routes.yaml",
             "home:\n    path: /\nlegacy:\n    resource: '../modules/legacy/'\n    type: directory\n",
         ),
-        ("modules/legacy/x.xml", "<routes/>\n"),
+        ("modules/legacy/x.txt", "routes\n"),
     ]);
 
     assert_eq!(
@@ -1535,6 +1578,49 @@ fn bundle_extension_parameters_stay_silent() {
     assert!(broken_messages(&root).is_empty());
 }
 
+#[test]
+fn parameters_bundle_code_sets_are_known() {
+    let bundle = "<?php\nnamespace Acme;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle\n{\n    public function build($container): void\n    {\n        $container->addCompilerPass(new \\Acme\\Pass\\AcmePass());\n    }\n}\n";
+    let pass = "<?php\nnamespace Acme\\Pass;\nuse Symfony\\Component\\DependencyInjection\\Compiler\\CompilerPassInterface;\nclass AcmePass implements CompilerPassInterface\n{\n    private const KEY = 'acme.const_set';\n\n    public function process($container): void\n    {\n        $container->setParameter('acme.pass_set', 1);\n        $container->getParameterBag()->set(self::KEY, 1);\n    }\n}\n";
+    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->getParameter('router.nowhere');\n        $this->getParameter('acme.pass_set');\n        $this->getParameter('acme.const_set');\n        $this->getParameter('container.build_id');\n        $this->getParameter('acme.yaml_set');\n        $this->getParameter('acme.nowhere');\n    }\n}\n";
+    let base = [
+        (
+            "lib/CompilerPassInterface.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Compiler;\ninterface CompilerPassInterface\n{\n}\n",
+        ),
+        ("lib/acme/src/AcmeBundle.php", bundle),
+        ("lib/acme-pass/AcmePass.php", pass),
+        (
+            "lib/acme/config/services.yaml",
+            "parameters:\n    acme.yaml_set: 1\n",
+        ),
+        ("src/Controller/Uses.php", uses),
+        (
+            "config/services.yaml",
+            "parameters:\n    app.name: x\n    acme.local: 1\n",
+        ),
+    ];
+    let project = |files: &[(&str, &str)]| {
+        let mut all = base.to_vec();
+        all.extend_from_slice(files);
+        bundled_symfony(&all)
+    };
+    // Bundles may set parameters in more ways than the module reads, so only the
+    // project's families are checked.
+    let (_dir, root) = project(&[]);
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'acme.nowhere'"]
+    );
+    // A bundle the index lacks changes nothing.
+    let unindexed = "<?php\nreturn [\n    Symfony\\Bundle\\FrameworkBundle\\FrameworkBundle::class => ['all' => true],\n    Acme\\AcmeBundle::class => ['all' => true],\n    Missing\\MissingBundle::class => ['all' => true],\n];\n";
+    let (_dir, root) = project(&[("config/bundles.php", unindexed)]);
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'acme.nowhere'"]
+    );
+}
+
 fn route_missing(index: &Index, name: &str) -> bool {
     index.framework::<Symfony>().unwrap().route_missing(name)
 }
@@ -1549,6 +1635,76 @@ fn bundle_routes_lead_to_their_definitions() {
 
     assert_eq!(route_files_of(&index, "_preview_error"), ["_preview_error"]);
     assert!(route_missing(&index, "_missing"));
+}
+
+const BLOG_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<routes xmlns=\"http://symfony.com/schema/routing\">\n    <route id=\"blog_list\" path=\"/blog\" controller=\"App\\Controller\\Blog::list\"/>\n    <route id=\"blog_show\" path=\"/blog/{slug}\">\n        <default key=\"_controller\">App\\Controller\\Blog::show</default>\n    </route>\n    <when env=\"dev\">\n        <route id=\"blog_debug\" path=\"/debug\"/>\n    </when>\n    <route id=\"blog_old\" alias=\"blog_list\"/>\n    <import resource=\"admin.xml\" name-prefix=\"admin_\"/>\n</routes>\n";
+
+/// A Symfony project whose `config/routes.yaml` imports `config/blog/blog.xml`.
+fn xml_routed_symfony(blog: &str, files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let mut all = vec![
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nblog:\n    resource: blog/blog.xml\n",
+        ),
+        ("config/blog/blog.xml", blog),
+        (
+            "config/blog/admin.xml",
+            "<routes>\n    <route id=\"panel\" path=\"/admin\"/>\n</routes>\n",
+        ),
+        (
+            "src/Controller/Blog.php",
+            "<?php\nnamespace App\\Controller;\nclass Blog\n{\n    public function list(): void {}\n    public function show(): void {}\n}\n",
+        ),
+    ];
+    all.extend_from_slice(files);
+    broken_symfony(&all)
+}
+
+#[test]
+fn xml_route_files_define_routes() {
+    let (_dir, root) = xml_routed_symfony(BLOG_XML, &[]);
+    let index = auto(&root);
+    assert_eq!(route_files_of(&index, "blog_list"), ["blog_list", "list"]);
+    assert_eq!(route_files_of(&index, "blog_show"), ["blog_show", "show"]);
+    assert_eq!(route_files_of(&index, "blog_debug"), ["blog_debug"]);
+    assert_eq!(route_files_of(&index, "blog_old"), ["blog_list", "list"]);
+    assert_eq!(route_files_of(&index, "admin_panel"), ["panel"]);
+    assert!(route_files_of(&index, "panel").is_empty());
+    assert_eq!(broken_messages(&root), CERTAIN);
+}
+
+#[test]
+fn unreadable_xml_routes_stay_unknown() {
+    for import in [
+        "<import resource=\"../src/*.xml\"/>",
+        "<import resource=\"../src/Controller/\" type=\"annotation\"/>",
+        "<r:route xmlns:r=\"http://symfony.com/schema/routing\" id=\"missing_route\" path=\"/x\"/>",
+    ] {
+        let blog = format!("<routes>\n    {import}\n</routes>\n");
+        let (_dir, root) = xml_routed_symfony(&blog, &[]);
+        assert_eq!(
+            broken_messages(&root),
+            ["Undefined parameter 'app.nowhere'"],
+            "{import}"
+        );
+    }
+}
+
+#[test]
+fn xml_bundle_route_imports_are_read() {
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/framework-bundle/Resources/config/routing/errors.xml",
+            "<routes>\n    <route id=\"_preview_error\" path=\"/{code}.{_format}\" controller=\"error_controller::preview\"/>\n</routes>\n",
+        ),
+        (
+            "config/routes/framework.yaml",
+            "when@dev:\n    _errors:\n        resource: '@FrameworkBundle/Resources/config/routing/errors.xml'\n        prefix: /_error\n",
+        ),
+    ]);
+    let index = auto(&root);
+    assert_eq!(route_files_of(&index, "_preview_error"), ["_preview_error"]);
+    assert!(route_missing(&index, "_nowhere"));
 }
 
 #[test]
@@ -1616,7 +1772,48 @@ fn logout_routes_lead_to_the_firewall() {
 
     assert_eq!(route_files_of(&index, "_logout_main"), ["logout"]);
     assert!(route_files_of(&index, "_logout_dev").is_empty());
-    assert!(!route_missing(&index, "_missing"));
+}
+
+#[test]
+fn logout_routes_are_checked_when_security_is_read() {
+    let files = [
+        (
+            "config/packages/security.yaml",
+            "security:\n    firewalls:\n        main:\n            logout:\n                path: /logout\n",
+        ),
+        (
+            "config/routes/security.yaml",
+            "_security_logout:\n    resource: security.route_loader.logout\n    type: service\n",
+        ),
+    ];
+    let (_dir, root) = broken_symfony(&files);
+    let index = auto(&root);
+    assert!(route_missing(&index, "_logout_admin"));
+    assert!(!route_missing(&index, "_logout_main"));
+    // PHP configuration may add firewalls the module does not read.
+    let mut more = files.to_vec();
+    more.push((
+        "config/packages/security.php",
+        "<?php\nreturn static function (): void {};\n",
+    ));
+    let (_dir, root) = broken_symfony(&more);
+    assert!(!route_missing(&auto(&root), "_logout_admin"));
+    // So may a kernel that configures the container from PHP.
+    let mut kernel = files.to_vec();
+    kernel.push((
+        "src/Kernel.php",
+        "<?php\nnamespace App;\nuse Symfony\\Component\\DependencyInjection\\Loader\\Configurator\\ContainerConfigurator;\nclass Kernel\n{\n    protected function configureContainer(ContainerConfigurator $c): void\n    {\n    }\n}\n",
+    ));
+    let (_dir, root) = broken_symfony(&kernel);
+    assert!(!route_missing(&auto(&root), "_logout_admin"));
+    // A parameter in a logout path, or settings merged from another key, hide it.
+    for security in [
+        "security:\n    firewalls:\n        main:\n            logout:\n                path: '%app.logout%'\n",
+        "security:\n    firewalls:\n        main: &main\n            logout:\n                path: /logout\n        admin:\n            <<: *main\n",
+    ] {
+        let (_dir, root) = broken_symfony(&[("config/packages/security.yaml", security), files[1]]);
+        assert!(!route_missing(&auto(&root), "_logout_admin"), "{security}");
+    }
 }
 
 #[test]
@@ -1984,6 +2181,81 @@ fn unresolved_bundle_namespaces_stay_unknown() {
             );
         }
     }
+}
+
+/// The diagnostics of `file` in the project at `root`.
+fn messages_of(root: &Path, file: &str) -> Vec<String> {
+    let index = auto(root);
+    let path = root.join(file);
+    let source = fs::read(&path).unwrap();
+    index
+        .diagnostics(&path, &source)
+        .into_iter()
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn interpolated_twig_names_are_checked() {
+    let page = "{{ path(\"blog_#{x}\") }}\n{{ path(\"shop_#{x}\") }}\n{% include \"blocks/#{t}.html.twig\" %}\n{% include \"cards/#{t}.html.twig\" %}\n{% include \"#{ns}/card.html.twig\" %}\n{{ path(\"about.#{locale}\") }}\n";
+    let (_dir, root) = broken_symfony(&[
+        (
+            "config/routes.yaml",
+            "home:\n    path: /\nblog_list:\n    path: /blog\nabout:\n    path: { en: /about, fr: /a-propos }\n",
+        ),
+        ("templates/blocks/a.html.twig", "a\n"),
+        ("templates/page.html.twig", page),
+        TWIG_BRIDGE,
+    ]);
+    assert_eq!(
+        messages_of(&root, "templates/page.html.twig"),
+        [
+            "Undefined route 'shop_#{x}'",
+            "Undefined template 'cards/#{t}.html.twig'"
+        ]
+    );
+}
+
+#[test]
+fn template_lists_are_checked() {
+    let page = "{{ include(['a.html.twig', 'b.html.twig']) }}\n{{ include(['c.html.twig', 'exists.html.twig']) }}\n{% include 'x.html.twig' ignore missing %}\n{% include ['d.html.twig', 'e.html.twig'] %}\n{% include [custom, 'gone_1.html.twig'] %}\n{{ include([custom, 'gone_2.html.twig']) }}\n{% extends [layout, 'gone_3.html.twig'] %}\n{% include ['gone_4.html.twig']|merge(more) %}\n{% include [\"pages/#{slug}.html.twig\", 'gone_5.html.twig'] %}\n{{ include(['gone_6.html.twig', 'gone_7.html.twig'], {}, true, true) }}\n";
+    let (_dir, root) = broken_symfony(&[
+        ("templates/exists.html.twig", "exists\n"),
+        ("templates/page.html.twig", page),
+        TWIG_BRIDGE,
+    ]);
+    assert_eq!(
+        messages_of(&root, "templates/page.html.twig"),
+        [
+            "Undefined template 'a.html.twig'",
+            "Undefined template 'b.html.twig'",
+            "Undefined template 'd.html.twig'",
+            "Undefined template 'e.html.twig'"
+        ]
+    );
+}
+
+#[test]
+fn project_bundle_templates_are_checked() {
+    let include = "{% include 'nowhere.html.twig' %}\n";
+    let (_dir, root) = templated_bundles(&[
+        (
+            "config/bundles.php",
+            "<?php\nreturn [\n    Symfony\\Bundle\\FrameworkBundle\\FrameworkBundle::class => ['all' => true],\n    Acme\\AcmeBundle::class => ['all' => true],\n    App\\AdminBundle\\AdminBundle::class => ['all' => true],\n];\n",
+        ),
+        (
+            "src/AdminBundle/AdminBundle.php",
+            "<?php\nnamespace App\\AdminBundle;\nuse Symfony\\Component\\HttpKernel\\Bundle\\Bundle;\nclass AdminBundle extends Bundle {}\n",
+        ),
+        ("src/AdminBundle/templates/panel.html.twig", include),
+        ("tests/fixtures/page.html.twig", include),
+    ]);
+    assert_eq!(
+        messages_of(&root, "src/AdminBundle/templates/panel.html.twig"),
+        ["Undefined template 'nowhere.html.twig'"]
+    );
+    assert!(messages_of(&root, "tests/fixtures/page.html.twig").is_empty());
+    assert!(messages_of(&root, "lib/acme/templates/card.html.twig").is_empty());
 }
 
 #[test]

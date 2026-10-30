@@ -303,6 +303,10 @@ const KERNELS: [&str; 4] = [
     "Symfony\\Component\\DependencyInjection\\Kernel\\KernelInterface",
 ];
 
+/// The interface of compiler passes, which may set parameters.
+const COMPILER_PASS: &str =
+    "Symfony\\Component\\DependencyInjection\\Compiler\\CompilerPassInterface";
+
 /// The interface of Twig loaders, which autoconfiguration tags `twig.loader`.
 const TWIG_LOADER: &str = "Twig\\Loader\\LoaderInterface";
 
@@ -583,9 +587,12 @@ impl Symfony {
     /// Bundles define their own parameters, so only a name whose first segment
     /// starts a parameter of the project counts; `kernel.*` and `env(...)` never do.
     pub fn parameter_missing(&self, index: &Index, name: &str) -> bool {
+        // The kernel and the container set `kernel.*`, `container.*` and hidden names.
         if self.parameters_unknown
             || self.parameters.contains_key(name)
             || name.starts_with("kernel.")
+            || name.starts_with("container.")
+            || name.starts_with('.')
             || name.starts_with("env(")
         {
             return false;
@@ -876,8 +883,10 @@ impl Symfony {
 
     /// The parameters each bundle's extension sets: the PHP files of the
     /// `DependencyInjection` directory next to the bundle class, compiler passes
-    /// included, and the bundle class itself, as an `AbstractBundle` loads its
-    /// extension. A bundle the index lacks adds nothing.
+    /// included, the compiler passes the bundle class names, and the bundle class
+    /// itself, as an `AbstractBundle` loads its extension; and the names under
+    /// `parameters` in the bundle's YAML configuration. A name set as a class constant
+    /// that does not resolve may be any.
     fn extension_parameters(&self, index: &Index) -> &ExtensionParameters {
         self.extension_parameters.get_or_init(|| {
             let mut found = ExtensionParameters::default();
@@ -888,12 +897,58 @@ impl Symfony {
                 let Some(dir) = bundle.path.parent() else {
                     continue;
                 };
-                let code = files_below(&[dir.join("DependencyInjection")]);
-                let files = std::iter::once(bundle.path.to_path_buf()).chain(code);
-                for file in files.filter(|file| routes::is_php(file)) {
-                    if let Ok(source) = std::fs::read(&file) {
+                let mut files = vec![bundle.path.to_path_buf()];
+                files.extend(files_below(&[dir.join("DependencyInjection")]));
+                if let Ok(source) = std::fs::read(bundle.path) {
+                    for name in summarize(&source).names {
+                        if name.kind != crate::summary::NameKind::ClassLike
+                            || !is_a(index, &name.fqn, &[COMPILER_PASS])
+                        {
+                            continue;
+                        }
+                        if let Some(pass) = index.classes_named(&name.fqn).into_iter().next() {
+                            files.push(pass.path.to_path_buf());
+                        }
+                    }
+                }
+                files.sort();
+                files.dedup();
+                for file in files.iter().filter(|file| routes::is_php(file)) {
+                    if let Ok(source) = std::fs::read(file) {
                         found.read_php(&source);
                     }
+                }
+                // YAML configuration, which the bundle definitions do not read: the
+                // names under `parameters`.
+                let Some(dir) = bundles::directory(index, &class) else {
+                    continue;
+                };
+                let configured = files_below(&[dir.join("Resources/config"), dir.join("config")]);
+                for file in configured.iter().filter(|file| is_yaml(file)) {
+                    let root = std::fs::read_to_string(file)
+                        .ok()
+                        .and_then(|text| yaml::parse(&text));
+                    if let Some(Yaml::Map(parameters)) =
+                        root.as_ref().and_then(|r| r.get("parameters"))
+                    {
+                        found.names.extend(
+                            parameters
+                                .iter()
+                                .filter_map(|(key, _)| key.text().map(str::to_string)),
+                        );
+                    }
+                }
+            }
+            for (class, constant) in std::mem::take(&mut found.constants) {
+                let value = index
+                    .find_member(&class, MemberKind::Constant, &constant)
+                    .into_iter()
+                    .find_map(|(_, member)| member.value.clone());
+                match value {
+                    Some(name) => {
+                        found.names.insert(name);
+                    }
+                    None => found.any = true,
                 }
             }
             found
@@ -1089,11 +1144,10 @@ impl Symfony {
             .flat_map(|class| index.candidate_files(&RefKey::Class(class.to_string())))
             .any(|path| self.is_source(index, path));
         let classes = self.class_sources(index, &filter);
-        self.parameters_unknown = configured_in_php
-            || unread_imports
-            || config::has_unread_configuration(&self.project)
-            || classes.config_dir
-            || classes.parameters;
+        let configuration_unread =
+            unread_imports || config::has_unread_configuration(&self.project);
+        self.parameters_unknown =
+            configured_in_php || configuration_unread || classes.config_dir || classes.parameters;
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
         self.aliases = config::read_aliases(&files, &self.config_files);
@@ -1113,7 +1167,14 @@ impl Symfony {
             &files,
             &self.config_files,
         );
-        self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
+        self.routes = Routes::read(
+            index,
+            &filter,
+            &self.project,
+            &self.config_files,
+            &files,
+            configured_in_php || configuration_unread,
+        );
         if classes.config_dir
             || classes.routes
             || config::router_resource_changed(&files, &self.config_files)

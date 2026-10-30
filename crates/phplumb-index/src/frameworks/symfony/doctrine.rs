@@ -25,6 +25,8 @@ const MAPPED_SUPERCLASS_ATTRIBUTE: &str = "Doctrine\\ORM\\Mapping\\MappedSupercl
 pub(crate) struct Element {
     pub(crate) name: String,
     pub(crate) attributes: Vec<(String, String, u32, u32)>,
+    /// Where the element's start tag ends, after its `>`.
+    pub(crate) end: u32,
 }
 
 impl Element {
@@ -124,7 +126,11 @@ pub(crate) fn elements(text: &str) -> Vec<Element> {
                 }
             }
         }
-        found.push(Element { name, attributes });
+        found.push(Element {
+            name,
+            attributes,
+            end: j as u32,
+        });
         i = j;
     }
     found

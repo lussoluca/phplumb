@@ -16,6 +16,8 @@ use crate::infer::{configurator_definitions, parameter_setters};
 pub(crate) struct ExtensionParameters {
     pub names: HashSet<String>,
     pub patterns: Vec<(String, String)>,
+    /// Names given as class constants, by class and constant, still to look up.
+    pub constants: Vec<(String, String)>,
     pub any: bool,
 }
 
@@ -30,10 +32,12 @@ impl ExtensionParameters {
                 self.patterns.push(pattern);
             }
         }
+        self.constants.extend(setters.constants);
         self.any |= setters.computed;
-        let configured = configurator_definitions(source).parameters;
+        let configured = configurator_definitions(source);
         self.names
-            .extend(configured.into_iter().map(|(name, ..)| name));
+            .extend(configured.parameters.into_iter().map(|(name, ..)| name));
+        self.any |= configured.computed_parameters;
     }
 
     /// Whether an extension may set the parameter `name`.
