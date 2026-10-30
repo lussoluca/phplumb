@@ -14,6 +14,9 @@ use crate::summary::SymbolKind;
 /// The attribute that maps an entity class.
 const ENTITY_ATTRIBUTE: &str = "Doctrine\\ORM\\Mapping\\Entity";
 
+/// The attribute that maps a mapped superclass, whose repository its entities take.
+const MAPPED_SUPERCLASS_ATTRIBUTE: &str = "Doctrine\\ORM\\Mapping\\MappedSuperclass";
+
 /// An XML element of a mapping file: its name, its attributes with each value and
 /// the value's range inside the quotes.
 #[derive(Debug, PartialEq, Eq)]
@@ -132,6 +135,19 @@ const MAPPED_CLASSES: [&str; 3] = ["entity", "embeddable", "mapped-superclass"];
 /// `target-entity` names the associated class.
 const ASSOCIATIONS: [&str; 4] = ["one-to-one", "one-to-many", "many-to-one", "many-to-many"];
 
+/// The elements an association holds before its `order-by`, which keep its target
+/// entity for an `order-by-field`; the `cascade-*` elements count too.
+const ASSOCIATION_PARTS: [&str; 8] = [
+    "cache",
+    "cascade",
+    "join-table",
+    "join-columns",
+    "inverse-join-columns",
+    "join-column",
+    "order-by",
+    "order-by-field",
+];
+
 /// What the attribute value under `offset` of a mapping file names.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Named {
@@ -144,11 +160,22 @@ pub(crate) enum Named {
 /// element it belongs to and the class the enclosing element maps.
 pub(crate) fn named_at(text: &str, offset: u32) -> Option<Named> {
     let mut mapped: Option<String> = None;
+    // The target entity of the association the elements read are inside.
+    let mut association: Option<String> = None;
     for element in elements(text) {
-        if MAPPED_CLASSES.contains(&element.name.as_str()) {
+        let name = element.name.as_str();
+        if MAPPED_CLASSES.contains(&name) {
             mapped = element
                 .attribute("name")
                 .map(|n| n.trim_start_matches('\\').to_string());
+        }
+        if ASSOCIATIONS.contains(&name) {
+            association = element
+                .attribute("target-entity")
+                .zip(mapped.as_deref())
+                .map(|(target, mapped)| qualify(mapped, target));
+        } else if !ASSOCIATION_PARTS.contains(&name) && !name.starts_with("cascade") {
+            association = None;
         }
         let Some((key, value, ..)) = element
             .attributes
@@ -157,14 +184,27 @@ pub(crate) fn named_at(text: &str, offset: u32) -> Option<Named> {
         else {
             continue;
         };
-        let name = element.name.as_str();
         let class = |written: &str| mapped.as_deref().map(|m| qualify(m, written));
         return match key.as_str() {
             "name" if MAPPED_CLASSES.contains(&name) => {
                 Some(Named::Class(value.trim_start_matches('\\').to_string()))
             }
             "target-entity" | "repository-class" => class(value).map(Named::Class),
-            "class" if name == "embedded" => class(value).map(Named::Class),
+            "class"
+                if matches!(
+                    name,
+                    "embedded" | "discriminator-mapping" | "entity-listener"
+                ) =>
+            {
+                class(value).map(Named::Class)
+            }
+            // Doctrine reads a custom generator's class as written.
+            "class" if name == "custom-id-generator" => {
+                Some(Named::Class(value.trim_start_matches('\\').to_string()))
+            }
+            "name" if name == "order-by-field" => {
+                Some(Named::Property(association.clone()?, value.clone()))
+            }
             // Doctrine reads `enum-type` as written, without the mapped namespace.
             "enum-type" if matches!(name, "field" | "id") => {
                 Some(Named::Class(value.trim_start_matches('\\').to_string()))
@@ -185,36 +225,51 @@ pub(crate) fn named_at(text: &str, offset: u32) -> Option<Named> {
     None
 }
 
-/// What the mappings declare: each entity's repository class.
+/// What the mappings declare: each entity's repository class, and each mapped
+/// superclass's, which its entities without their own take.
 #[derive(Default)]
 pub(crate) struct Mappings {
-    repositories: HashMap<String, String>,
+    /// Each mapped entity, with the repository it declares.
+    entities: HashMap<String, Option<String>>,
+    /// Each mapped superclass, with the repository it declares.
+    superclasses: HashMap<String, Option<String>>,
+}
+
+/// Records the mapped class `class`, keeping a repository it declares anywhere.
+fn record(found: &mut HashMap<String, Option<String>>, class: &str, repository: Option<String>) {
+    let known = found.entry(class.to_ascii_lowercase()).or_default();
+    if repository.is_some() {
+        *known = repository;
+    }
 }
 
 impl Mappings {
-    /// The `repository-class` of every entity in the project's `*.orm.xml` files,
-    /// then the `repositoryClass` of `#[ORM\Entity]` attributes of project classes.
+    /// The `repository-class` of every entity and mapped superclass in the project's
+    /// `*.orm.xml` files, then the repository of the `#[ORM\Entity]`,
+    /// `@ORM\Entity` and `#[ORM\MappedSuperclass]` mappings of project classes.
     pub(crate) fn read(
         index: &Index,
         filter: &PathFilter,
         files: &[PathBuf],
         config_files: &ConfigFiles,
     ) -> Mappings {
-        let mut repositories = HashMap::new();
+        let mut mappings = Mappings::default();
         for file in files {
             let Some(parsed) = config_files.get(file) else {
                 continue;
             };
             for element in elements(&parsed.text) {
-                if element.name != "entity" {
-                    continue;
-                }
-                if let (Some(entity), Some(repository)) = (
-                    element.attribute("name"),
-                    element.attribute("repository-class"),
-                ) {
+                let found = match element.name.as_str() {
+                    "entity" => &mut mappings.entities,
+                    "mapped-superclass" => &mut mappings.superclasses,
+                    _ => continue,
+                };
+                if let Some(entity) = element.attribute("name") {
                     let entity = entity.trim_start_matches('\\');
-                    repositories.insert(entity.to_ascii_lowercase(), qualify(entity, repository));
+                    let repository = element
+                        .attribute("repository-class")
+                        .map(|repository| qualify(entity, repository));
+                    record(found, entity, repository);
                 }
             }
         }
@@ -225,26 +280,67 @@ impl Mappings {
             let Some(shape) = &declaration.class else {
                 continue;
             };
-            let repository = shape
-                .metadata
-                .iter()
-                .filter(|m| !m.annotation && m.name.eq_ignore_ascii_case(ENTITY_ATTRIBUTE))
-                .find_map(|m| match m.argument("repositoryClass") {
+            // `#[ORM\Entity]`, `@ORM\Entity` and `#[ORM\MappedSuperclass]`, the
+            // repository named or first.
+            for metadata in &shape.metadata {
+                let found = if metadata.name.eq_ignore_ascii_case(ENTITY_ATTRIBUTE) {
+                    &mut mappings.entities
+                } else if metadata
+                    .name
+                    .eq_ignore_ascii_case(MAPPED_SUPERCLASS_ATTRIBUTE)
+                {
+                    &mut mappings.superclasses
+                } else {
+                    continue;
+                };
+                let first = metadata
+                    .arguments
+                    .first()
+                    .filter(|(key, _)| key.is_none())
+                    .map(|(_, value)| value);
+                let repository = match metadata.argument("repositoryClass").or(first) {
                     Some(MetaValue::Class(class)) => Some(class.clone()),
                     Some(MetaValue::String(class)) => Some(qualify(&declaration.fqn, class)),
                     _ => None,
-                });
-            if let Some(repository) = repository {
-                repositories.insert(declaration.fqn.to_ascii_lowercase(), repository);
+                };
+                record(found, &declaration.fqn, repository);
             }
         }
-        Mappings { repositories }
+        mappings
+    }
+
+    /// The repository of `entity`: its own, else, as `ClassMetadataFactory` does,
+    /// the one of its nearest mapped ancestor when that is a mapped superclass;
+    /// unmapped classes in between are skipped.
+    pub(crate) fn repository_for(&self, index: &Index, entity: &str) -> Option<&str> {
+        if let Some(own) = self.repository_of(entity) {
+            return Some(own);
+        }
+        let mut next = index
+            .classes_named(entity)
+            .first()
+            .and_then(|found| found.declaration.class.as_ref()?.parent.clone());
+        for _ in 0..16 {
+            let parent = next.take()?;
+            let key = parent.to_ascii_lowercase();
+            if let Some(repository) = self.superclasses.get(&key) {
+                return repository.as_deref();
+            }
+            if self.entities.contains_key(&key) {
+                return None;
+            }
+            next = index
+                .classes_named(&parent)
+                .first()
+                .and_then(|found| found.declaration.class.as_ref()?.parent.clone());
+        }
+        None
     }
 
     pub(crate) fn repository_of(&self, entity: &str) -> Option<&str> {
-        self.repositories
-            .get(&entity.trim_start_matches('\\').to_ascii_lowercase())
-            .map(String::as_str)
+        self.entities
+            .get(&entity.trim_start_matches('\\').to_ascii_lowercase())?
+            .as_deref()
     }
 }
 
@@ -277,7 +373,7 @@ pub(crate) fn mapping_files(index: &Index, dir: &Path, filter: &PathFilter) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::{elements, qualify};
+    use super::{Named, elements, named_at, qualify};
 
     #[test]
     fn reads_elements_and_their_attributes() {
@@ -312,6 +408,63 @@ mod tests {
             finishes("<entity name=\"A\"><![CDATA[x > <field name=\"bogus\"/> <c / d>]]></entity>"),
             ["entity"]
         );
+    }
+
+    #[test]
+    fn reads_more_mapping_attributes() {
+        let text = r#"<doctrine-mapping>
+  <entity name="App\Entity\Post">
+    <discriminator-map><discriminator-mapping value="a" class="Article"/></discriminator-map>
+    <entity-listeners><entity-listener class="PostListener"/></entity-listeners>
+    <id name="id"><generator strategy="CUSTOM"/><custom-id-generator class="App\Id\IdGen"/></id>
+    <one-to-many field="comments" target-entity="Comment" mapped-by="post">
+      <order-by><order-by-field name="createdAt" direction="DESC"/></order-by>
+    </one-to-many>
+    <field name="title"/>
+    <order-by-field name="stray"/>
+  </entity>
+</doctrine-mapping>"#;
+        let at = |needle: &str| named_at(text, text.find(needle).unwrap() as u32 + 1);
+        let class = |name: &str| Some(Named::Class(name.to_string()));
+        assert_eq!(at("Article"), class("App\\Entity\\Article"));
+        assert_eq!(at("PostListener"), class("App\\Entity\\PostListener"));
+        assert_eq!(at("App\\Id"), class("App\\Id\\IdGen"));
+        assert_eq!(
+            at("createdAt"),
+            Some(Named::Property(
+                "App\\Entity\\Comment".to_string(),
+                "createdAt".to_string()
+            ))
+        );
+        assert_eq!(at("stray"), None);
+    }
+
+    #[test]
+    fn order_by_fields_follow_cascades_caches_and_join_tables() {
+        let text = r#"<doctrine-mapping>
+  <entity name="App\Entity\Post">
+    <one-to-many field="comments" target-entity="Comment" mapped-by="post">
+      <cache usage="READ_ONLY"/>
+      <cascade><cascade-persist/></cascade>
+      <order-by><order-by-field name="createdAt"/></order-by>
+    </one-to-many>
+    <many-to-many field="tags" target-entity="Tag">
+      <join-table name="post_tag">
+        <join-columns><join-column name="post_id"/></join-columns>
+        <inverse-join-columns><join-column name="tag_id"/></inverse-join-columns>
+      </join-table>
+      <order-by><order-by-field name="label"/></order-by>
+    </many-to-many>
+  </entity>
+</doctrine-mapping>"#;
+        let at = |needle: &str| named_at(text, text.find(needle).unwrap() as u32 + 1);
+        let property =
+            |class: &str, name: &str| Some(Named::Property(class.to_string(), name.to_string()));
+        assert_eq!(
+            at("createdAt"),
+            property("App\\Entity\\Comment", "createdAt")
+        );
+        assert_eq!(at("label"), property("App\\Entity\\Tag", "label"));
     }
 
     #[test]

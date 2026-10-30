@@ -866,6 +866,11 @@ impl Symfony {
         Vec::new()
     }
 
+    /// The project's Doctrine XML mapping files.
+    pub fn mapping_files(&self) -> &[PathBuf] {
+        &self.mapping_files
+    }
+
     /// The repository class the Doctrine mappings declare for `entity`.
     pub fn repository_of(&self, entity: &str) -> Option<&str> {
         self.mappings.repository_of(entity)
@@ -984,14 +989,18 @@ impl Framework for Symfony {
             .flatten()
             .collect();
         self.config_files.forget(&configuration);
-        let mappings_moved = paths
-            .iter()
-            .any(|path| path.is_dir() || path.extension().is_none() || is_doctrine_xml(path));
+        // A removed directory, dotted or not, may have held listed mapping files.
+        let mappings_moved = paths.iter().any(|path| {
+            path.is_dir()
+                || path.extension().is_none()
+                || is_doctrine_xml(path)
+                || self.mapping_files.iter().any(|file| file.starts_with(path))
+        });
         if mappings_moved {
             let filter = index.filter().scoped(&self.project);
             self.mapping_files = doctrine::mapping_files(index, &self.project.dir, &filter);
         }
-        if relevant {
+        if relevant || mappings_moved {
             self.read(index);
         }
     }
@@ -1011,7 +1020,7 @@ impl Framework for Symfony {
             return None;
         }
         let entity = call.strings.first()?.as_deref()?;
-        let repository = self.repository_of(entity)?;
+        let repository = self.mappings.repository_for(index, entity)?;
         index
             .has_class(repository)
             .then(|| TypeExpr::Named(repository.to_string()))

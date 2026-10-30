@@ -290,10 +290,16 @@ impl Annotations<'_> {
             }
             _ => {
                 let name = self.name()?;
-                // `Foo::class` and `Foo::BAR` stay unknown.
+                // `Foo::class` names the class; `Foo::BAR` stays unknown.
                 if self.text[self.pos..].starts_with(b"::") {
                     self.pos += 2;
-                    self.name()?;
+                    let member = self.name()?;
+                    if member.eq_ignore_ascii_case("class") {
+                        let resolved = self.names.resolve_class(&name);
+                        return Some(MetaValue::Class(
+                            resolved.trim_start_matches('\\').to_string(),
+                        ));
+                    }
                     return Some(MetaValue::Other);
                 }
                 Some(match name.to_ascii_lowercase().as_str() {
