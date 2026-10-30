@@ -494,11 +494,11 @@ impl Mappings {
 }
 
 /// A class name written in the mapping of `mapped`: a name without a namespace is
-/// in `mapped`'s namespace, as Doctrine resolves it.
+/// in `mapped`'s namespace, as Doctrine resolves it; one with a backslash, even a
+/// leading one alone, is already qualified.
 pub(crate) fn qualify(mapped: &str, name: &str) -> String {
-    let name = name.trim_start_matches('\\');
     if name.contains('\\') {
-        return name.to_string();
+        return name.trim_start_matches('\\').to_string();
     }
     match mapped.rsplit_once('\\') {
         Some((namespace, _)) => format!("{namespace}\\{name}"),

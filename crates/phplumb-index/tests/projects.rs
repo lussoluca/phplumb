@@ -3112,6 +3112,153 @@ fn association_attributes_lead_to_classes_and_properties() {
     );
 }
 
+/// Where definition at the `nth` `needle` of `file` leads, as `file:text`.
+fn targets_at(index: &mut Index, root: &Path, file: &str, needle: &str, nth: usize) -> Vec<String> {
+    let path = root.join(file);
+    let source = fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&source).into_owned();
+    let offset = text.match_indices(needle).nth(nth).unwrap().0 as u32 + 1;
+    index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| {
+            let target = fs::read(&location.path).unwrap();
+            format!(
+                "{}:{}",
+                location.path.file_name().unwrap().to_string_lossy(),
+                String::from_utf8_lossy(&target[location.start as usize..location.end as usize])
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn positional_association_arguments_follow_the_constructor() {
+    // ORM 2 puts `mappedBy` first; ORM 3 puts `targetEntity` first.
+    let orm2 = "<?php\nnamespace Doctrine\\ORM\\Mapping;\n#[\\Attribute]\nfinal class OneToMany\n{\n    public function __construct(?string $mappedBy = null, ?string $targetEntity = null) {}\n}\n#[\\Attribute]\nfinal class OneToOne\n{\n    public function __construct(?string $mappedBy = null, ?string $inversedBy = null, ?string $targetEntity = null) {}\n}\n";
+    let orm3 = "<?php\nnamespace Doctrine\\ORM\\Mapping;\n#[\\Attribute]\nfinal class OneToMany\n{\n    public function __construct(?string $targetEntity = null, ?string $mappedBy = null) {}\n}\n#[\\Attribute]\nfinal class OneToOne\n{\n    public function __construct(?string $targetEntity = null, ?string $mappedBy = null, ?string $inversedBy = null) {}\n}\n";
+    let author2 = "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\nclass Author\n{\n    #[ORM\\OneToMany('author', Post::class)]\n    private iterable $posts;\n\n    #[ORM\\OneToOne('owner')]\n    private Profile $profile;\n}\n";
+    let author3 = "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\nclass Author\n{\n    #[ORM\\OneToMany('Post', 'author')]\n    private iterable $posts;\n\n    #[ORM\\OneToOne('Profile', 'owner')]\n    private Profile $profile;\n}\n";
+    let post = "<?php\nnamespace App\\Entity;\nclass Post\n{\n    private $author;\n}\n";
+    let profile = "<?php\nnamespace App\\Entity;\nclass Profile\n{\n    private $owner;\n}\n";
+    for (stubs, author) in [(orm2, author2), (orm3, author3)] {
+        let (_dir, root) = doctrine_symfony(&[
+            ("lib/Associations.php", stubs),
+            ("src/Entity/Author.php", author),
+            ("src/Entity/Post.php", post),
+            ("src/Entity/Profile.php", profile),
+        ]);
+        let mut index = auto(&root);
+        let file = "src/Entity/Author.php";
+        assert_eq!(
+            targets_at(&mut index, &root, file, "'author'", 0),
+            ["Post.php:author"],
+            "{author}"
+        );
+        assert_eq!(
+            targets_at(&mut index, &root, file, "'owner'", 0),
+            ["Profile.php:owner"],
+            "{author}"
+        );
+        if author == author3 {
+            assert_eq!(
+                targets_at(&mut index, &root, file, "'Post'", 0),
+                ["Post.php:Post"]
+            );
+        }
+    }
+    // Without the attribute class, a positional argument names nothing.
+    let (_dir, root) = doctrine_symfony(&[
+        ("src/Entity/Author.php", author2),
+        ("src/Entity/Post.php", post),
+        ("src/Entity/Profile.php", profile),
+    ]);
+    let mut index = auto(&root);
+    assert!(targets_at(&mut index, &root, "src/Entity/Author.php", "'author'", 0).is_empty());
+}
+
+#[test]
+fn global_target_entities_stay_global() {
+    let (_dir, root) = doctrine_symfony(&[
+        ("lib/Associations.php", ORM_ASSOCIATIONS),
+        (
+            "lib/Author.php",
+            "<?php\nclass Author\n{\n    private $posts;\n}\n",
+        ),
+        (
+            "src/Entity/Author.php",
+            "<?php\nnamespace App\\Entity;\nclass Author\n{\n    private $posts;\n}\n",
+        ),
+        (
+            "src/Entity/Post.php",
+            "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\nclass Post\n{\n    #[ORM\\ManyToOne(targetEntity: '\\Author', inversedBy: 'posts')]\n    private $author;\n}\n",
+        ),
+    ]);
+    let mut index = auto(&root);
+    let file = "src/Entity/Post.php";
+    let lib = root.join("lib/Author.php");
+    let path = root.join(file);
+    let source = fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&source).into_owned();
+    for needle in ["\\Author'", "'posts'"] {
+        let offset = text.find(needle).unwrap() as u32 + 1;
+        let found: Vec<PathBuf> = index
+            .definition(&path, &source, offset)
+            .into_iter()
+            .map(|location| location.path)
+            .collect();
+        assert_eq!(found, std::slice::from_ref(&lib), "{needle}");
+    }
+}
+
+#[test]
+fn yaml_mapping_files_keep_class_navigation() {
+    let mapping = format!(
+        "{POST_YAML}    discriminatorMap: {{ page: App\\Entity\\Page }}\n    entityListeners:\n        App\\EventListener\\PostListener: ~\n    id:\n        id:\n            customIdGenerator: {{ class: App\\Doctrine\\IdGenerator }}\n"
+    );
+    let (_dir, root) = doctrine_symfony(&[
+        (
+            "src/Entity/Post.php",
+            "<?php\nnamespace App\\Entity;\nclass Post\n{\n    private $id;\n    private $title;\n    private $author;\n}\n",
+        ),
+        (
+            "src/Entity/Author.php",
+            "<?php\nnamespace App\\Entity;\nclass Author\n{\n    private $posts;\n}\n",
+        ),
+        (
+            "src/Entity/Page.php",
+            "<?php\nnamespace App\\Entity;\nclass Page extends Post\n{\n}\n",
+        ),
+        (
+            "src/EventListener/PostListener.php",
+            "<?php\nnamespace App\\EventListener;\nclass PostListener\n{\n}\n",
+        ),
+        (
+            "src/Doctrine/IdGenerator.php",
+            "<?php\nnamespace App\\Doctrine;\nclass IdGenerator\n{\n}\n",
+        ),
+        ("config/doctrine/Post.orm.yml", &mapping),
+    ]);
+    let mut index = auto(&root);
+    let file = "config/doctrine/Post.orm.yml";
+    assert_eq!(
+        targets_at(&mut index, &root, file, "Entity\\Page", 0),
+        ["Page.php:Page"]
+    );
+    assert_eq!(
+        targets_at(&mut index, &root, file, "PostListener", 0),
+        ["PostListener.php:PostListener"]
+    );
+    assert_eq!(
+        targets_at(&mut index, &root, file, "Doctrine\\IdGenerator", 0),
+        ["IdGenerator.php:IdGenerator"]
+    );
+    assert_eq!(
+        targets_at(&mut index, &root, file, "author:", 0),
+        ["Post.php:author"]
+    );
+}
+
 const POST_YAML: &str = "App\\Entity\\Post:\n    type: entity\n    repositoryClass: App\\Repository\\PostRepository\n    fields:\n        title: { type: string }\n    manyToOne:\n        author:\n            targetEntity: Author\n            inversedBy: posts\n";
 
 #[test]

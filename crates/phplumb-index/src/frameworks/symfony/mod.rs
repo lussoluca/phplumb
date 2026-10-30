@@ -224,8 +224,9 @@ const ORM_ASSOCIATIONS: [&str; 4] = [
 /// The class or property a string of a Doctrine association attribute names: the
 /// target entity, qualified with the entity's namespace, or a property of it for
 /// `inversedBy` and `mappedBy`. The target is the `targetEntity` argument, else
-/// the declared type of the property for a to-one association. None for other
-/// attributes.
+/// the declared type of the property for a to-one association. A positional
+/// argument is named by the attribute class's constructor, whose order differs
+/// between ORM versions. None for other attributes.
 fn doctrine_attribute_targets(
     index: &Index,
     found: &AttributeString,
@@ -237,13 +238,21 @@ fn doctrine_attribute_targets(
         return None;
     }
     let holder = found.holder.as_deref()?;
+    let parameters = constructor_parameters(index, &found.attribute);
+    let name_of = |key: Option<&str>, position: usize| -> Option<String> {
+        key.map(str::to_string)
+            .or_else(|| parameters.get(position).cloned())
+    };
     let target_argument = found
         .arguments
         .iter()
-        .find(|(key, _)| key.as_deref() == Some("targetEntity"))
-        .or_else(|| found.arguments.first().filter(|(key, _)| key.is_none()));
+        .enumerate()
+        .find(|(position, (key, _))| {
+            name_of(key.as_deref(), *position).as_deref() == Some("targetEntity")
+        })
+        .map(|(_, (_, value))| value);
     let to_one = found.attribute.ends_with("ToOne");
-    let target = match target_argument.map(|(_, value)| value) {
+    let target = match target_argument {
         Some(MetaValue::Class(class)) => Some(class.clone()),
         Some(MetaValue::String(class)) => Some(doctrine::qualify(holder, class)),
         _ if to_one => found
@@ -252,15 +261,38 @@ fn doctrine_attribute_targets(
             .and_then(|ty| crate::infer::class_names(ty).into_iter().next()),
         _ => None,
     };
-    let targetting = found.key.as_deref() == Some("targetEntity")
-        || (found.key.is_none() && found.position == 0);
-    Some(match found.key.as_deref() {
-        _ if targetting => class_targets(index, &doctrine::qualify(holder, &found.value)),
-        Some("inversedBy" | "mappedBy") => target
-            .map(|target| property_targets(index, &target, &found.value))
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    })
+    Some(
+        match name_of(found.key.as_deref(), found.position).as_deref() {
+            Some("targetEntity") => class_targets(index, &doctrine::qualify(holder, &found.value)),
+            Some("inversedBy" | "mappedBy") => target
+                .map(|target| property_targets(index, &target, &found.value))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        },
+    )
+}
+
+/// The parameter names of `class`'s constructor, in order; none when the index
+/// lacks the class.
+fn constructor_parameters(index: &Index, class: &str) -> Vec<String> {
+    index
+        .classes_named(class)
+        .first()
+        .and_then(|found| found.declaration.class.as_ref())
+        .and_then(|shape| {
+            shape.members.iter().find(|member| {
+                member.kind == crate::summary::MemberKind::Method
+                    && member.name.eq_ignore_ascii_case("__construct")
+            })
+        })
+        .map(|constructor| {
+            constructor
+                .params
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The interface message buses are autowired by.
@@ -1250,13 +1282,14 @@ impl Framework for Symfony {
                 .ok()
                 .and_then(yaml::parse)
                 .and_then(|root| doctrine::yaml_named_at(&root, offset));
-            return match named {
-                Some(doctrine::Named::Class(class)) => class_targets(index, &class),
+            // Other class names in the mapping open as in any YAML file.
+            match named {
+                Some(doctrine::Named::Class(class)) => return class_targets(index, &class),
                 Some(doctrine::Named::Property(class, property)) => {
-                    property_targets(index, &class, &property)
+                    return property_targets(index, &class, &property);
                 }
-                None => Vec::new(),
-            };
+                None => {}
+            }
         }
         if crate::filter::is_yaml(path) {
             return self.yaml_targets(index, path, source, offset);
