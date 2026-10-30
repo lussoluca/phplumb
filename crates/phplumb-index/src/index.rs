@@ -1594,7 +1594,7 @@ impl Index {
         };
         let targets: Vec<(Location, String)> = self
             .frameworks_for(path)
-            .flat_map(|f| f.call_targets(self, &call, &found.arguments))
+            .flat_map(|f| f.call_targets(self, &call, &found.arguments, &found.wrapped))
             .collect();
         (!targets.is_empty()).then_some(targets)
     }

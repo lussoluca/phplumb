@@ -670,7 +670,7 @@ fn dispatch_without_handlers_keeps_its_declaration() {
         "vendor/symfony/messenger/MessageBusInterface.php",
         "dispatch",
     )];
-    for line in [21, 22, 23] {
+    for line in [21, 22, 27] {
         assert_eq!(
             dispatch_targets(&mut index, line),
             declaration,
@@ -717,15 +717,23 @@ fn handlers_list_their_dispatches() {
             11,
             "__invoke"
         ),
-        [dispatch(19)]
+        [dispatch(19), dispatch(23), dispatch(25)]
     );
+    let handle = (14, "handle".to_string());
     assert_eq!(
         lines_of(&mut index, "src/Handler/NotifyLogger.php", 15, "handle"),
-        [dispatch(19), dispatch(20)]
+        [
+            handle.clone(),
+            dispatch(19),
+            dispatch(20),
+            dispatch(23),
+            dispatch(24),
+            dispatch(25)
+        ]
     );
     assert_eq!(
         lines_of(&mut index, "src/Handler/Explicit.php", 11, "run"),
-        [dispatch(20)]
+        [handle, dispatch(20), dispatch(24)]
     );
 }
 
@@ -735,7 +743,14 @@ fn the_handler_attribute_lists_the_dispatches() {
     // Inside the attribute's arguments: its name opens the attribute class.
     assert_eq!(
         lines_of(&mut index, "src/Handler/NotifyLogger.php", 8, "method:"),
-        [(19, "dispatch".to_string()), (20, "dispatch".to_string())]
+        [
+            (14, "handle".to_string()),
+            (19, "dispatch".to_string()),
+            (20, "dispatch".to_string()),
+            (23, "dispatch".to_string()),
+            (24, "dispatch".to_string()),
+            (25, "dispatch".to_string())
+        ]
     );
 }
 
@@ -753,7 +768,7 @@ fn dispatch_keeps_hover_and_references() {
         hover.markdown
     );
     let references = index.references(&path, &source, offset, false);
-    assert_eq!(references.len(), 5, "{references:?}");
+    assert_eq!(references.len(), 8, "{references:?}");
 }
 
 #[test]
@@ -1528,5 +1543,63 @@ fn service_ids_ending_in_twig_stay_services() {
     assert_eq!(
         opened(&mut index, &path, "'@app.mailer"),
         ["config/services_test.yaml"]
+    );
+}
+
+#[test]
+fn envelopes_reach_the_handlers_of_their_message() {
+    let mut index = build();
+    assert_eq!(
+        dispatch_targets(&mut index, 23),
+        dispatch_targets(&mut index, 19)
+    );
+    assert_eq!(
+        dispatch_targets(&mut index, 24),
+        dispatch_targets(&mut index, 20)
+    );
+}
+
+#[test]
+fn named_messages_reach_their_handlers() {
+    let mut index = build();
+    assert_eq!(
+        dispatch_targets(&mut index, 25),
+        dispatch_targets(&mut index, 19)
+    );
+}
+
+#[test]
+fn envelope_variables_list_nothing() {
+    let mut index = build();
+    assert_eq!(
+        dispatch_targets(&mut index, 27),
+        [pair(
+            "vendor/symfony/messenger/MessageBusInterface.php",
+            "dispatch"
+        )]
+    );
+}
+
+#[test]
+fn handle_trait_calls_reach_their_handlers() {
+    let mut index = build();
+    let mut found = definition_on_line(&mut index, "src/Service/Queries.php", 14, "handle");
+    found.sort();
+    assert_eq!(found, dispatch_targets(&mut index, 20));
+    let explicit = definition_on_line(&mut index, "src/Handler/Explicit.php", 11, "run");
+    assert!(
+        explicit
+            .iter()
+            .any(|(path, text)| path == "src/Service/Queries.php" && text == "handle"),
+        "{explicit:?}"
+    );
+}
+
+#[test]
+fn handle_without_the_trait_lists_nothing() {
+    let mut index = build();
+    assert_eq!(
+        definition_on_line(&mut index, "src/Service/OwnHandle.php", 11, "handle"),
+        [pair("src/Service/OwnHandle.php", "handle")]
     );
 }
