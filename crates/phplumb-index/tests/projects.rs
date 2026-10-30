@@ -2000,3 +2000,60 @@ fn recurring_messages_reach_their_handlers() {
         ]
     );
 }
+
+const TAGGED_SERVICES: &str = "parameters:\n    app.name: x\n\nservices:\n    _instanceof:\n        App\\Handler\\Handles:\n            tags: [messenger.message_handler]\n\n    App\\Handler\\TaggedHandler:\n        tags: [messenger.message_handler]\n\n    tagged.mapped:\n        class: App\\Handler\\MappedHandler\n        tags:\n            - { name: messenger.message_handler, handles: App\\Message\\Ping, method: onPing }\n\n    tagged.short:\n        class: App\\Handler\\ShortHandler\n        tags:\n            - messenger.message_handler: { method: run }\n\n    tagged.missing:\n        class: App\\Handler\\Nowhere\n        tags: [messenger.message_handler]\n\n    tagged.wrong:\n        class: App\\Handler\\MappedHandler\n        tags:\n            - { name: messenger.message_handler, method: nope }\n";
+
+fn tagged_symfony() -> (TempDir, PathBuf) {
+    messenger_symfony(&[
+        ("config/services.yaml", TAGGED_SERVICES),
+        (
+            "src/Handler/TaggedHandler.php",
+            "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nfinal class TaggedHandler\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n",
+        ),
+        (
+            "src/Handler/MappedHandler.php",
+            "<?php\nnamespace App\\Handler;\nfinal class MappedHandler\n{\n    public function onPing(object $message): void\n    {\n    }\n}\n",
+        ),
+        (
+            "src/Handler/ShortHandler.php",
+            "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nfinal class ShortHandler\n{\n    public function run(Ping $message): void\n    {\n    }\n}\n",
+        ),
+        (
+            "src/Handler/Handles.php",
+            "<?php\nnamespace App\\Handler;\ninterface Handles\n{\n}\n",
+        ),
+        (
+            "src/Handler/InstanceHandler.php",
+            "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nfinal class InstanceHandler implements Handles\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n",
+        ),
+    ])
+}
+
+#[test]
+fn tagged_handlers_handle_their_messages() {
+    let (_dir, root) = tagged_symfony();
+    let mut index = auto(&root);
+
+    assert_eq!(
+        handler_definitions(&mut index, &root, "src/Service/Sender.php", "dispatch("),
+        [
+            named("InstanceHandler.php", "__invoke"),
+            named("MappedHandler.php", "onPing"),
+            named("PingHandler.php", "__invoke"),
+            named("ShortHandler.php", "run"),
+            named("TaggedHandler.php", "__invoke")
+        ]
+    );
+    for (file, method) in [
+        ("src/Handler/TaggedHandler.php", "__invoke"),
+        ("src/Handler/MappedHandler.php", "onPing"),
+        ("src/Handler/ShortHandler.php", "run"),
+        ("src/Handler/InstanceHandler.php", "__invoke"),
+    ] {
+        assert_eq!(
+            handler_definitions(&mut index, &root, file, method),
+            [named("Sender.php", "dispatch")],
+            "{file}"
+        );
+    }
+}

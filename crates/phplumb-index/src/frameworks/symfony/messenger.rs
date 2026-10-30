@@ -1,9 +1,10 @@
-//! Symfony Messenger: the message handlers `#[AsMessageHandler]` declares, and the
-//! messages each one handles.
+//! Symfony Messenger: the message handlers `#[AsMessageHandler]` declares or the
+//! configuration tags, and the messages each one handles.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use super::config::Tagged;
 use crate::filter::PathFilter;
 use crate::frameworks::ancestry::{is_a, methods_of};
 use crate::index::{Index, Location};
@@ -29,8 +30,9 @@ pub(crate) struct Handlers {
 impl Handlers {
     /// Every handler of the concrete project classes: a class attribute names its
     /// method (`__invoke` by default), a method attribute marks its method, also on
-    /// a method the class takes from a parent or a trait.
-    pub(crate) fn read(index: &Index, filter: &PathFilter) -> Handlers {
+    /// a method the class takes from a parent or a trait; then the handlers of the
+    /// services `tagged` `messenger.message_handler`.
+    pub(crate) fn read(index: &Index, filter: &PathFilter, tagged: &[Tagged]) -> Handlers {
         let mut handlers = Handlers::default();
         let declaring: HashSet<String> = index
             .declarations()
@@ -49,7 +51,51 @@ impl Handlers {
                 handlers.read_class(index, path, declaration);
             }
         }
+        for service in tagged {
+            if service.instanceof {
+                for (path, declaration) in index.declarations() {
+                    if declaration.kind == SymbolKind::Class
+                        && filter.in_scope(path)
+                        && index.is_project_code(path)
+                        && is_a(index, &declaration.fqn, &[&service.class])
+                    {
+                        handlers.read_tagged(index, path, declaration, &service.attributes);
+                    }
+                }
+            } else if let Some(found) = index.classes_named(&service.class).first() {
+                handlers.read_tagged(index, found.path, found.declaration, &service.attributes);
+            }
+        }
         handlers
+    }
+
+    /// The handler a `messenger.message_handler` tag with `attributes` makes of
+    /// `class`: its `method` (`__invoke` by default), handling the tag's `handles`
+    /// or the type of the method's first parameter.
+    fn read_tagged(
+        &mut self,
+        index: &Index,
+        path: &Path,
+        class: &Declaration,
+        attributes: &[(String, String)],
+    ) {
+        if class.class.as_ref().is_none_or(|shape| shape.is_abstract) {
+            return;
+        }
+        let attribute = |name: &str| {
+            attributes
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        let name = attribute("method").unwrap_or("__invoke");
+        let methods = methods_of(index, path, class);
+        if let Some((file, _, method)) = methods
+            .iter()
+            .find(|(_, _, m)| m.name.eq_ignore_ascii_case(name))
+        {
+            self.add(file, method, attribute("handles").map(str::to_string));
+        }
     }
 
     fn read_class(&mut self, index: &Index, path: &Path, class: &Declaration) {
@@ -70,28 +116,35 @@ impl Handlers {
                 .iter()
                 .find(|(_, _, m)| m.name.eq_ignore_ascii_case(name))
             {
-                self.add(file, method, attribute);
+                self.add_attributed(file, method, attribute);
             }
         }
         for (file, _, method) in &methods {
             for attribute in method.metadata.iter().filter(|m| is_handler(m)) {
-                self.add(file, method, attribute);
+                self.add_attributed(file, method, attribute);
             }
         }
     }
 
-    /// The handler `method`, handling the attribute's `handles` class or the
-    /// classes of its first parameter's declared type, as `MessengerPass` reads it.
-    /// Symfony registers public methods only.
-    fn add(&mut self, path: &Path, method: &Member, attribute: &Metadata) {
+    /// The handler an `#[AsMessageHandler]` `attribute` makes of `method`.
+    fn add_attributed(&mut self, path: &Path, method: &Member, attribute: &Metadata) {
+        let handles = match argument(attribute, "handles", 2) {
+            Some(MetaValue::Class(class) | MetaValue::String(class)) => Some(class.clone()),
+            Some(_) => return,
+            None => None,
+        };
+        self.add(path, method, handles);
+    }
+
+    /// The handler `method`, handling the class `handles` names or the classes of
+    /// its first parameter's declared type, as `MessengerPass` reads it. Symfony
+    /// registers public methods only.
+    fn add(&mut self, path: &Path, method: &Member, handles: Option<String>) {
         if !is_public(method) {
             return;
         }
-        let handles = match argument(attribute, "handles", 2) {
-            Some(MetaValue::Class(class) | MetaValue::String(class)) => {
-                vec![class.trim_start_matches('\\').to_string()]
-            }
-            Some(_) => return,
+        let handles = match handles {
+            Some(class) => vec![class.trim_start_matches('\\').to_string()],
             None => method
                 .hints
                 .first()

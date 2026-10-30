@@ -127,6 +127,106 @@ pub(crate) fn read_services(
     found
 }
 
+/// A service the configuration files tag: its class, or for `_instanceof` the
+/// type whose implementations carry the tag, and the tag's attributes.
+pub(crate) struct Tagged {
+    pub class: String,
+    pub instanceof: bool,
+    pub attributes: Vec<(String, String)>,
+}
+
+/// The services the configuration files tag `tag`, also inside `when@<env>`
+/// blocks and through `_instanceof`: by name in the list of tags, as
+/// `{ name: tag, ... }`, or as `tag: { ... }`. A service's class is its `class`, or
+/// its id when written like a class.
+pub(crate) fn tagged_services(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+    tag: &str,
+) -> Vec<Tagged> {
+    let mut found = Vec::new();
+    for file in files {
+        let Some(parsed) = config_files.get(file) else {
+            continue;
+        };
+        let Some(root) = &parsed.yaml else {
+            continue;
+        };
+        for block in top_blocks(root) {
+            let Some(Yaml::Map(entries)) = block.get("services") else {
+                continue;
+            };
+            for (key, value) in entries {
+                let Some(id) = key.text() else {
+                    continue;
+                };
+                if id == "_instanceof" {
+                    let Yaml::Map(types) = value else {
+                        continue;
+                    };
+                    for (class, service) in types {
+                        let Some(class) = class.text() else {
+                            continue;
+                        };
+                        for attributes in tags_of(service, tag) {
+                            found.push(Tagged {
+                                class: class.trim_start_matches('\\').to_string(),
+                                instanceof: true,
+                                attributes,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                let class = match value.get("class").and_then(Yaml::text) {
+                    Some(class) => class,
+                    None if looks_like_class(id) => id,
+                    None => continue,
+                };
+                for attributes in tags_of(value, tag) {
+                    found.push(Tagged {
+                        class: class.trim_start_matches('\\').to_string(),
+                        instanceof: false,
+                        attributes,
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The attributes of each `tag` in the `tags` of `service`.
+fn tags_of(service: &Yaml, tag: &str) -> Vec<Vec<(String, String)>> {
+    let Some(Yaml::Sequence(tags)) = service.get("tags") else {
+        return Vec::new();
+    };
+    let scalars = |entries: &[(Yaml, Yaml)]| -> Vec<(String, String)> {
+        entries
+            .iter()
+            .filter_map(|(key, value)| Some((key.text()?.to_string(), value.text()?.to_string())))
+            .filter(|(key, _)| key != "name")
+            .collect()
+    };
+    let mut found = Vec::new();
+    for entry in tags {
+        match entry {
+            Yaml::Scalar { value, .. } if value == tag => found.push(Vec::new()),
+            Yaml::Map(entries) if entry.get("name").and_then(Yaml::text) == Some(tag) => {
+                found.push(scalars(entries));
+            }
+            Yaml::Map(entries) if entries.len() == 1 && entries[0].0.text() == Some(tag) => {
+                found.push(match &entries[0].1 {
+                    Yaml::Map(attributes) => scalars(attributes),
+                    _ => Vec::new(),
+                });
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 /// Whether `text` is written like a fully qualified class name.
 pub(crate) fn looks_like_class(text: &str) -> bool {
     let name = text.trim_start_matches('\\');

@@ -518,7 +518,9 @@ impl Symfony {
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);
-        self.handlers = Handlers::read(index, &filter);
+        let tagged =
+            config::tagged_services(&files, &self.config_files, "messenger.message_handler");
+        self.handlers = Handlers::read(index, &filter, &tagged);
     }
 }
 
