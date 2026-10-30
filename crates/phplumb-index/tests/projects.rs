@@ -423,6 +423,170 @@ fn certain_symfony_projects_flag_missing_names() {
     );
 }
 
+const UNDEFINED_ROUTE: &str = "Undefined route 'missing_route'";
+const UNDEFINED_PARAMETER: &str = "Undefined parameter 'app.nowhere'";
+
+/// A Symfony project whose kernel declares `methods`, with a template directory, so
+/// route, parameter and template names can all be checked.
+fn kernel_symfony(class: &str, methods: &str) -> (TempDir, PathBuf) {
+    let kernel = format!(
+        "<?php\nnamespace App;\nuse Symfony\\Component\\HttpKernel\\Kernel as BaseKernel;\nclass {class}\n{{\n{methods}}}\n"
+    );
+    broken_symfony(&[
+        (
+            "lib/HttpKernel.php",
+            "<?php\nnamespace Symfony\\Component\\HttpKernel;\nabstract class Kernel\n{\n}\n",
+        ),
+        ("src/Kernel.php", &kernel),
+        ("templates/home.html.twig", "home\n"),
+        TWIG_BRIDGE,
+    ])
+}
+
+#[test]
+fn kernel_overrides_keep_names_unknown() {
+    let method =
+        |name: &str| format!("    public function {name}()\n    {{\n        return [];\n    }}\n");
+    let cases = [
+        ("Kernel extends BaseKernel", String::new(), true, true, true),
+        (
+            "Kernel extends BaseKernel",
+            method("getConfigDir"),
+            false,
+            false,
+            false,
+        ),
+        (
+            "Kernel extends BaseKernel",
+            method("loadRoutes"),
+            false,
+            true,
+            true,
+        ),
+        (
+            "Kernel extends BaseKernel",
+            method("getKernelParameters"),
+            true,
+            false,
+            true,
+        ),
+        ("Paths", method("getConfigDir"), true, true, true),
+    ];
+    for (class, methods, route, parameter, template) in cases {
+        let (_dir, root) = kernel_symfony(class, &methods);
+        let mut expected = Vec::new();
+        if route {
+            expected.push(UNDEFINED_ROUTE);
+        }
+        if parameter {
+            expected.push(UNDEFINED_PARAMETER);
+        }
+        assert_eq!(broken_messages(&root), expected, "{class} {methods}");
+        let status = template_status(&root, "missing.html.twig");
+        let wanted = if template {
+            TemplateStatus::Missing
+        } else {
+            TemplateStatus::Unknown
+        };
+        assert_eq!(status, wanted, "{class} {methods}");
+    }
+}
+
+#[test]
+fn kernel_overrides_through_traits_and_interfaces_keep_names_unknown() {
+    let config_dir = "    public function getConfigDir()\n    {\n        return [];\n    }\n";
+    // Symfony's own trait declares these methods for every kernel.
+    let micro = format!(
+        "<?php\nnamespace Symfony\\Bundle\\FrameworkBundle\\Kernel;\ntrait MicroKernelTrait\n{{\n{config_dir}}}\n"
+    );
+    let base = [
+        (
+            "lib/HttpKernel.php",
+            "<?php\nnamespace Symfony\\Component\\HttpKernel;\nabstract class Kernel\n{\n}\n",
+        ),
+        (
+            "lib/DiKernel.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Kernel;\ninterface KernelInterface\n{\n}\n",
+        ),
+        (
+            "vendor/symfony/framework-bundle/Kernel/MicroKernelTrait.php",
+            micro.as_str(),
+        ),
+        ("templates/home.html.twig", "home\n"),
+        TWIG_BRIDGE,
+    ];
+    let project = |files: &[(&str, &str)]| {
+        let mut all = base.to_vec();
+        all.extend_from_slice(files);
+        broken_symfony(&all)
+    };
+    let micro_kernel = "<?php\nnamespace App;\nuse Symfony\\Bundle\\FrameworkBundle\\Kernel\\MicroKernelTrait;\nuse Symfony\\Component\\HttpKernel\\Kernel as BaseKernel;\nclass Kernel extends BaseKernel\n{\n    use MicroKernelTrait;\n}\n";
+    let (_dir, root) = project(&[("src/Kernel.php", micro_kernel)]);
+    assert_eq!(
+        broken_messages(&root),
+        [UNDEFINED_ROUTE, UNDEFINED_PARAMETER]
+    );
+    let own_trait = format!("<?php\nnamespace App;\ntrait Paths\n{{\n{config_dir}}}\n");
+    let kernel = "<?php\nnamespace App;\nuse Symfony\\Component\\HttpKernel\\Kernel as BaseKernel;\nclass Kernel extends BaseKernel\n{\n    use Paths;\n}\n";
+    let (_dir, root) = project(&[("src/Paths.php", &own_trait), ("src/Kernel.php", kernel)]);
+    assert!(broken_messages(&root).is_empty());
+    let di_kernel = format!(
+        "<?php\nnamespace App;\nuse Symfony\\Component\\DependencyInjection\\Kernel\\KernelInterface;\nclass Kernel implements KernelInterface\n{{\n{config_dir}}}\n"
+    );
+    let (_dir, root) = project(&[("src/Kernel.php", &di_kernel)]);
+    assert!(broken_messages(&root).is_empty());
+}
+
+#[test]
+fn router_resource_keeps_routes_unknown() {
+    let other =
+        "framework:\n    router:\n        resource: '%kernel.project_dir%/config/routing.php'\n";
+    let in_environment = "when@dev:\n    framework:\n        router:\n            resource: '%kernel.project_dir%/config/routing.php'\n";
+    for config in [other, in_environment] {
+        let (_dir, root) = broken_symfony(&[("config/packages/routing.yaml", config)]);
+        assert_eq!(broken_messages(&root), [UNDEFINED_PARAMETER], "{config}");
+    }
+    let default = "framework:\n    router:\n        resource: 'kernel::loadRoutes'\n";
+    let (_dir, root) = broken_symfony(&[("config/packages/routing.yaml", default)]);
+    assert_eq!(
+        broken_messages(&root),
+        [UNDEFINED_ROUTE, UNDEFINED_PARAMETER]
+    );
+}
+
+#[test]
+fn parameters_set_through_untyped_variables_are_known() {
+    let setup = "<?php\nnamespace App\\Setup;\nuse Doctrine\\ORM\\Query;\nfinal class Setup\n{\n    public function configure($c, Query $query, $name): void\n    {\n        $c->setParameter('app.extra', 1);\n        $query->setParameter('app.other', 1);\n        $c->setParameter($name, 1);\n    }\n}\n";
+    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->getParameter('app.extra');\n        $this->getParameter('app.other');\n        $this->getParameter('app.missing');\n    }\n}\n";
+    let (_dir, root) = broken_symfony(&[
+        (
+            "lib/Query.php",
+            "<?php\nnamespace Doctrine\\ORM;\nclass Query\n{\n    public function setParameter($key, $value): static\n    {\n        return $this;\n    }\n}\n",
+        ),
+        ("src/Setup/Setup.php", setup),
+        ("src/Controller/Uses.php", uses),
+    ]);
+    assert_eq!(
+        broken_messages(&root),
+        [
+            "Undefined parameter 'app.other'",
+            "Undefined parameter 'app.missing'"
+        ]
+    );
+    let mut index = auto(&root);
+    let path = root.join("src/Controller/Uses.php");
+    let source = fs::read(&path).unwrap();
+    let offset = uses.find("app.extra").unwrap() as u32 + 1;
+    let found: Vec<PathBuf> = index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| location.path)
+        .collect();
+    // The receiver may be another class, such as a query: the name stays known,
+    // with no jump to the call.
+    assert!(found.is_empty());
+}
+
 #[test]
 fn unknown_route_imports_silence_route_diagnostics() {
     let (_dir, root) = broken_symfony(&[(
@@ -1340,6 +1504,37 @@ fn bundled_symfony(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
     broken_symfony(&all)
 }
 
+#[test]
+fn bundle_extension_parameters_stay_silent() {
+    let extension = "<?php\nnamespace Acme\\DependencyInjection;\nclass AcmeExtension\n{\n    public function load(array $configs, $container): void\n    {\n        $container->setParameter('router.resource', 'x');\n        foreach (['command.bus'] as $busId) {\n            $container->setParameter($busId.'.middleware', []);\n        }\n    }\n}\n";
+    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->getParameter('router.resource');\n        $this->getParameter('command.bus.middleware');\n        $this->getParameter('router.missing');\n    }\n}\n";
+    let services =
+        "parameters:\n    app.name: x\n    router.request_context.host: x\n    command.x: y\n";
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/acme/src/DependencyInjection/AcmeExtension.php",
+            extension,
+        ),
+        ("src/Controller/Uses.php", uses),
+        ("config/services.yaml", services),
+    ]);
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'router.missing'"]
+    );
+    // A name the extension computes in full may be any parameter.
+    let computed = extension.replace("$busId.'.middleware'", "$busId");
+    let (_dir, root) = bundled_symfony(&[
+        (
+            "lib/acme/src/DependencyInjection/AcmeExtension.php",
+            &computed,
+        ),
+        ("src/Controller/Uses.php", uses),
+        ("config/services.yaml", services),
+    ]);
+    assert!(broken_messages(&root).is_empty());
+}
+
 fn route_missing(index: &Index, name: &str) -> bool {
     index.framework::<Symfony>().unwrap().route_missing(name)
 }
@@ -1662,6 +1857,78 @@ fn templated_bundles(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
     ];
     all.extend_from_slice(files);
     bundled_symfony(&all)
+}
+
+#[test]
+fn custom_twig_loaders_keep_templates_unknown() {
+    let interface = (
+        "lib/LoaderInterface.php",
+        "<?php\nnamespace Twig\\Loader;\ninterface LoaderInterface\n{\n}\n",
+    );
+    let base = [
+        interface,
+        ("templates/home.html.twig", "home\n"),
+        TWIG_BRIDGE,
+    ];
+    let project = |files: &[(&str, &str)]| {
+        let mut all = base.to_vec();
+        all.extend_from_slice(files);
+        broken_symfony(&all)
+    };
+    let (_dir, root) = project(&[(
+        "src/Twig/Plain.php",
+        "<?php\nnamespace App\\Twig;\nclass Plain\n{\n}\n",
+    )]);
+    assert_eq!(
+        template_status(&root, "missing.html.twig"),
+        TemplateStatus::Missing
+    );
+    let loader = "<?php\nnamespace App\\Twig;\nuse Twig\\Loader\\LoaderInterface;\nclass DbLoader implements LoaderInterface\n{\n}\n";
+    let (_dir, root) = project(&[("src/Twig/DbLoader.php", loader)]);
+    assert_eq!(
+        template_status(&root, "missing.html.twig"),
+        TemplateStatus::Unknown
+    );
+    for tags in ["['twig.loader']", "[{ name: twig.loader, priority: 10 }]"] {
+        let services = format!(
+            "parameters:\n    app.name: x\nservices:\n    App\\Twig\\Plain:\n        tags: {tags}\n"
+        );
+        let (_dir, root) = project(&[
+            (
+                "src/Twig/Plain.php",
+                "<?php\nnamespace App\\Twig;\nclass Plain\n{\n}\n",
+            ),
+            ("config/services.yaml", &services),
+        ]);
+        assert_eq!(
+            template_status(&root, "missing.html.twig"),
+            TemplateStatus::Unknown,
+            "{tags}"
+        );
+    }
+}
+
+#[test]
+fn namespaces_from_paths_and_bundles_read_both() {
+    let (_dir, root) = templated_bundles(&[
+        (
+            "config/packages/twig.yaml",
+            "twig:\n    paths:\n        '%kernel.project_dir%/extra': Acme\n",
+        ),
+        ("extra/own.html.twig", "own\n"),
+    ]);
+    assert_eq!(
+        template_file(&root, "@Acme/own.html.twig").as_deref(),
+        Some("extra/own.html.twig")
+    );
+    assert_eq!(
+        template_file(&root, "@Acme/card.html.twig").as_deref(),
+        Some("lib/acme/templates/card.html.twig")
+    );
+    assert_eq!(
+        template_status(&root, "@Acme/gone.html.twig"),
+        TemplateStatus::Missing
+    );
 }
 
 #[test]

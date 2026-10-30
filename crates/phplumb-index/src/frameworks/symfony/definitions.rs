@@ -1,13 +1,52 @@
 //! Services and parameters defined outside YAML: PHP configurator files and XML
 //! service files, the project's and the bundles'.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::RouteTarget;
 use super::doctrine::elements;
 use crate::index::Location;
-use crate::infer::configurator_definitions;
+use crate::infer::{configurator_definitions, parameter_setters};
+
+/// The parameters bundle extensions set from code: names, the literal start and
+/// end of names computed in between, and whether one sets a name computed
+/// otherwise, which may be any.
+#[derive(Default)]
+pub(crate) struct ExtensionParameters {
+    pub names: HashSet<String>,
+    pub patterns: Vec<(String, String)>,
+    pub any: bool,
+}
+
+impl ExtensionParameters {
+    /// Adds the parameters the PHP file `source` sets: through `setParameter()`, or
+    /// `set()` on a `parameters()` configurator.
+    pub(crate) fn read_php(&mut self, source: &[u8]) {
+        let setters = parameter_setters(source);
+        self.names.extend(setters.names);
+        for pattern in setters.patterns {
+            if !self.patterns.contains(&pattern) {
+                self.patterns.push(pattern);
+            }
+        }
+        self.any |= setters.computed;
+        let configured = configurator_definitions(source).parameters;
+        self.names
+            .extend(configured.into_iter().map(|(name, ..)| name));
+    }
+
+    /// Whether an extension may set the parameter `name`.
+    pub(crate) fn may_set(&self, name: &str) -> bool {
+        self.any
+            || self.names.contains(name)
+            || self.patterns.iter().any(|(prefix, suffix)| {
+                name.len() >= prefix.len() + suffix.len()
+                    && name.starts_with(prefix.as_str())
+                    && name.ends_with(suffix.as_str())
+            })
+    }
+}
 
 /// The parameters, services and aliases some files define.
 #[derive(Default)]
@@ -175,5 +214,51 @@ return static function ($container): void {
         assert_eq!(names(&found.parameters), ["app.x"]);
         assert_eq!(names(&found.services), ["app.alias", "app.y"]);
         assert_eq!(found.aliases["app.alias"], ["app.y"]);
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::ExtensionParameters;
+
+    fn read(body: &str) -> ExtensionParameters {
+        let mut found = ExtensionParameters::default();
+        found.read_php(
+            format!("<?php\nfunction load($container, $name, $busId) {{\n{body}\n}}\n").as_bytes(),
+        );
+        found
+    }
+
+    #[test]
+    fn reads_the_parameters_extensions_set() {
+        let literal = read("$container->setParameter('router.resource', 1);");
+        assert!(literal.names.contains("router.resource"));
+        assert!(literal.patterns.is_empty() && !literal.any);
+        let suffix = read("$container->setParameter($busId.'.middleware', 1);");
+        assert_eq!(
+            suffix.patterns,
+            [(String::new(), ".middleware".to_string())]
+        );
+        assert!(!suffix.any);
+        let prefix = read("$container->setParameter('dama.'.Configuration::KEY, 1);");
+        assert_eq!(prefix.patterns, [("dama.".to_string(), String::new())]);
+        assert!(!prefix.any);
+        let both = read("$container->setParameter('security.'.$name.'._indexed', 1);");
+        assert_eq!(
+            both.patterns,
+            [("security.".to_string(), "._indexed".to_string())]
+        );
+        assert!(both.may_set("security.main._indexed"));
+        assert!(!both.may_set("security._index"));
+        let stof = || vec![("stof.listener.".to_string(), ".class".to_string())];
+        let format = read("$container->setParameter(sprintf('stof.listener.%s.class', $name), 1);");
+        assert_eq!(format.patterns, stof());
+        assert!(!format.any);
+        let interpolated = read("$container->setParameter(\"stof.listener.{$name}.class\", 1);");
+        assert_eq!(interpolated.patterns, stof());
+        assert!(!interpolated.any);
+        assert!(read("$container->setParameter($name, 1);").any);
+        let configured = read("$container->parameters()->set('acme.x', 1);");
+        assert!(configured.names.contains("acme.x"));
     }
 }

@@ -843,6 +843,96 @@ pub(crate) fn configurator_definitions(source: &[u8]) -> ConfiguratorDefinitions
     found
 }
 
+/// The names a file's `setParameter()` calls set: literal ones, the literal start
+/// and end of one computed by concatenation, interpolation or `sprintf()`
+/// (`'dama.'.X::KEY`, `$id.'.middleware'`), and whether another is computed with
+/// neither.
+#[derive(Default)]
+pub(crate) struct ParameterSetters {
+    pub names: Vec<String>,
+    pub patterns: Vec<(String, String)>,
+    pub computed: bool,
+}
+
+/// The parameter names the `setParameter()` calls of `source` set, on any receiver.
+pub(crate) fn parameter_setters(source: &[u8]) -> ParameterSetters {
+    let arena = LocalArena::new();
+    let program = parse_file_content(&arena, FileId::zero(), source);
+    let mut calls: Vec<CallRef<'_, '_>> = Vec::new();
+    CallsWithArguments.walk_program(program, &mut calls);
+    let mut found = ParameterSetters::default();
+    for call in &calls {
+        let CallRef::Method(call) = call else {
+            continue;
+        };
+        let ClassLikeMemberSelector::Identifier(name) = &call.method else {
+            continue;
+        };
+        if !name.value.eq_ignore_ascii_case(b"setParameter") {
+            continue;
+        }
+        let shaped = match positional(&call.argument_list, 0) {
+            Some(Expression::Call(Call::Function(function))) => format_shape(source, function),
+            Some(argument) => Some(shape(argument)),
+            None => None,
+        };
+        let Some(shaped) = shaped else {
+            found.computed = true;
+            continue;
+        };
+        let (Some(first), Some(last)) = (shaped.find('*'), shaped.rfind('*')) else {
+            found.names.push(shaped);
+            continue;
+        };
+        let (prefix, suffix) = (&shaped[..first], &shaped[last + 1..]);
+        if prefix.is_empty() && suffix.is_empty() {
+            found.computed = true;
+        } else {
+            found
+                .patterns
+                .push((prefix.to_string(), suffix.to_string()));
+        }
+    }
+    found
+}
+
+/// The text `sprintf()` with a literal format gives, `*` for each conversion and `%`
+/// for each `%%`; none for another call.
+fn format_shape(source: &[u8], call: &FunctionCall<'_>) -> Option<String> {
+    let Expression::Identifier(identifier) = call.function else {
+        return None;
+    };
+    let span = identifier.span();
+    let name = source.get(span.start.offset as usize..span.end.offset as usize)?;
+    let name = name.strip_prefix(b"\\").unwrap_or(name);
+    if !name.eq_ignore_ascii_case(b"sprintf") {
+        return None;
+    }
+    let Expression::Literal(Literal::String(format)) = positional(&call.argument_list, 0)? else {
+        return None;
+    };
+    let format = String::from_utf8_lossy(format.value?).into_owned();
+    let mut text = String::with_capacity(format.len());
+    let mut chars = format.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            text.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => text.push('%'),
+            // A conversion runs up to its type letter.
+            Some(c) if c.is_ascii_alphabetic() => text.push('*'),
+            Some(_) => {
+                chars.by_ref().find(char::is_ascii_alphabetic);
+                text.push('*');
+            }
+            None => text.push('%'),
+        }
+    }
+    Some(text)
+}
+
 /// What a Symfony PHP route file defines through its `RoutingConfigurator`.
 #[derive(Default)]
 pub(crate) struct PhpRoutes {

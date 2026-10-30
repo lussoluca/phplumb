@@ -283,6 +283,29 @@ pub(crate) fn buses(
     Some((names, default))
 }
 
+/// The route resource Symfony loads unless `framework.router.resource` names another.
+const DEFAULT_ROUTER_RESOURCE: &str = "kernel::loadRoutes";
+
+/// Whether the configuration files give `framework.router.resource` another
+/// resource than the kernel's routes, also inside a `when@<env>` block.
+pub(crate) fn router_resource_changed(files: &[PathBuf], config_files: &ConfigFiles) -> bool {
+    files.iter().any(|file| {
+        let Some(parsed) = config_files.get(file) else {
+            return false;
+        };
+        let Some(root) = &parsed.yaml else {
+            return false;
+        };
+        top_blocks(root).into_iter().any(|block| {
+            block
+                .get("framework")
+                .and_then(|framework| framework.get("router"))
+                .and_then(|router| router.get("resource"))
+                .is_some_and(|resource| resource.text() != Some(DEFAULT_ROUTER_RESOURCE))
+        })
+    })
+}
+
 /// A service the configuration files tag: its class, or for `_instanceof` the
 /// type whose implementations carry the tag, and the tag's attributes.
 pub(crate) struct Tagged {
