@@ -360,8 +360,8 @@ impl Symfony {
         }
     }
 
-    /// In a YAML configuration file: a `%parameter%`, an `@id` service reference, or a
-    /// class name under `offset`.
+    /// In a YAML configuration file: a `%parameter%`, a template name, an `@id`
+    /// service reference, or a class name under `offset`.
     fn yaml_targets(
         &self,
         index: &Index,
@@ -396,8 +396,9 @@ impl Symfony {
         if let Some(name) = config::parameter_at(raw, (offset - start) as usize) {
             return targets_of(self.parameter_targets(&name));
         }
-        // A template name, such as a `form_themes` entry, also when it starts with `@`.
-        if value.to_ascii_lowercase().ends_with(".twig") {
+        // A template name, such as a `form_themes` entry; with `@`, a namespaced one.
+        let namespaced = !value.starts_with('@') || value.contains('/');
+        if namespaced && value.to_ascii_lowercase().ends_with(".twig") {
             return self
                 .template_file(value)
                 .into_iter()

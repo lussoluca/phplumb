@@ -1,5 +1,6 @@
-//! Twig template names: the directories `config/packages/twig.yaml` gives each
-//! namespace, in the order TwigBundle adds them to Twig's filesystem loader.
+//! Twig template names: the directories `config/packages/twig.yaml` and the
+//! bundles give each namespace, in the order TwigBundle adds them to Twig's
+//! filesystem loader.
 
 use std::path::{Path, PathBuf};
 
@@ -36,16 +37,18 @@ pub(crate) struct Templates {
     /// Whether an environment adds main-namespace directories or another
     /// `default_path`, which the module leaves out.
     main_unknown: bool,
-    /// The template directories of bundles, whose templates are not the project's.
-    bundle_views: Vec<PathBuf>,
+    /// The positions in `paths` of the bundles' entries, whose templates are not
+    /// the project's.
+    bundled: Vec<usize>,
 }
 
 impl Templates {
-    /// The `twig.paths` entries of `config/packages/twig.yaml`, then
-    /// `default_path` (`templates` by default) when it exists, then TwigBridge's form
-    /// themes. A `when@<env>` block
-    /// adds only namespaced paths, after the others, since its main-namespace paths
-    /// and `default_path` would shadow the other environments' templates.
+    /// The `twig.paths` entries of `config/packages/twig.yaml`, then the bundles'
+    /// namespaces, then `default_path` (`templates` by default) when it exists, then
+    /// TwigBridge's form themes. A `when@<env>` block or an environment directory
+    /// adds only namespaced paths, after the configured ones, since its
+    /// main-namespace paths and `default_path` would shadow the other environments'
+    /// templates.
     pub(crate) fn read(index: &Index, project: &Project, config_files: &ConfigFiles) -> Templates {
         let dir = &project.dir;
         let mut templates = Templates {
@@ -119,17 +122,19 @@ impl Templates {
             };
             let own = overrides.join("bundles").join(&name);
             if own.exists() {
+                self.bundled.push(self.paths.len());
                 self.paths.push((Some(namespace.clone()), Some(own)));
             }
             let views = [bundle.join("Resources/views"), bundle.join("templates")]
                 .into_iter()
                 .find(|views| views.exists());
             if let Some(views) = views {
+                self.bundled
+                    .extend([self.paths.len(), self.paths.len() + 1]);
                 self.paths
                     .push((Some(namespace.clone()), Some(views.clone())));
                 self.paths
-                    .push((Some(format!("!{namespace}")), Some(views.clone())));
-                self.bundle_views.push(views);
+                    .push((Some(format!("!{namespace}")), Some(views)));
             }
         }
     }
@@ -222,19 +227,14 @@ impl Templates {
         }
     }
 
-    /// Whether `path` is inside one of the project's template directories, not a
-    /// bundle's.
+    /// Whether `path` is inside one of the project's template directories: the
+    /// configured ones, `default_path` and the form themes, not those of bundles.
     pub(crate) fn holds(&self, path: &Path) -> bool {
-        if self
-            .bundle_views
-            .iter()
-            .any(|views| path.starts_with(views))
-        {
-            return false;
-        }
         self.paths
             .iter()
-            .filter_map(|(_, dir)| dir.as_deref())
+            .enumerate()
+            .filter(|(position, _)| !self.bundled.contains(position))
+            .filter_map(|(_, (_, dir))| dir.as_deref())
             .any(|dir| path.starts_with(dir))
     }
 }

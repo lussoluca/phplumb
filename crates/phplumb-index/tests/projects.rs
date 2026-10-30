@@ -1739,3 +1739,53 @@ fn bundle_templates_get_no_diagnostics() {
         ["Undefined template 'nowhere.html.twig'"]
     );
 }
+
+#[test]
+fn project_bundles_keep_project_template_diagnostics() {
+    let (_dir, root) = templated_bundles(&[
+        (
+            "config/bundles.php",
+            "<?php\nreturn [\n    App\\AppBundle::class => ['all' => true],\n];\n",
+        ),
+        (
+            "src/AppBundle.php",
+            "<?php\nnamespace App;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AppBundle extends AbstractBundle {}\n",
+        ),
+    ]);
+    let index = auto(&root);
+    let path = root.join("templates/page.html.twig");
+    let source = fs::read(&path).unwrap();
+    let messages: Vec<String> = index
+        .diagnostics(&path, &source)
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+
+    assert_eq!(messages, ["Undefined template 'nowhere.html.twig'"]);
+}
+
+#[test]
+fn bundles_setting_their_path_stay_unknown() {
+    let (_dir, root) = templated_bundles(&[
+        (
+            "lib/acme/src/AcmeBundle.php",
+            "<?php\nnamespace Acme;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle\n{\n    public function __construct()\n    {\n        $this->path = \\dirname(__DIR__).'/res';\n    }\n}\n",
+        ),
+        ("lib/acme/res/templates/real.html.twig", "real\n"),
+        (
+            "config/routes/acme.yaml",
+            "acme:\n    resource: '@AcmeBundle/config/routes.yaml'\n",
+        ),
+    ]);
+
+    assert_eq!(
+        template_status(&root, "@Acme/real.html.twig"),
+        TemplateStatus::Unknown
+    );
+    assert_eq!(
+        template_status(&root, "@Acme/card.html.twig"),
+        TemplateStatus::Unknown
+    );
+    assert!(route_files_of(&auto(&root), "acme_home").is_empty());
+    assert!(!route_missing(&auto(&root), "nope"));
+}

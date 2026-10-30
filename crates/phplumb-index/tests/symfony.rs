@@ -1514,3 +1514,19 @@ fn template_names_in_yaml_open_their_file() {
     assert!(definition(&mut index, twig, "'nowhere.html.twig'").is_empty());
     assert!(diagnostics(&index, twig).is_empty());
 }
+
+#[test]
+fn service_ids_ending_in_twig_stay_services() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "config/services_test.yaml",
+        "services:\n    app.mailer.twig:\n        class: App\\Mailer\n    app.user:\n        arguments: ['@app.mailer.twig']\n",
+    );
+
+    assert_eq!(
+        opened(&mut index, &path, "'@app.mailer"),
+        ["config/services_test.yaml"]
+    );
+}

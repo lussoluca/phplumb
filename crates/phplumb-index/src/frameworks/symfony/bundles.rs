@@ -46,9 +46,48 @@ pub(crate) fn bundle_dir(index: &Index, config: &Path, name: &str) -> Option<Pat
         .1
 }
 
-/// The directory of the bundle class `fqn`; none when the bundle sets its own path.
+/// Whether the bundle class `fqn`, or one of its parents below Symfony's bundle
+/// classes, declares or writes the `path` property `getPath()` returns.
+fn sets_path(index: &Index, fqn: &str) -> bool {
+    let mut next = Some(fqn.to_string());
+    let mut seen = 0;
+    while let Some(class) = next.take() {
+        seen += 1;
+        let symfony = std::iter::once(BUNDLE)
+            .chain(ABSTRACT_BUNDLES)
+            .any(|known| class.eq_ignore_ascii_case(known));
+        if symfony || seen > 16 {
+            return false;
+        }
+        let Some(found) = index.classes_named(&class).into_iter().next() else {
+            return false;
+        };
+        let Some(shape) = &found.declaration.class else {
+            return false;
+        };
+        let declares = shape
+            .members
+            .iter()
+            .any(|m| m.kind == MemberKind::Property && m.name.eq_ignore_ascii_case("path"));
+        let text = std::fs::read(found.path).unwrap_or_default();
+        let (start, end) = found.declaration.range;
+        let body = text.get(start as usize..end as usize).unwrap_or_default();
+        let writes = body.windows(b"->path".len()).any(|w| w == b"->path");
+        if declares || writes {
+            return true;
+        }
+        next = shape.parent.clone();
+    }
+    false
+}
+
+/// The directory of the bundle class `fqn`; none when the bundle sets its own path,
+/// by its `getPath()` or by its `path` property.
 fn directory(index: &Index, fqn: &str) -> Option<PathBuf> {
     let class = index.classes_named(fqn).into_iter().next()?;
+    if sets_path(index, fqn) {
+        return None;
+    }
     // The nearest `getPath()` decides: Symfony's own, or one the bundle sets.
     let (owner, _) = index
         .find_member(fqn, MemberKind::Method, "getPath")
