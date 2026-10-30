@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::config::top_blocks;
 use super::files::ConfigFiles;
 use crate::filter::{PathFilter, is_doctrine_xml};
 use crate::frameworks::yaml::{Step, Yaml, scalar_at};
@@ -288,6 +289,62 @@ pub(crate) struct Mappings {
     entities: HashMap<String, Option<String>>,
     /// Each mapped superclass, with the repository it declares.
     superclasses: HashMap<String, Option<String>>,
+    /// The namespace each entity alias stands for in `Alias:Entity`.
+    namespaces: HashMap<String, String>,
+}
+
+/// The namespaces entity aliases stand for: each mapping of `doctrine.orm.mappings`
+/// or `doctrine.orm.entity_managers.<name>.mappings` with a `prefix`, under its
+/// `alias` or, as DoctrineBundle does, its name. An alias given different prefixes
+/// is left out.
+fn entity_namespaces(files: &[PathBuf], config_files: &ConfigFiles) -> HashMap<String, String> {
+    let mut found: HashMap<String, Option<String>> = HashMap::new();
+    for file in files {
+        let Some(parsed) = config_files.get(file) else {
+            continue;
+        };
+        let Some(root) = &parsed.yaml else {
+            continue;
+        };
+        for block in top_blocks(root) {
+            let Some(orm) = block
+                .get("doctrine")
+                .and_then(|doctrine| doctrine.get("orm"))
+            else {
+                continue;
+            };
+            let mut managers = vec![orm];
+            if let Some(Yaml::Map(entries)) = orm.get("entity_managers") {
+                managers.extend(entries.iter().map(|(_, manager)| manager));
+            }
+            for manager in managers {
+                let Some(Yaml::Map(mappings)) = manager.get("mappings") else {
+                    continue;
+                };
+                for (name, mapping) in mappings {
+                    let (Some(name), Some(prefix)) =
+                        (name.text(), mapping.get("prefix").and_then(Yaml::text))
+                    else {
+                        continue;
+                    };
+                    let alias = mapping.get("alias").and_then(Yaml::text).unwrap_or(name);
+                    let prefix = prefix.trim_matches('\\').to_string();
+                    found
+                        .entry(alias.to_string())
+                        .and_modify(|known| {
+                            if known.as_ref() != Some(&prefix) {
+                                *known = None;
+                            }
+                        })
+                        .or_insert_with(|| Some(prefix));
+                }
+            }
+        }
+    }
+    found
+        .into_iter()
+        .filter_map(|(alias, prefix)| Some((alias, prefix?)))
+        .collect()
 }
 
 /// Records the mapped class `class`, keeping a repository it declares anywhere.
@@ -301,14 +358,19 @@ fn record(found: &mut HashMap<String, Option<String>>, class: &str, repository: 
 impl Mappings {
     /// The `repository-class` of every entity and mapped superclass in the project's
     /// `*.orm.xml` files, then the repository of the `#[ORM\Entity]`,
-    /// `@ORM\Entity` and `#[ORM\MappedSuperclass]` mappings of project classes.
+    /// `@ORM\Entity` and `#[ORM\MappedSuperclass]` mappings of project classes, and
+    /// the entity aliases the configuration files `config` define.
     pub(crate) fn read(
         index: &Index,
         filter: &PathFilter,
         files: &[PathBuf],
+        config: &[PathBuf],
         config_files: &ConfigFiles,
     ) -> Mappings {
-        let mut mappings = Mappings::default();
+        let mut mappings = Mappings {
+            namespaces: entity_namespaces(config, config_files),
+            ..Mappings::default()
+        };
         for file in files {
             let Some(parsed) = config_files.get(file) else {
                 continue;
@@ -385,6 +447,15 @@ impl Mappings {
             }
         }
         mappings
+    }
+
+    /// The entity `name` stands for: for `Alias:Entity`, the entity in the alias's
+    /// namespace, none for an unknown alias; any other name itself.
+    pub(crate) fn entity_named(&self, name: &str) -> Option<String> {
+        match name.split_once(':') {
+            Some((alias, entity)) => Some(format!("{}\\{entity}", self.namespaces.get(alias)?)),
+            None => Some(name.to_string()),
+        }
     }
 
     /// The repository of `entity`: its own, else, as `ClassMetadataFactory` does,

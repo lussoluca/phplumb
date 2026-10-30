@@ -962,7 +962,13 @@ impl Symfony {
             self.bundles_key = key;
             self.bundle_definitions = OnceLock::new();
         }
-        self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
+        self.mappings = Mappings::read(
+            index,
+            &filter,
+            &self.mapping_files,
+            &files,
+            &self.config_files,
+        );
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);
         let tagged =
@@ -1067,13 +1073,16 @@ impl Framework for Symfony {
     }
 
     /// `getRepository(X::class)` returns the repository the mappings declare for `X`,
-    /// when the index knows that class.
+    /// when the index knows that class; `getRepository('Alias:X')` does for `X` in
+    /// the alias's namespace.
     fn call_type(&self, index: &Index, call: &FrameworkCall<'_>) -> Option<TypeExpr> {
         if !calls_one_of(index, call, &REPOSITORY_METHODS) {
             return None;
         }
-        let entity = call.strings.first()?.as_deref()?;
-        let repository = self.mappings.repository_for(index, entity)?;
+        let entity = self
+            .mappings
+            .entity_named(call.strings.first()?.as_deref()?)?;
+        let repository = self.mappings.repository_for(index, &entity)?;
         index
             .has_class(repository)
             .then(|| TypeExpr::Named(repository.to_string()))

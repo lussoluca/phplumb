@@ -2845,6 +2845,45 @@ fn manager_registry_repositories_are_typed() {
     assert_eq!(find_recent(&root, 1), [REPOSITORY]);
 }
 
+/// A loader asking `getRepository()` for `Shop:Post`, `Blog:Post` and `Other:Post`.
+const ALIAS_LOADER: &str = "<?php\nnamespace App\\Service;\nuse Doctrine\\Persistence\\ObjectManager;\nfinal class Loader\n{\n    public function __construct(private ObjectManager $em)\n    {\n    }\n\n    public function load(): void\n    {\n        $this->em->getRepository('Shop:Post')->findRecent();\n        $this->em->getRepository('Blog:Post')->findRecent();\n        $this->em->getRepository('Other:Post')->findRecent();\n    }\n}\n";
+
+#[test]
+fn aliased_entities_type_their_repository() {
+    // `Shop` is a mapping's `alias`, `Blog` a mapping's name; `Other` is unknown.
+    let mappings = "            App:\n                prefix: App\\Entity\n                alias: Shop\n            Blog:\n                prefix: App\\Entity\n";
+    let single = format!("doctrine:\n    orm:\n        mappings:\n{mappings}");
+    let managers = format!(
+        "doctrine:\n    orm:\n        entity_managers:\n            default:\n                mappings:\n{}",
+        mappings
+            .replace("\n            ", "\n                    ")
+            .replacen("            ", "                    ", 1)
+    );
+    for config in [&single, &managers] {
+        let (_dir, root) = doctrine_symfony(&[
+            ("src/Entity/Post.php", POST_ENTITY),
+            ("config/doctrine/Post.orm.xml", POST_XML),
+            ("src/Service/Loader.php", ALIAS_LOADER),
+            ("config/packages/doctrine.yaml", config),
+        ]);
+        assert_eq!(find_recent(&root, 0), [REPOSITORY], "{config}");
+        assert_eq!(find_recent(&root, 1), [REPOSITORY], "{config}");
+        assert!(find_recent(&root, 2).is_empty(), "{config}");
+    }
+    // An alias whose namespace an environment changes gives nothing.
+    let changed = format!(
+        "{single}when@test:\n    doctrine:\n        orm:\n            mappings:\n                App:\n                    prefix: Other\\Entity\n                    alias: Shop\n"
+    );
+    let (_dir, root) = doctrine_symfony(&[
+        ("src/Entity/Post.php", POST_ENTITY),
+        ("config/doctrine/Post.orm.xml", POST_XML),
+        ("src/Service/Loader.php", ALIAS_LOADER),
+        ("config/packages/doctrine.yaml", &changed),
+    ]);
+    assert!(find_recent(&root, 0).is_empty());
+    assert_eq!(find_recent(&root, 1), [REPOSITORY]);
+}
+
 const POST_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<doctrine-mapping><entity name=\"App\\Entity\\Post\" repository-class=\"App\\Repository\\PostRepository\"/></doctrine-mapping>\n";
 const POST_ENTITY: &str = "<?php\nnamespace App\\Entity;\nclass Post\n{\n}\n";
 
