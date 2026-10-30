@@ -2588,3 +2588,33 @@ fn unresolved_bundles_define_nothing() {
     );
     assert!(bundle_definitions_at(&[own_path], "router'").is_empty());
 }
+
+#[test]
+fn instanceof_and_bind_references_lead_to_their_definitions() {
+    let (_dir, root) = broken_symfony(&[(
+        "config/services.yaml",
+        "parameters:\n    app.name: x\n\nservices:\n    _defaults:\n        bind:\n            $name: '%app.name%'\n            $mailer: '@app.mailer'\n            $other: '%app.missing%'\n    _instanceof:\n        App\\Handles:\n            calls:\n                - [setMailer, ['@app.mailer']]\n    app.mailer:\n        class: stdClass\n",
+    )]);
+    let mut index = auto(&root);
+    let path = root.join("config/services.yaml");
+    let source = fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&source).into_owned();
+    let at = |index: &mut Index, needle: &str, nth: usize| -> Vec<String> {
+        let offset = text.match_indices(needle).nth(nth).unwrap().0 as u32 + 1;
+        index
+            .definition(&path, &source, offset)
+            .into_iter()
+            .map(|location| text[location.start as usize..location.end as usize].to_string())
+            .collect()
+    };
+
+    assert_eq!(at(&mut index, "app.name", 1), ["app.name"]);
+    assert_eq!(at(&mut index, "app.mailer", 0), ["app.mailer"]);
+    assert_eq!(at(&mut index, "app.mailer", 1), ["app.mailer"]);
+    let messages: Vec<String> = index
+        .diagnostics(&path, &source)
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+    assert_eq!(messages, ["Undefined parameter 'app.missing'"]);
+}
