@@ -250,9 +250,72 @@ fn argument_count(source: &[u8], literal: &Literal) -> usize {
 fn list_of(source: &[u8], literal: &Literal) -> Option<usize> {
     let element = is_function_list_element(source, literal, &["include"])
         || (is_tag_argument(source, literal) && in_list(source, literal));
-    element
-        .then(|| enclosing_open(source, literal.block.0, literal.quote))
-        .flatten()
+    if !element {
+        return None;
+    }
+    let (block, end) = literal.block;
+    let open = enclosing_open(source, block, literal.quote)?;
+    let close = closing(source, open, end)?;
+    (plain_list(source, open, close) && whole_argument(source, literal, close)).then_some(open)
+}
+
+/// Whether the list between `open` and `close` holds only string literals without
+/// interpolations, so its elements are every template Twig may try.
+fn plain_list(source: &[u8], open: usize, close: usize) -> bool {
+    let mut i = open + 1;
+    while i < close {
+        match source[i] {
+            b',' => i += 1,
+            c if c.is_ascii_whitespace() => i += 1,
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < close && source[i] != quote {
+                    if quote == b'"' && source[i..].starts_with(b"#{") {
+                        return false;
+                    }
+                    i += if source[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether the list closing at `close` is the whole argument the literal's tag or
+/// call takes: the tag goes on with `with`, `only`, `ignore` or ends, and the call
+/// ends or takes other arguments, fewer than the four that bring `ignore_missing`.
+fn whole_argument(source: &[u8], literal: &Literal, close: usize) -> bool {
+    let end = literal.block.1;
+    let after = skip_spaces(source, close + 1, end);
+    if literal.tag {
+        let rest = String::from_utf8_lossy(&source[after..end]);
+        let rest = rest.trim_end_matches(['-', '~']).trim_end();
+        let word = rest.split(|c: char| !c.is_ascii_alphanumeric()).next();
+        return rest.is_empty() || matches!(word, Some("with" | "only" | "ignore"));
+    }
+    let mut arguments = 1;
+    let mut depth = 0;
+    let mut i = after;
+    while i < end {
+        match source[i] {
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < end && source[i] != quote {
+                    i += if source[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' if depth == 0 => return arguments < 4,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => arguments += 1,
+            _ if depth == 0 && i == after => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn in_list(source: &[u8], literal: &Literal) -> bool {
@@ -731,7 +794,7 @@ fn form_theme(source: &[u8], literal: &Literal) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TwigName, names, route_name_at, template_name_at};
+    use super::{TwigName, matches, names, pattern, route_name_at, template_name_at};
 
     fn route(source: &str, needle: &str) -> Option<String> {
         let offset = source.find(needle).unwrap() as u32 + 1;
@@ -792,6 +855,20 @@ mod tests {
         ] {
             assert_eq!(template(source, needle), None, "{source} {needle}");
         }
+    }
+
+    #[test]
+    fn interpolations_become_patterns() {
+        assert_eq!(pattern("blog_#{x}"), "blog_*");
+        assert_eq!(pattern("#{a}/#{ {k: 1}.k }.html.twig"), "*/*.html.twig");
+        assert_eq!(pattern("#{a}#{b}x"), "*x");
+        assert!(matches("blog_*", "blog_list"));
+        assert!(matches("*/*.twig", "a/b/c.twig"));
+        assert!(matches("a*b*c", "abc"));
+        assert!(!matches("a*b*c", "acb"));
+        assert!(!matches("ab*ba", "aba"));
+        assert!(matches("plain", "plain"));
+        assert!(!matches("plain", "plains"));
     }
 
     #[test]

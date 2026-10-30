@@ -1579,10 +1579,10 @@ fn bundle_extension_parameters_stay_silent() {
 }
 
 #[test]
-fn bundle_parameters_are_checked_when_every_source_is_read() {
+fn parameters_bundle_code_sets_are_known() {
     let bundle = "<?php\nnamespace Acme;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle\n{\n    public function build($container): void\n    {\n        $container->addCompilerPass(new \\Acme\\Pass\\AcmePass());\n    }\n}\n";
     let pass = "<?php\nnamespace Acme\\Pass;\nuse Symfony\\Component\\DependencyInjection\\Compiler\\CompilerPassInterface;\nclass AcmePass implements CompilerPassInterface\n{\n    private const KEY = 'acme.const_set';\n\n    public function process($container): void\n    {\n        $container->setParameter('acme.pass_set', 1);\n        $container->getParameterBag()->set(self::KEY, 1);\n    }\n}\n";
-    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->getParameter('router.nowhere');\n        $this->getParameter('acme.pass_set');\n        $this->getParameter('acme.const_set');\n        $this->getParameter('container.build_id');\n        $this->getParameter('acme.yaml_set');\n    }\n}\n";
+    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->getParameter('router.nowhere');\n        $this->getParameter('acme.pass_set');\n        $this->getParameter('acme.const_set');\n        $this->getParameter('container.build_id');\n        $this->getParameter('acme.yaml_set');\n        $this->getParameter('acme.nowhere');\n    }\n}\n";
     let base = [
         (
             "lib/CompilerPassInterface.php",
@@ -1595,24 +1595,30 @@ fn bundle_parameters_are_checked_when_every_source_is_read() {
             "parameters:\n    acme.yaml_set: 1\n",
         ),
         ("src/Controller/Uses.php", uses),
+        (
+            "config/services.yaml",
+            "parameters:\n    app.name: x\n    acme.local: 1\n",
+        ),
     ];
     let project = |files: &[(&str, &str)]| {
         let mut all = base.to_vec();
         all.extend_from_slice(files);
         bundled_symfony(&all)
     };
+    // Bundles may set parameters in more ways than the module reads, so only the
+    // project's families are checked.
     let (_dir, root) = project(&[]);
     assert_eq!(
         broken_messages(&root),
-        ["Undefined parameter 'router.nowhere'"]
+        ["Undefined parameter 'acme.nowhere'"]
     );
-    // A bundle the index lacks, or YAML configuration the module cannot read, may
-    // define any.
+    // A bundle the index lacks changes nothing.
     let unindexed = "<?php\nreturn [\n    Symfony\\Bundle\\FrameworkBundle\\FrameworkBundle::class => ['all' => true],\n    Acme\\AcmeBundle::class => ['all' => true],\n    Missing\\MissingBundle::class => ['all' => true],\n];\n";
     let (_dir, root) = project(&[("config/bundles.php", unindexed)]);
-    assert!(broken_messages(&root).is_empty());
-    let (_dir, root) = project(&[("lib/acme/config/broken.yaml", "parameters: [\n")]);
-    assert!(broken_messages(&root).is_empty());
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'acme.nowhere'"]
+    );
 }
 
 fn route_missing(index: &Index, name: &str) -> bool {
@@ -1672,6 +1678,7 @@ fn unreadable_xml_routes_stay_unknown() {
     for import in [
         "<import resource=\"../src/*.xml\"/>",
         "<import resource=\"../src/Controller/\" type=\"annotation\"/>",
+        "<r:route xmlns:r=\"http://symfony.com/schema/routing\" id=\"missing_route\" path=\"/x\"/>",
     ] {
         let blog = format!("<routes>\n    {import}\n</routes>\n");
         let (_dir, root) = xml_routed_symfony(&blog, &[]);
@@ -1791,6 +1798,22 @@ fn logout_routes_are_checked_when_security_is_read() {
     ));
     let (_dir, root) = broken_symfony(&more);
     assert!(!route_missing(&auto(&root), "_logout_admin"));
+    // So may a kernel that configures the container from PHP.
+    let mut kernel = files.to_vec();
+    kernel.push((
+        "src/Kernel.php",
+        "<?php\nnamespace App;\nuse Symfony\\Component\\DependencyInjection\\Loader\\Configurator\\ContainerConfigurator;\nclass Kernel\n{\n    protected function configureContainer(ContainerConfigurator $c): void\n    {\n    }\n}\n",
+    ));
+    let (_dir, root) = broken_symfony(&kernel);
+    assert!(!route_missing(&auto(&root), "_logout_admin"));
+    // A parameter in a logout path, or settings merged from another key, hide it.
+    for security in [
+        "security:\n    firewalls:\n        main:\n            logout:\n                path: '%app.logout%'\n",
+        "security:\n    firewalls:\n        main: &main\n            logout:\n                path: /logout\n        admin:\n            <<: *main\n",
+    ] {
+        let (_dir, root) = broken_symfony(&[("config/packages/security.yaml", security), files[1]]);
+        assert!(!route_missing(&auto(&root), "_logout_admin"), "{security}");
+    }
 }
 
 #[test]
@@ -2174,11 +2197,11 @@ fn messages_of(root: &Path, file: &str) -> Vec<String> {
 
 #[test]
 fn interpolated_twig_names_are_checked() {
-    let page = "{{ path(\"blog_#{x}\") }}\n{{ path(\"shop_#{x}\") }}\n{% include \"blocks/#{t}.html.twig\" %}\n{% include \"cards/#{t}.html.twig\" %}\n";
+    let page = "{{ path(\"blog_#{x}\") }}\n{{ path(\"shop_#{x}\") }}\n{% include \"blocks/#{t}.html.twig\" %}\n{% include \"cards/#{t}.html.twig\" %}\n{% include \"#{ns}/card.html.twig\" %}\n{{ path(\"about.#{locale}\") }}\n";
     let (_dir, root) = broken_symfony(&[
         (
             "config/routes.yaml",
-            "home:\n    path: /\nblog_list:\n    path: /blog\n",
+            "home:\n    path: /\nblog_list:\n    path: /blog\nabout:\n    path: { en: /about, fr: /a-propos }\n",
         ),
         ("templates/blocks/a.html.twig", "a\n"),
         ("templates/page.html.twig", page),
@@ -2195,7 +2218,7 @@ fn interpolated_twig_names_are_checked() {
 
 #[test]
 fn template_lists_are_checked() {
-    let page = "{{ include(['a.html.twig', 'b.html.twig']) }}\n{{ include(['c.html.twig', 'exists.html.twig']) }}\n{% include 'x.html.twig' ignore missing %}\n{% include ['d.html.twig', 'e.html.twig'] %}\n";
+    let page = "{{ include(['a.html.twig', 'b.html.twig']) }}\n{{ include(['c.html.twig', 'exists.html.twig']) }}\n{% include 'x.html.twig' ignore missing %}\n{% include ['d.html.twig', 'e.html.twig'] %}\n{% include [custom, 'gone_1.html.twig'] %}\n{{ include([custom, 'gone_2.html.twig']) }}\n{% extends [layout, 'gone_3.html.twig'] %}\n{% include ['gone_4.html.twig']|merge(more) %}\n{% include [\"pages/#{slug}.html.twig\", 'gone_5.html.twig'] %}\n{{ include(['gone_6.html.twig', 'gone_7.html.twig'], {}, true, true) }}\n";
     let (_dir, root) = broken_symfony(&[
         ("templates/exists.html.twig", "exists\n"),
         ("templates/page.html.twig", page),

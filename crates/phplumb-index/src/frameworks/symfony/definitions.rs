@@ -11,9 +11,7 @@ use crate::infer::{configurator_definitions, parameter_setters};
 
 /// The parameters bundle extensions set from code: names, the literal start and
 /// end of names computed in between, and whether one sets a name computed
-/// otherwise, which may be any. `complete` says whether every source of bundle
-/// parameters was read: each bundle class, its extension and compiler passes, and
-/// its PHP and XML configuration.
+/// otherwise, which may be any.
 #[derive(Default)]
 pub(crate) struct ExtensionParameters {
     pub names: HashSet<String>,
@@ -21,7 +19,6 @@ pub(crate) struct ExtensionParameters {
     /// Names given as class constants, by class and constant, still to look up.
     pub constants: Vec<(String, String)>,
     pub any: bool,
-    pub complete: bool,
 }
 
 impl ExtensionParameters {

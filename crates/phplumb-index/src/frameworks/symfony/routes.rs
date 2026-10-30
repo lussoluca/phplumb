@@ -173,10 +173,16 @@ impl Routes {
         if self.unknown || (self.symfony && pattern.starts_with(['_', '*'])) {
             return false;
         }
-        !self
-            .by_name
-            .keys()
-            .any(|name| super::twig::matches(pattern, name))
+        let known = |pattern: &str| {
+            self.by_name
+                .keys()
+                .any(|name| super::twig::matches(pattern, name))
+        };
+        // The localized routes `name.locale` of a route `name`, as `missing()` keeps.
+        let localized = pattern
+            .rsplit_once('.')
+            .is_some_and(|(base, _)| known(base));
+        !known(pattern) && !localized
     }
 
     fn add(&mut self, name: String, target: RouteTarget) {
@@ -527,6 +533,8 @@ impl Routes {
                     };
                     self.follow(sources, import(sources, file, &spec, prefix));
                 }
+                // An element with a namespace prefix may be a route the reader skips.
+                name if name.contains(':') => self.unknown = true,
                 _ => {}
             }
         }
@@ -583,9 +591,15 @@ impl Routes {
                     continue;
                 };
                 for (firewall, settings) in firewalls {
+                    // Settings the reader cannot see, through an alias or a merge key,
+                    // may hold a logout path.
                     let (Some(firewall), Yaml::Map(settings)) = (firewall.text(), settings) else {
+                        self.symfony = true;
                         continue;
                     };
+                    if settings.iter().any(|(key, _)| key.text() == Some("<<")) {
+                        self.symfony = true;
+                    }
                     for (key, value) in settings {
                         let Yaml::Scalar {
                             value: name,
@@ -597,6 +611,11 @@ impl Routes {
                         };
                         // Symfony adds a route for a logout path, not for a route name.
                         let path = value.get("path").and_then(Yaml::text);
+                        // A parameter in the path resolves to either.
+                        if path.is_some_and(|p| p.contains('%')) {
+                            self.symfony = true;
+                            continue;
+                        }
                         let disabled = value.text() == Some("false");
                         if name != "logout" || disabled || path.is_some_and(|p| !p.starts_with('/'))
                         {

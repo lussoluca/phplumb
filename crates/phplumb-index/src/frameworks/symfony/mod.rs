@@ -604,15 +604,12 @@ impl Symfony {
         {
             return false;
         }
-        // Unless every source of bundle parameters was read, only a name whose first
-        // segment starts a parameter of the project counts.
         let family = |name: &str| name.split('.').next().unwrap_or_default().to_string();
         let ours = family(name);
-        if !self.extension_parameters(index).complete
-            && !self
-                .parameters
-                .keys()
-                .any(|defined| family(defined) == ours)
+        if !self
+            .parameters
+            .keys()
+            .any(|defined| family(defined) == ours)
         {
             return false;
         }
@@ -887,20 +884,14 @@ impl Symfony {
     /// The parameters each bundle's extension sets: the PHP files of the
     /// `DependencyInjection` directory next to the bundle class, compiler passes
     /// included, the compiler passes the bundle class names, and the bundle class
-    /// itself, as an `AbstractBundle` loads its extension. The set is complete when
-    /// the index has every bundle class and its directory, each name set as a class
-    /// constant resolves, and each bundle YAML configuration file parses; the names
-    /// under its `parameters` count.
+    /// itself, as an `AbstractBundle` loads its extension; and the names under
+    /// `parameters` in the bundle's YAML configuration. A name set as a class constant
+    /// that does not resolve may be any.
     fn extension_parameters(&self, index: &Index) -> &ExtensionParameters {
         self.extension_parameters.get_or_init(|| {
-            // Without `config/bundles.php`, the bundles are registered elsewhere.
-            let mut found = ExtensionParameters {
-                complete: self.project.dir.join("config/bundles.php").is_file(),
-                ..ExtensionParameters::default()
-            };
+            let mut found = ExtensionParameters::default();
             for class in bundles::bundle_classes(&self.project.dir.join("config")) {
                 let Some(bundle) = index.classes_named(&class).into_iter().next() else {
-                    found.complete = false;
                     continue;
                 };
                 let Some(dir) = bundle.path.parent() else {
@@ -929,28 +920,23 @@ impl Symfony {
                 }
                 // YAML configuration, which the bundle definitions do not read: the
                 // names under `parameters`.
-                match bundles::directory(index, &class) {
-                    Some(dir) => {
-                        let configured =
-                            files_below(&[dir.join("Resources/config"), dir.join("config")]);
-                        for file in configured.iter().filter(|file| is_yaml(file)) {
-                            let root = std::fs::read_to_string(file)
-                                .ok()
-                                .and_then(|text| yaml::parse(&text));
-                            let Some(root) = root else {
-                                found.complete = false;
-                                continue;
-                            };
-                            if let Some(Yaml::Map(parameters)) = root.get("parameters") {
-                                found.names.extend(
-                                    parameters
-                                        .iter()
-                                        .filter_map(|(key, _)| key.text().map(str::to_string)),
-                                );
-                            }
-                        }
+                let Some(dir) = bundles::directory(index, &class) else {
+                    continue;
+                };
+                let configured = files_below(&[dir.join("Resources/config"), dir.join("config")]);
+                for file in configured.iter().filter(|file| is_yaml(file)) {
+                    let root = std::fs::read_to_string(file)
+                        .ok()
+                        .and_then(|text| yaml::parse(&text));
+                    if let Some(Yaml::Map(parameters)) =
+                        root.as_ref().and_then(|r| r.get("parameters"))
+                    {
+                        found.names.extend(
+                            parameters
+                                .iter()
+                                .filter_map(|(key, _)| key.text().map(str::to_string)),
+                        );
                     }
-                    None => found.complete = false,
                 }
             }
             for (class, constant) in std::mem::take(&mut found.constants) {
@@ -1187,7 +1173,7 @@ impl Symfony {
             &self.project,
             &self.config_files,
             &files,
-            configuration_unread,
+            configured_in_php || configuration_unread,
         );
         if classes.config_dir
             || classes.routes

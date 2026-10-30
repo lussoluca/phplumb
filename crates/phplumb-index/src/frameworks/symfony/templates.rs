@@ -240,6 +240,10 @@ impl Templates {
     /// text, in the directories of its namespace, as Twig's loader would find one
     /// for some value.
     pub(crate) fn pattern_status(&self, pattern: &str) -> TemplateStatus {
+        // A leading interpolation may name any namespace.
+        if pattern.starts_with('*') {
+            return TemplateStatus::Unknown;
+        }
         let pattern = pattern.replace('\\', "/");
         let (namespace, rest) = match pattern.strip_prefix('@') {
             Some(named) => match named.split_once('/') {
