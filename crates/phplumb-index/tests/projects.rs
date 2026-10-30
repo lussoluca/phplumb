@@ -2338,3 +2338,106 @@ fn prototype_tags_make_handlers() {
         "{found:?}"
     );
 }
+
+/// The `getParameter()` diagnostics of `broken_symfony` with `files`, whose
+/// controller asks for `app.nowhere`.
+fn parameter_messages(files: &[(&str, &str)]) -> Vec<String> {
+    let (_dir, root) = broken_symfony(files);
+    broken_messages(&root)
+        .into_iter()
+        .filter(|message| message.contains("parameter"))
+        .collect()
+}
+
+const NOWHERE: &str = "Undefined parameter 'app.nowhere'";
+
+#[test]
+fn yml_and_environment_configuration_define_parameters() {
+    for (file, content) in [
+        (
+            "config/packages/extra.yml",
+            "parameters:\n    app.nowhere: 1\n",
+        ),
+        (
+            "config/packages/dev/extra.yaml",
+            "parameters:\n    app.nowhere: 1\n",
+        ),
+        (
+            "config/services_dev.yml",
+            "parameters:\n    app.nowhere: 1\n",
+        ),
+    ] {
+        assert!(parameter_messages(&[(file, content)]).is_empty(), "{file}");
+    }
+    // Read files without the parameter keep it flagged.
+    assert_eq!(
+        parameter_messages(&[(
+            "config/packages/dev/extra.yaml",
+            "parameters:\n    app.other: 1\n"
+        )]),
+        [NOWHERE]
+    );
+}
+
+#[test]
+fn imported_files_define_parameters() {
+    let files = [
+        (
+            "config/services.yaml",
+            "imports:\n    - { resource: 'more/params.yaml' }\n\nparameters:\n    app.name: x\n",
+        ),
+        (
+            "config/more/params.yaml",
+            "parameters:\n    app.nowhere: 1\n",
+        ),
+    ];
+    assert!(parameter_messages(&files).is_empty());
+    let (_dir, root) = broken_symfony(&files);
+    let mut index = auto(&root);
+    let path = root.join("config/services.yaml");
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source).find("more/").unwrap() as u32 + 1;
+    let found: Vec<PathBuf> = index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| location.path)
+        .collect();
+    assert_eq!(found, [root.join("config/more/params.yaml")]);
+}
+
+#[test]
+fn import_cycles_read_each_file_once() {
+    let files = [
+        (
+            "config/services.yaml",
+            "imports:\n    - { resource: 'a.yaml' }\n\nparameters:\n    app.name: x\n",
+        ),
+        (
+            "config/a.yaml",
+            "imports:\n    - { resource: 'services.yaml' }\n\nparameters:\n    app.other: 1\n",
+        ),
+    ];
+    assert_eq!(parameter_messages(&files), [NOWHERE]);
+}
+
+#[test]
+fn ignored_missing_imports_keep_names_certain() {
+    let files = [(
+        "config/services.yaml",
+        "imports:\n    - { resource: 'gone.yaml', ignore_errors: true }\n\nparameters:\n    app.name: x\n",
+    )];
+    assert_eq!(parameter_messages(&files), [NOWHERE]);
+}
+
+#[test]
+fn unreadable_imports_keep_names_unknown() {
+    for import in ["'more/*.yaml'", "'gone.yaml'", "'legacy.xml'"] {
+        let services =
+            format!("imports:\n    - {{ resource: {import} }}\n\nparameters:\n    app.name: x\n");
+        let services: &'static str = Box::leak(services.into_boxed_str());
+        assert!(
+            parameter_messages(&[("config/services.yaml", services)]).is_empty(),
+            "{import}"
+        );
+    }
+}

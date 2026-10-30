@@ -589,8 +589,8 @@ impl Symfony {
         found
     }
 
-    /// In a YAML configuration file: a `%parameter%`, a template name, an `@id`
-    /// service reference, or a class name under `offset`.
+    /// In a YAML configuration file: an import's resource, a `%parameter%`, a
+    /// template name, an `@id` service reference, or a class name under `offset`.
     fn yaml_targets(
         &self,
         index: &Index,
@@ -613,6 +613,14 @@ impl Symfony {
         else {
             return Vec::new();
         };
+        // An import's resource opens the file it loads.
+        if steps.contains(&yaml::Step::Key("imports")) {
+            return config::imported_file(path, value)
+                .filter(|file| file.is_file())
+                .into_iter()
+                .map(file_start)
+                .collect();
+        }
         let in_services = steps.contains(&yaml::Step::Key("services"));
         let names_a_service = matches!(
             steps.last(),
@@ -664,14 +672,15 @@ impl Symfony {
 
     fn read(&mut self, index: &Index) {
         let filter = index.filter().scoped(&self.project);
-        let files = config::config_files(&self.project, &filter);
+        let (files, unread_imports) =
+            config::config_files(&self.project, &filter, &self.config_files);
         self.parameters = config::read_parameters(&files, &self.config_files);
         let configured_in_php = CONFIGURATORS
             .iter()
             .flat_map(|class| index.candidate_files(&RefKey::Class(class.to_string())))
             .any(|path| self.is_source(index, path));
-        self.parameters_unknown = configured_in_php
-            || config::has_unread_configuration(&self.project, &files, &self.config_files);
+        self.parameters_unknown =
+            configured_in_php || unread_imports || config::has_unread_configuration(&self.project);
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
         self.aliases = config::read_aliases(&files, &self.config_files);

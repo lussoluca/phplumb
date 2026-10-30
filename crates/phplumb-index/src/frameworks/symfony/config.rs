@@ -11,18 +11,117 @@ use crate::frameworks::symfony::RouteTarget;
 use crate::frameworks::yaml::{self, Yaml};
 use crate::index::Location;
 
-/// The configuration files of the project: `config/services.yaml`,
-/// `config/services_<env>.yaml`, then `config/packages/*.yaml`, in path order.
-pub(crate) fn config_files(project: &Project, filter: &PathFilter) -> Vec<PathBuf> {
+/// The configuration files the kernel loads: `config/services.{yaml,yml}`,
+/// `config/services_<env>.{yaml,yml}`, `config/packages/*.{yaml,yml}` and
+/// `config/packages/<env>/*.{yaml,yml}`, in path order, then the YAML files their
+/// `imports:` name, each once; and whether an import names something the module
+/// does not read: a glob, a directory, another format, or a missing file whose
+/// errors are not ignored.
+pub(crate) fn config_files(
+    project: &Project,
+    filter: &PathFilter,
+    config_files: &ConfigFiles,
+) -> (Vec<PathBuf>, bool) {
     let config = project.dir.join("config");
+    let yaml = |name: &str| name.ends_with(".yaml") || name.ends_with(".yml");
     let mut files = files_named(&config, |name| {
-        name == "services.yaml" || (name.starts_with("services_") && name.ends_with(".yaml"))
+        yaml(name) && (name.starts_with("services.") || name.starts_with("services_"))
     });
-    files.extend(files_named(&config.join("packages"), |name| {
-        name.ends_with(".yaml")
-    }));
+    let packages = config.join("packages");
+    files.extend(files_named(&packages, yaml));
+    let mut environments: Vec<PathBuf> = std::fs::read_dir(&packages)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    environments.sort();
+    for environment in environments {
+        files.extend(files_named(&environment, yaml));
+    }
     files.retain(|path| filter.in_scope(path));
-    files
+    let mut unread = false;
+    let mut seen: Vec<PathBuf> = files
+        .iter()
+        .map(|file| file.canonicalize().unwrap_or_else(|_| file.clone()))
+        .collect();
+    let mut next = 0;
+    while next < files.len() {
+        let file = files[next].clone();
+        next += 1;
+        for import in imports_of(&file, config_files) {
+            match import {
+                Import::File(imported) => {
+                    let real = imported.canonicalize().unwrap_or_else(|_| imported.clone());
+                    if !seen.contains(&real) {
+                        seen.push(real);
+                        files.push(imported);
+                    }
+                }
+                Import::Ignored => {}
+                Import::Unread => unread = true,
+            }
+        }
+    }
+    (files, unread)
+}
+
+/// What an entry of `imports:` loads.
+enum Import {
+    File(PathBuf),
+    /// A missing file whose errors are ignored.
+    Ignored,
+    Unread,
+}
+
+/// The imports of the configuration file `file`, also inside `when@<env>` blocks.
+fn imports_of(file: &Path, config_files: &ConfigFiles) -> Vec<Import> {
+    let Some(parsed) = config_files.get(file) else {
+        return Vec::new();
+    };
+    let Some(root) = &parsed.yaml else {
+        return Vec::new();
+    };
+    top_blocks(root)
+        .into_iter()
+        .filter_map(|block| match block.get("imports") {
+            Some(Yaml::Sequence(entries)) => Some(entries),
+            _ => None,
+        })
+        .flatten()
+        .map(|entry| {
+            let resource = entry.text().or_else(|| entry.get("resource")?.text());
+            let Some(resource) = resource else {
+                return Import::Unread;
+            };
+            let ignored = entry
+                .get("ignore_errors")
+                .and_then(Yaml::text)
+                .is_some_and(|value| matches!(value, "true" | "not_found"));
+            match imported_file(file, resource) {
+                Some(path) if path.is_file() => {
+                    let name = path.to_string_lossy();
+                    if name.ends_with(".yaml") || name.ends_with(".yml") {
+                        Import::File(path)
+                    } else {
+                        Import::Unread
+                    }
+                }
+                Some(path) if !path.exists() && ignored => Import::Ignored,
+                _ => Import::Unread,
+            }
+        })
+        .collect()
+}
+
+/// The file the import `resource` of `file` names, relative to its directory;
+/// none for a glob or a bundle path.
+pub(crate) fn imported_file(file: &Path, resource: &str) -> Option<PathBuf> {
+    if resource.starts_with('@') || resource.contains(['*', '?', '{', '[']) {
+        return None;
+    }
+    Some(normalize(&file.parent()?.join(resource)))
 }
 
 /// The files of `dir` whose name `keep` accepts, in path order.
@@ -495,40 +594,26 @@ pub(crate) fn parameters_in(text: &str) -> Vec<(&str, usize, usize)> {
 }
 
 /// Whether the project has configuration the module does not read, which may define
-/// parameters: PHP configuration files, environment directories below
-/// `config/packages`, or YAML files that import others, also inside `when@<env>`.
-pub(crate) fn has_unread_configuration(
-    project: &Project,
-    files: &[PathBuf],
-    config_files: &ConfigFiles,
-) -> bool {
+/// parameters: PHP or XML configuration files in `config`, `config/packages` and its
+/// environment directories.
+pub(crate) fn has_unread_configuration(project: &Project) -> bool {
     let config = project.dir.join("config");
     let php = |name: &str| name.ends_with(".php");
     let services_php = !files_named(&config, |name| {
         php(name) && (name == "services.php" || name.starts_with("services_"))
     })
     .is_empty();
-    let packages = std::fs::read_dir(config.join("packages"))
+    // PHP and XML configuration, in `config/packages` and its environment directories.
+    let unread =
+        |dir: &Path| !files_named(dir, |name| php(name) || name.ends_with(".xml")).is_empty();
+    let packages = config.join("packages");
+    let environments = std::fs::read_dir(&packages)
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
-        .any(|path| {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            path.is_dir() || php(name) || name.ends_with(".yml") || name.ends_with(".xml")
-        });
-    let imports = files.iter().any(|file| {
-        config_files.get(file).is_some_and(|parsed| {
-            parsed
-                .yaml
-                .as_ref()
-                .is_some_and(|root| top_blocks(root).iter().any(|b| b.get("imports").is_some()))
-        })
-    });
-    services_php || packages || imports
+        .any(|path| path.is_dir() && unread(&path));
+    services_php || unread(&packages) || environments
 }
 
 #[cfg(test)]
