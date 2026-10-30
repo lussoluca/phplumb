@@ -135,6 +135,19 @@ const MAPPED_CLASSES: [&str; 3] = ["entity", "embeddable", "mapped-superclass"];
 /// `target-entity` names the associated class.
 const ASSOCIATIONS: [&str; 4] = ["one-to-one", "one-to-many", "many-to-one", "many-to-many"];
 
+/// The elements an association holds before its `order-by`, which keep its target
+/// entity for an `order-by-field`; the `cascade-*` elements count too.
+const ASSOCIATION_PARTS: [&str; 8] = [
+    "cache",
+    "cascade",
+    "join-table",
+    "join-columns",
+    "inverse-join-columns",
+    "join-column",
+    "order-by",
+    "order-by-field",
+];
+
 /// What the attribute value under `offset` of a mapping file names.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Named {
@@ -161,7 +174,7 @@ pub(crate) fn named_at(text: &str, offset: u32) -> Option<Named> {
                 .attribute("target-entity")
                 .zip(mapped.as_deref())
                 .map(|(target, mapped)| qualify(mapped, target));
-        } else if !matches!(name, "order-by" | "order-by-field") {
+        } else if !ASSOCIATION_PARTS.contains(&name) && !name.starts_with("cascade") {
             association = None;
         }
         let Some((key, value, ..)) = element
@@ -216,8 +229,18 @@ pub(crate) fn named_at(text: &str, offset: u32) -> Option<Named> {
 /// superclass's, which its entities without their own take.
 #[derive(Default)]
 pub(crate) struct Mappings {
-    repositories: HashMap<String, String>,
-    superclasses: HashMap<String, String>,
+    /// Each mapped entity, with the repository it declares.
+    entities: HashMap<String, Option<String>>,
+    /// Each mapped superclass, with the repository it declares.
+    superclasses: HashMap<String, Option<String>>,
+}
+
+/// Records the mapped class `class`, keeping a repository it declares anywhere.
+fn record(found: &mut HashMap<String, Option<String>>, class: &str, repository: Option<String>) {
+    let known = found.entry(class.to_ascii_lowercase()).or_default();
+    if repository.is_some() {
+        *known = repository;
+    }
 }
 
 impl Mappings {
@@ -237,16 +260,16 @@ impl Mappings {
             };
             for element in elements(&parsed.text) {
                 let found = match element.name.as_str() {
-                    "entity" => &mut mappings.repositories,
+                    "entity" => &mut mappings.entities,
                     "mapped-superclass" => &mut mappings.superclasses,
                     _ => continue,
                 };
-                if let (Some(entity), Some(repository)) = (
-                    element.attribute("name"),
-                    element.attribute("repository-class"),
-                ) {
+                if let Some(entity) = element.attribute("name") {
                     let entity = entity.trim_start_matches('\\');
-                    found.insert(entity.to_ascii_lowercase(), qualify(entity, repository));
+                    let repository = element
+                        .attribute("repository-class")
+                        .map(|repository| qualify(entity, repository));
+                    record(found, entity, repository);
                 }
             }
         }
@@ -261,7 +284,7 @@ impl Mappings {
             // repository named or first.
             for metadata in &shape.metadata {
                 let found = if metadata.name.eq_ignore_ascii_case(ENTITY_ATTRIBUTE) {
-                    &mut mappings.repositories
+                    &mut mappings.entities
                 } else if metadata
                     .name
                     .eq_ignore_ascii_case(MAPPED_SUPERCLASS_ATTRIBUTE)
@@ -276,18 +299,19 @@ impl Mappings {
                     .filter(|(key, _)| key.is_none())
                     .map(|(_, value)| value);
                 let repository = match metadata.argument("repositoryClass").or(first) {
-                    Some(MetaValue::Class(class)) => class.clone(),
-                    Some(MetaValue::String(class)) => qualify(&declaration.fqn, class),
-                    _ => continue,
+                    Some(MetaValue::Class(class)) => Some(class.clone()),
+                    Some(MetaValue::String(class)) => Some(qualify(&declaration.fqn, class)),
+                    _ => None,
                 };
-                found.insert(declaration.fqn.to_ascii_lowercase(), repository);
+                record(found, &declaration.fqn, repository);
             }
         }
         mappings
     }
 
-    /// The repository of `entity`: its own, else the nearest mapped superclass
-    /// ancestor's.
+    /// The repository of `entity`: its own, else, as `ClassMetadataFactory` does,
+    /// the one of its nearest mapped ancestor when that is a mapped superclass;
+    /// unmapped classes in between are skipped.
     pub(crate) fn repository_for(&self, index: &Index, entity: &str) -> Option<&str> {
         if let Some(own) = self.repository_of(entity) {
             return Some(own);
@@ -298,8 +322,12 @@ impl Mappings {
             .and_then(|found| found.declaration.class.as_ref()?.parent.clone());
         for _ in 0..16 {
             let parent = next.take()?;
-            if let Some(repository) = self.superclasses.get(&parent.to_ascii_lowercase()) {
-                return Some(repository);
+            let key = parent.to_ascii_lowercase();
+            if let Some(repository) = self.superclasses.get(&key) {
+                return repository.as_deref();
+            }
+            if self.entities.contains_key(&key) {
+                return None;
             }
             next = index
                 .classes_named(&parent)
@@ -310,9 +338,9 @@ impl Mappings {
     }
 
     pub(crate) fn repository_of(&self, entity: &str) -> Option<&str> {
-        self.repositories
-            .get(&entity.trim_start_matches('\\').to_ascii_lowercase())
-            .map(String::as_str)
+        self.entities
+            .get(&entity.trim_start_matches('\\').to_ascii_lowercase())?
+            .as_deref()
     }
 }
 
@@ -409,6 +437,34 @@ mod tests {
             ))
         );
         assert_eq!(at("stray"), None);
+    }
+
+    #[test]
+    fn order_by_fields_follow_cascades_caches_and_join_tables() {
+        let text = r#"<doctrine-mapping>
+  <entity name="App\Entity\Post">
+    <one-to-many field="comments" target-entity="Comment" mapped-by="post">
+      <cache usage="READ_ONLY"/>
+      <cascade><cascade-persist/></cascade>
+      <order-by><order-by-field name="createdAt"/></order-by>
+    </one-to-many>
+    <many-to-many field="tags" target-entity="Tag">
+      <join-table name="post_tag">
+        <join-columns><join-column name="post_id"/></join-columns>
+        <inverse-join-columns><join-column name="tag_id"/></inverse-join-columns>
+      </join-table>
+      <order-by><order-by-field name="label"/></order-by>
+    </many-to-many>
+  </entity>
+</doctrine-mapping>"#;
+        let at = |needle: &str| named_at(text, text.find(needle).unwrap() as u32 + 1);
+        let property =
+            |class: &str, name: &str| Some(Named::Property(class.to_string(), name.to_string()));
+        assert_eq!(
+            at("createdAt"),
+            property("App\\Entity\\Comment", "createdAt")
+        );
+        assert_eq!(at("label"), property("App\\Entity\\Tag", "label"));
     }
 
     #[test]

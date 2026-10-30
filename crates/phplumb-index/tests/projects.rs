@@ -2913,3 +2913,113 @@ fn mapping_files_with_a_bom_or_encoding_are_read() {
         assert_eq!(find_recent(&root, 0), [REPOSITORY], "{text}");
     }
 }
+
+const BASE_WITH_REPOSITORY: &str = "<?php\nnamespace App\\Entity;\nuse App\\Repository\\PostRepository;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\MappedSuperclass(repositoryClass: PostRepository::class)]\nabstract class Base\n{\n}\n";
+const MAPPED_POST: &str = "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\Entity]\nclass Post extends Mid\n{\n}\n";
+
+#[test]
+fn only_the_nearest_mapped_parent_gives_its_repository() {
+    for (case, mid) in [
+        (
+            "entity",
+            "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\Entity]\nclass Mid extends Base\n{\n}\n",
+        ),
+        (
+            "superclass",
+            "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\MappedSuperclass]\nabstract class Mid extends Base\n{\n}\n",
+        ),
+    ] {
+        let (_dir, root) = doctrine_symfony(&[
+            ("src/Entity/Base.php", BASE_WITH_REPOSITORY),
+            ("src/Entity/Mid.php", mid),
+            ("src/Entity/Post.php", MAPPED_POST),
+        ]);
+        assert!(find_recent(&root, 0).is_empty(), "{case}");
+    }
+    // An unmapped class in between passes the repository on.
+    let (_dir, root) = doctrine_symfony(&[
+        ("src/Entity/Base.php", BASE_WITH_REPOSITORY),
+        (
+            "src/Entity/Mid.php",
+            "<?php\nnamespace App\\Entity;\nabstract class Mid extends Base\n{\n}\n",
+        ),
+        ("src/Entity/Post.php", MAPPED_POST),
+    ]);
+    assert_eq!(find_recent(&root, 0), [REPOSITORY]);
+    // The XML form.
+    let (_dir, root) = doctrine_symfony(&[
+        (
+            "config/doctrine/Base.orm.xml",
+            "<doctrine-mapping><mapped-superclass name=\"App\\Entity\\Base\" repository-class=\"App\\Repository\\PostRepository\"/></doctrine-mapping>\n",
+        ),
+        (
+            "config/doctrine/Mid.orm.xml",
+            "<doctrine-mapping><mapped-superclass name=\"App\\Entity\\Mid\"/></doctrine-mapping>\n",
+        ),
+        (
+            "config/doctrine/Post.orm.xml",
+            "<doctrine-mapping><entity name=\"App\\Entity\\Post\"/></doctrine-mapping>\n",
+        ),
+        (
+            "src/Entity/Base.php",
+            "<?php\nnamespace App\\Entity;\nabstract class Base\n{\n}\n",
+        ),
+        (
+            "src/Entity/Mid.php",
+            "<?php\nnamespace App\\Entity;\nabstract class Mid extends Base\n{\n}\n",
+        ),
+        (
+            "src/Entity/Post.php",
+            "<?php\nnamespace App\\Entity;\nclass Post extends Mid\n{\n}\n",
+        ),
+    ]);
+    assert!(find_recent(&root, 0).is_empty(), "xml");
+}
+
+#[test]
+fn own_repositories_win_over_the_superclass() {
+    let (_dir, root) = doctrine_symfony(&[
+        (
+            "src/Entity/Base.php",
+            "<?php\nnamespace App\\Entity;\nuse App\\Repository\\OtherRepository;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\MappedSuperclass(repositoryClass: OtherRepository::class)]\nabstract class Base\n{\n}\n",
+        ),
+        (
+            "src/Repository/OtherRepository.php",
+            "<?php\nnamespace App\\Repository;\nclass OtherRepository\n{\n    public function findRecent(): array { return []; }\n}\n",
+        ),
+        (
+            "src/Entity/Post.php",
+            "<?php\nnamespace App\\Entity;\nuse App\\Repository\\PostRepository;\nuse Doctrine\\ORM\\Mapping as ORM;\n#[ORM\\Entity(repositoryClass: PostRepository::class)]\nclass Post extends Base\n{\n}\n",
+        ),
+    ]);
+    assert_eq!(find_recent(&root, 0), [REPOSITORY]);
+}
+
+#[test]
+fn class_constant_annotation_repositories_are_read() {
+    let (_dir, root) = doctrine_symfony(&[(
+        "src/Entity/Post.php",
+        "<?php\nnamespace App\\Entity;\nuse App\\Repository\\PostRepository;\nuse Doctrine\\ORM\\Mapping as ORM;\n/**\n * @ORM\\Entity(repositoryClass=PostRepository::class)\n */\nclass Post\n{\n}\n",
+    )]);
+    assert_eq!(find_recent(&root, 0), [REPOSITORY]);
+}
+
+#[test]
+fn removed_directories_without_mappings_change_nothing() {
+    let (_dir, root) = doctrine_symfony(&[
+        ("src/Entity/Post.php", POST_ENTITY),
+        ("config/doctrine/Post.orm.xml", POST_XML),
+        ("config/other.d/notes.txt", "x\n"),
+    ]);
+    let mut index = auto(&root);
+    let dir = root.join("config/other.d");
+    fs::remove_dir_all(&dir).unwrap();
+
+    index.update(&[], &[dir]);
+
+    assert_eq!(
+        index.framework::<Symfony>().unwrap().mapping_files().len(),
+        1
+    );
+    assert_eq!(find_recent_in(&mut index, &root), [REPOSITORY]);
+}
