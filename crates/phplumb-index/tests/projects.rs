@@ -2844,3 +2844,72 @@ fn manager_registry_repositories_are_typed() {
     )]);
     assert_eq!(find_recent(&root, 1), [REPOSITORY]);
 }
+
+const POST_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<doctrine-mapping><entity name=\"App\\Entity\\Post\" repository-class=\"App\\Repository\\PostRepository\"/></doctrine-mapping>\n";
+const POST_ENTITY: &str = "<?php\nnamespace App\\Entity;\nclass Post\n{\n}\n";
+
+fn find_recent_in(index: &mut Index, root: &Path) -> Vec<String> {
+    let path = root.join("src/Service/Loader.php");
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source).find("findRecent").unwrap() as u32 + 1;
+    index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| {
+            location
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn removed_dotted_mapping_directories_leave_the_list() {
+    let (_dir, root) = doctrine_symfony(&[
+        ("src/Entity/Post.php", POST_ENTITY),
+        ("config/doctrine.old/Post.orm.xml", POST_XML),
+    ]);
+    let mut index = auto(&root);
+    let listed = |index: &Index| index.framework::<Symfony>().unwrap().mapping_files().len();
+    assert_eq!(listed(&index), 1);
+    assert_eq!(find_recent_in(&mut index, &root), [REPOSITORY]);
+    let dir = root.join("config/doctrine.old");
+    fs::remove_dir_all(&dir).unwrap();
+
+    index.update(&[], &[dir]);
+
+    assert_eq!(listed(&index), 0);
+    assert!(find_recent_in(&mut index, &root).is_empty());
+}
+
+#[test]
+fn added_and_removed_mapping_files_update_repositories() {
+    let (_dir, root) = doctrine_symfony(&[("src/Entity/Post.php", POST_ENTITY)]);
+    let mut index = auto(&root);
+    assert!(find_recent_in(&mut index, &root).is_empty());
+    let file = root.join("config/doctrine/Post.orm.xml");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, POST_XML).unwrap();
+
+    index.update(std::slice::from_ref(&file), &[]);
+    assert_eq!(find_recent_in(&mut index, &root), [REPOSITORY]);
+
+    fs::remove_file(&file).unwrap();
+    index.update(&[], std::slice::from_ref(&file));
+    assert!(find_recent_in(&mut index, &root).is_empty());
+}
+
+#[test]
+fn mapping_files_with_a_bom_or_encoding_are_read() {
+    let latin = POST_XML.replace("UTF-8", "ISO-8859-1");
+    for text in [format!("\u{feff}{POST_XML}"), latin] {
+        let (_dir, root) = doctrine_symfony(&[
+            ("src/Entity/Post.php", POST_ENTITY),
+            ("config/doctrine/Post.orm.xml", text.as_str()),
+        ]);
+        assert_eq!(find_recent(&root, 0), [REPOSITORY], "{text}");
+    }
+}
