@@ -112,15 +112,16 @@ impl Handlers {
         });
     }
 
-    /// The handlers whose handled class `message` is, extends or implements, each
-    /// with its method name.
+    /// The handlers whose handled class `message` is, extends or implements, or,
+    /// for an interface or abstract class, one of its subtypes, each with its method
+    /// name.
     pub(crate) fn of(&self, index: &Index, message: &str) -> Vec<(Location, String)> {
         let mut found: Vec<(Location, String)> = Vec::new();
         for handler in &self.list {
             let handles = handler
                 .handles
                 .iter()
-                .any(|class| is_a(index, message, &[class]));
+                .any(|class| may_carry(index, message, class));
             if handles && !found.iter().any(|(known, _)| *known == handler.location) {
                 found.push((handler.location.clone(), handler.name.clone()));
             }
@@ -143,6 +144,26 @@ impl Handlers {
         }
         found
     }
+}
+
+/// Whether a message typed `message` may be an instance of `class`: `message` is,
+/// extends or implements it, or, being an interface or abstract class, is one of
+/// its supertypes.
+pub(crate) fn may_carry(index: &Index, message: &str, class: &str) -> bool {
+    is_a(index, message, &[class]) || (is_open(index, message) && is_a(index, class, &[message]))
+}
+
+/// Whether `class` is an interface or an abstract class, which no message is an
+/// instance of itself.
+fn is_open(index: &Index, class: &str) -> bool {
+    index.classes_named(class).first().is_some_and(|found| {
+        found.declaration.kind == SymbolKind::Interface
+            || found
+                .declaration
+                .class
+                .as_ref()
+                .is_some_and(|shape| shape.is_abstract)
+    })
 }
 
 /// The method a class-level `#[AsMessageHandler]` names, when `attribute` is one.

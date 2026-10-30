@@ -721,7 +721,7 @@ fn handlers_list_their_dispatches() {
             11,
             "__invoke"
         ),
-        [dispatch(19), dispatch(23), dispatch(25)]
+        [dispatch(19), dispatch(23), dispatch(25), dispatch(32)]
     );
     let handle = (14, "handle".to_string());
     assert_eq!(
@@ -732,12 +732,13 @@ fn handlers_list_their_dispatches() {
             dispatch(20),
             dispatch(23),
             dispatch(24),
-            dispatch(25)
+            dispatch(25),
+            dispatch(32)
         ]
     );
     assert_eq!(
         lines_of(&mut index, "src/Handler/Explicit.php", 11, "run"),
-        [handle, dispatch(20), dispatch(24)]
+        [handle, dispatch(20), dispatch(24), dispatch(32)]
     );
 }
 
@@ -753,7 +754,8 @@ fn the_handler_attribute_lists_the_dispatches() {
             (20, "dispatch".to_string()),
             (23, "dispatch".to_string()),
             (24, "dispatch".to_string()),
-            (25, "dispatch".to_string())
+            (25, "dispatch".to_string()),
+            (32, "dispatch".to_string())
         ]
     );
 }
@@ -772,7 +774,7 @@ fn dispatch_keeps_hover_and_references() {
         hover.markdown
     );
     let references = index.references(&path, &source, offset, false);
-    assert_eq!(references.len(), 8, "{references:?}");
+    assert_eq!(references.len(), 10, "{references:?}");
 }
 
 #[test]
@@ -1628,7 +1630,8 @@ fn inherited_handler_methods_handle_for_concrete_classes() {
         [
             (14, "handle".to_string()),
             (20, "dispatch".to_string()),
-            (24, "dispatch".to_string())
+            (24, "dispatch".to_string()),
+            (32, "dispatch".to_string())
         ]
     );
 }
@@ -1639,5 +1642,39 @@ fn trait_handler_methods_handle_for_their_class() {
     assert!(
         dispatch_targets(&mut index, 19)
             .contains(&pair("src/Handler/HandlesEmail.php", "__invoke"))
+    );
+}
+
+#[test]
+fn interface_typed_dispatches_reach_the_handlers_of_implementations() {
+    let mut index = build();
+    let mut expected = dispatch_targets(&mut index, 19);
+    expected.extend(dispatch_targets(&mut index, 20));
+    expected.sort();
+    expected.dedup();
+    assert_eq!(dispatch_targets(&mut index, 32), expected);
+}
+
+#[test]
+fn handlers_of_implementations_list_interface_typed_dispatches() {
+    let mut index = build();
+    let found = lines_of(
+        &mut index,
+        "src/Handler/SendEmailHandler.php",
+        11,
+        "__invoke",
+    );
+    assert!(found.contains(&(32, "dispatch".to_string())), "{found:?}");
+}
+
+#[test]
+fn concrete_messages_skip_handlers_of_subclasses() {
+    let mut index = build();
+    assert_eq!(
+        dispatch_targets(&mut index, 33),
+        [pair(
+            "vendor/symfony/messenger/MessageBusInterface.php",
+            "dispatch"
+        )]
     );
 }

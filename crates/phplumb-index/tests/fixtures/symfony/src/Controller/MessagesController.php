@@ -26,4 +26,10 @@ class MessagesController
         $envelope = new Envelope(new SendEmail());
         $this->bus->dispatch($envelope);
     }
+
+    public function notify(\App\Message\Notify $notify, \App\Message\Ping $ping): void
+    {
+        $this->bus->dispatch($notify);
+        $this->bus->dispatch($ping);
+    }
 }

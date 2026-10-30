@@ -343,7 +343,7 @@ impl Symfony {
     }
 
     /// The `dispatch()` and `HandleTrait::handle()` calls of the project whose
-    /// message is, extends or implements one of `handled`, at their method name.
+    /// message may be one of `handled`, at their method name.
     fn dispatches(&self, index: &Index, handled: &[String]) -> Vec<(Location, String)> {
         let handled: Vec<&str> = handled.iter().map(String::as_str).collect();
         index
@@ -358,7 +358,11 @@ impl Symfony {
                 calls_one_of(index, &found, &DISPATCH)
                     && messages(index, &call.arguments, &call.wrapped)
                         .iter()
-                        .any(|class| is_a(index, class, &handled))
+                        .any(|message| {
+                            handled
+                                .iter()
+                                .any(|class| messenger::may_carry(index, message, class))
+                        })
             })
             .map(|call| {
                 let name = call.targets.iter().find_map(|target| match target {
