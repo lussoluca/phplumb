@@ -2536,3 +2536,55 @@ fn php_and_xml_configuration_define_targets() {
     // PHP and XML configuration keep parameter names unknown.
     assert_eq!(broken_messages(&root), ["Undefined route 'missing_route'"]);
 }
+
+const BUNDLE_SERVICES: &str = "<?php\nuse Symfony\\Component\\DependencyInjection\\Loader\\Configurator\\ContainerConfigurator;\nreturn static function (ContainerConfigurator $container): void {\n    $container->parameters()->set('router.request_context.host', 'localhost');\n    $container->services()\n        ->set('router.default', \\stdClass::class)\n        ->alias('router', 'router.default');\n};\n";
+
+fn bundle_definitions_at(files: &[(&str, &str)], needle: &str) -> Vec<String> {
+    let mut all = vec![
+        (
+            "lib/framework-bundle/Resources/config/routing.php",
+            BUNDLE_SERVICES,
+        ),
+        (
+            "config/packages/refs.yaml",
+            "services:\n    app.user:\n        arguments: ['@router', '%router.request_context.host%']\n",
+        ),
+    ];
+    all.extend_from_slice(files);
+    let (_dir, root) = bundled_symfony(&all);
+    let mut index = auto(&root);
+    let path = root.join("config/packages/refs.yaml");
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source).find(needle).unwrap() as u32 + 1;
+    index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| {
+            location
+                .path
+                .strip_prefix(&root)
+                .unwrap()
+                .display()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn bundle_services_and_parameters_lead_to_their_definition() {
+    let routing = "lib/framework-bundle/Resources/config/routing.php";
+    assert_eq!(bundle_definitions_at(&[], "router'"), [routing]);
+    assert_eq!(
+        bundle_definitions_at(&[], "router.request_context"),
+        [routing]
+    );
+}
+
+#[test]
+fn unresolved_bundles_define_nothing() {
+    let own_path = (
+        "lib/framework-bundle/FrameworkBundle.php",
+        "<?php\nnamespace Symfony\\Bundle\\FrameworkBundle;\nuse Symfony\\Component\\HttpKernel\\Bundle\\Bundle;\nclass FrameworkBundle extends Bundle\n{\n    public function getPath(): string { return __DIR__; }\n}\n",
+    );
+    assert!(bundle_definitions_at(&[own_path], "router'").is_empty());
+}

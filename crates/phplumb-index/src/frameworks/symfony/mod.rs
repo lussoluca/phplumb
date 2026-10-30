@@ -103,9 +103,8 @@ const MESSAGE_CALLS: [(&str, &str, usize); 5] = [
     ),
 ];
 
-/// What the PHP and XML files below `config` define, each file once, in path
-/// order.
-fn project_definitions(config: &Path) -> Definitions {
+/// What the PHP and XML files below `dirs` define, each file once, in path order.
+fn definitions_below(dirs: &[PathBuf]) -> Definitions {
     fn walk(dir: &Path, seen: &mut Vec<PathBuf>, found: &mut Vec<PathBuf>) {
         let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         if seen.contains(&real) {
@@ -128,7 +127,10 @@ fn project_definitions(config: &Path) -> Definitions {
         }
     }
     let mut files = Vec::new();
-    walk(config, &mut Vec::new(), &mut files);
+    let mut seen = Vec::new();
+    for dir in dirs {
+        walk(dir, &mut seen, &mut files);
+    }
     let mut definitions = Definitions::default();
     for file in files {
         let extension = file
@@ -356,6 +358,8 @@ pub struct Symfony {
     /// The parameters, services and aliases of the project's PHP and XML
     /// configuration.
     definitions: Definitions,
+    /// Those of the bundles' configuration, read on the first lookup after a read.
+    bundle_definitions: OnceLock<Definitions>,
     /// Each service alias and the service it stands for.
     aliases: HashMap<String, Vec<String>>,
     /// The argument names the configuration binds, and the classes whose
@@ -628,15 +632,33 @@ impl Symfony {
         self.parameters.get(name).map_or(&[], Vec::as_slice)
     }
 
+    /// The parameters, services and aliases the configuration of the bundles of
+    /// `config/bundles.php` defines, in their `Resources/config` and `config`
+    /// directories.
+    fn bundle_definitions(&self, index: &Index) -> &Definitions {
+        self.bundle_definitions.get_or_init(|| {
+            let dirs: Vec<PathBuf> = bundles::bundles(index, &self.project.dir.join("config"))
+                .into_iter()
+                .filter_map(|(_, dir)| dir)
+                .flat_map(|dir| [dir.join("Resources/config"), dir.join("config")])
+                .filter(|dir| dir.is_dir())
+                .collect();
+            definitions_below(&dirs)
+        })
+    }
+
     /// Where the parameter `name` is defined: under `parameters:`, then by the
-    /// project's `setParameter()` and parameter bag `set()` calls.
+    /// project's `setParameter()` and parameter bag `set()` calls, then in PHP and
+    /// XML configuration, the project's and the bundles'.
     fn parameter_locations(&self, index: &Index, name: &str) -> Vec<(Location, String)> {
         let mut found = targets_of(self.parameter_targets(name));
         if let Some(set) = self.set_parameters(index).and_then(|set| set.get(name)) {
             found.extend(targets_of(set));
         }
-        if let Some(defined) = self.definitions.parameters.get(name) {
-            found.extend(targets_of(defined));
+        for definitions in [&self.definitions, self.bundle_definitions(index)] {
+            if let Some(defined) = definitions.parameters.get(name) {
+                found.extend(targets_of(defined));
+            }
         }
         found
     }
@@ -654,11 +676,13 @@ impl Symfony {
                 continue;
             }
             seen.push(id);
+            let bundles = self.bundle_definitions(index);
             let defined: Vec<&RouteTarget> = self
                 .services
                 .get(id)
                 .into_iter()
                 .chain(self.definitions.services.get(id))
+                .chain(bundles.services.get(id))
                 .flatten()
                 .collect();
             let targets = match defined.is_empty() {
@@ -679,6 +703,7 @@ impl Symfony {
                     .get(id)
                     .into_iter()
                     .chain(self.definitions.aliases.get(id))
+                    .chain(bundles.aliases.get(id))
                     .flatten()
                     .map(String::as_str),
             );
@@ -789,7 +814,8 @@ impl Symfony {
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
         self.aliases = config::read_aliases(&files, &self.config_files);
-        self.definitions = project_definitions(&self.project.dir.join("config"));
+        self.definitions = definitions_below(&[self.project.dir.join("config")]);
+        self.bundle_definitions = OnceLock::new();
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);
