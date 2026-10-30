@@ -1797,3 +1797,52 @@ fn multi_line_and_null_safe_dispatches_list_their_handlers() {
     let explicit = definitions_in_copy(&mut index, &root, "src/Handler/Explicit.php", 11, "run");
     assert!(explicit.contains(&pair(multi, "dispatch")), "{explicit:?}");
 }
+
+#[test]
+fn bare_attributes_of_other_classes_open_their_class() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "src/Traced.php",
+        "<?php\nnamespace App;\n#[\\Attribute]\nfinal class Traced\n{\n}\n",
+    );
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Handler/TracedHandler.php",
+        "<?php\nnamespace App\\Handler;\nuse App\\Message\\SendEmail;\nuse App\\Traced;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\n#[AsMessageHandler]\nfinal class TracedHandler\n{\n    #[Traced]\n    public function __invoke(SendEmail $message): void\n    {\n    }\n}\n",
+    );
+
+    assert_eq!(opened(&mut index, &path, "Traced]"), ["src/Traced.php"]);
+}
+
+#[test]
+fn only_envelope_wrap_unwraps_static_calls() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Service/After.php",
+        "<?php\nnamespace App\\Service;\nuse App\\Message\\SendEmail;\nuse App\\Message\\SendSms;\nuse App\\Message\\Unhandled;\nuse Symfony\\Component\\Messenger\\Envelope;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nfinal class After\n{\n    public function __construct(private MessageBusInterface $bus)\n    {\n    }\n\n    public static function after(SendSms $cause, object $message): Envelope\n    {\n        return new Envelope($message);\n    }\n\n    public function run(): void\n    {\n        $this->bus->dispatch(self::after(new SendSms(), new Unhandled()));\n        $this->bus->dispatch(new Envelope(message: new SendEmail()));\n    }\n}\n",
+    );
+
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, "src/Service/After.php", 21, "dispatch"),
+        [pair(
+            "vendor/symfony/messenger/MessageBusInterface.php",
+            "dispatch"
+        )]
+    );
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, "src/Service/After.php", 22, "dispatch"),
+        definitions_in_copy(
+            &mut index,
+            &root,
+            "src/Controller/MessagesController.php",
+            19,
+            "dispatch"
+        )
+    );
+    let _ = path;
+}

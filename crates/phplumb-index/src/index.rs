@@ -1647,11 +1647,14 @@ impl Index {
         let on_name = name_at(&summary.names, offset).is_some()
             || summary.static_refs.iter().any(|r| covers((r.start, r.end)))
             || summary.keywords.iter().any(|k| covers((k.start, k.end)));
-        // The name of an attribute without arguments counts as the attribute: it is
-        // all there is to ask about.
-        let on_attribute =
+        let in_attributes = |metadata: &[Metadata]| {
+            !on_name && metadata.iter().any(|m| !m.annotation && covers(m.span))
+        };
+        // On a class, the name of an attribute without arguments counts as the
+        // attribute, all there is to ask about; the frameworks answer for their own
+        // attributes only.
+        let on_class_attribute =
             |m: &Metadata| !m.annotation && covers(m.span) && (!on_name || m.arguments.is_empty());
-        let in_attributes = |metadata: &[Metadata]| metadata.iter().any(on_attribute);
         let declaration = summary.declarations.iter().find_map(|d| {
             if d.kind == SymbolKind::Function
                 && (covers((d.name_start, d.name_end)) || in_attributes(&d.metadata))
@@ -1673,7 +1676,7 @@ impl Index {
                     member,
                 });
             }
-            let metadata = shape.metadata.iter().find(|m| on_attribute(m))?;
+            let metadata = shape.metadata.iter().find(|m| on_class_attribute(m))?;
             Some(FrameworkDeclaration::Class {
                 path,
                 class: d,

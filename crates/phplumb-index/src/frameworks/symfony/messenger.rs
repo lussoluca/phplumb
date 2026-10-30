@@ -41,7 +41,8 @@ impl Handlers {
         for (path, declaration) in index.declarations() {
             if declaration.kind == SymbolKind::Class
                 && (declares_handlers(declaration)
-                    || inherits_handlers(index, declaration, &declaring, &mut inherits))
+                    || (!declaring.is_empty()
+                        && inherits_handlers(index, declaration, &declaring, &mut inherits)))
                 && filter.in_scope(path)
                 && index.is_project_code(path)
             {

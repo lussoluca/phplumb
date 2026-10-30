@@ -2455,8 +2455,9 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             .collect()
     }
 
-    /// For each argument written `new C(x, ...)` or `C::f(x, ...)`, the type of `x`,
-    /// by the position of the parameter it fills among those of `targets`.
+    /// For each argument written `new C(x, ...)` or `C::wrap(x, ...)`, the type of
+    /// `x`, the argument filling the first parameter, by the position of the
+    /// parameter the argument fills among those of `targets`.
     fn wrapped_types(
         &self,
         arguments: &ArgumentList<'_>,
@@ -2466,17 +2467,34 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
             .arguments
             .iter()
             .map(|argument| {
-                let inner = match argument.value() {
-                    Expression::Instantiation(instantiation) => {
-                        instantiation.argument_list.as_ref()?
+                let value = argument.value();
+                let at = value.span().start.offset;
+                let (class, method, inner) = match value {
+                    Expression::Instantiation(instantiation) => (
+                        instantiation.class,
+                        "__construct",
+                        instantiation.argument_list.as_ref()?,
+                    ),
+                    Expression::Call(Call::StaticMethod(call)) => {
+                        let ClassLikeMemberSelector::Identifier(name) = &call.method else {
+                            return None;
+                        };
+                        if !name.value.eq_ignore_ascii_case(b"wrap") {
+                            return None;
+                        }
+                        (call.class, "wrap", &call.argument_list)
                     }
-                    Expression::Call(Call::StaticMethod(call)) => &call.argument_list,
                     _ => return None,
                 };
-                let Some(Argument::Positional(first)) = inner.arguments.iter().next() else {
-                    return None;
-                };
-                Some(self.expr(first.value, first.value.span().start.offset, 0))
+                let class = self.class_of(class, at, 0)?;
+                let callee = [CallTarget::Method {
+                    class,
+                    name: method.to_string(),
+                }];
+                let positions = self.parameter_positions(inner, &callee);
+                let first = positions.iter().position(|position| *position == Some(0))?;
+                let first = inner.arguments.iter().nth(first)?.value();
+                Some(self.expr(first, first.span().start.offset, 0))
             })
             .collect();
         by_parameter(values, &self.parameter_positions(arguments, targets))
