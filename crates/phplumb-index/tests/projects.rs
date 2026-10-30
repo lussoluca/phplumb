@@ -2460,3 +2460,35 @@ fn files_the_kernel_does_not_load_define_nothing() {
         [NOWHERE]
     );
 }
+
+#[test]
+fn parameters_set_from_php_lead_to_their_call() {
+    let (_dir, root) = broken_symfony(&[
+        (
+            "lib/ContainerBuilder.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection;\nclass ContainerBuilder\n{\n    public function setParameter(string $name, mixed $value): void {}\n}\n",
+        ),
+        (
+            "src/Pass.php",
+            "<?php\nnamespace App;\nuse Symfony\\Component\\DependencyInjection\\ContainerBuilder;\nclass Pass\n{\n    public function process(ContainerBuilder $container): void\n    {\n        $container->setParameter('app.nowhere', 1);\n    }\n}\n",
+        ),
+        (
+            "vendor/acme/lib/Other.php",
+            "<?php\nnamespace Acme;\nuse Symfony\\Component\\DependencyInjection\\ContainerBuilder;\nclass Other\n{\n    public function process(ContainerBuilder $container): void\n    {\n        $container->setParameter('app.nowhere', 2);\n    }\n}\n",
+        ),
+    ]);
+    let mut index = auto(&root);
+    let path = root.join("src/Controller/Uses.php");
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source)
+        .find("app.nowhere")
+        .unwrap() as u32
+        + 1;
+    let found: Vec<PathBuf> = index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| location.path)
+        .collect();
+
+    assert_eq!(found, [root.join("src/Pass.php")]);
+}

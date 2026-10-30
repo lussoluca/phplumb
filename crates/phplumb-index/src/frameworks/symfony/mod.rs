@@ -313,7 +313,7 @@ pub struct Symfony {
     parameters_unknown: bool,
     /// The parameters project code sets with `setParameter()`, or none when one of
     /// those calls computes its name; found on first use after each read.
-    set_parameters: OnceLock<Option<HashSet<String>>>,
+    set_parameters: OnceLock<Option<HashMap<String, Vec<RouteTarget>>>>,
     /// Service definitions, by id.
     services: HashMap<String, Vec<RouteTarget>>,
     mappings: Mappings,
@@ -368,7 +368,7 @@ impl Symfony {
             return false;
         }
         self.set_parameters(index)
-            .is_some_and(|set| !set.contains(name))
+            .is_some_and(|set| !set.contains_key(name))
     }
 
     /// Whether `path` is code of the project, not a dependency nor what Symfony
@@ -383,7 +383,7 @@ impl Symfony {
     /// project code give the container, or none when one of them is computed. Only
     /// files that mention a container class are read: a `setParameter()` whose
     /// receiver stays unknown there counts.
-    fn set_parameters(&self, index: &Index) -> Option<&HashSet<String>> {
+    fn set_parameters(&self, index: &Index) -> Option<&HashMap<String, Vec<RouteTarget>>> {
         self.set_parameters
             .get_or_init(|| {
                 let holders: Vec<&Path> = PARAMETER_HOLDERS
@@ -398,7 +398,7 @@ impl Symfony {
                     .collect();
                 files.sort();
                 files.dedup();
-                let mut names = HashSet::new();
+                let mut names: HashMap<String, Vec<RouteTarget>> = HashMap::new();
                 for path in files {
                     let source = std::fs::read(path).ok()?;
                     let summary = summarize(&source);
@@ -419,7 +419,19 @@ impl Symfony {
                         let unknown =
                             call.targets.is_empty() && method.eq_ignore_ascii_case("setParameter");
                         if holder || unknown {
-                            names.insert(call.strings.first().cloned().flatten()?);
+                            let name = call.strings.first().cloned().flatten()?;
+                            let target =
+                                call.ranges.first().copied().flatten().map(|(start, end)| {
+                                    RouteTarget {
+                                        location: Location {
+                                            path: path.to_path_buf(),
+                                            start,
+                                            end,
+                                        },
+                                        text: name.clone(),
+                                    }
+                                });
+                            names.entry(name).or_default().extend(target);
                         }
                     }
                 }
@@ -562,6 +574,16 @@ impl Symfony {
         self.parameters.get(name).map_or(&[], Vec::as_slice)
     }
 
+    /// Where the parameter `name` is defined: under `parameters:`, then by the
+    /// project's `setParameter()` and parameter bag `set()` calls.
+    fn parameter_locations(&self, index: &Index, name: &str) -> Vec<(Location, String)> {
+        let mut found = targets_of(self.parameter_targets(name));
+        if let Some(set) = self.set_parameters(index).and_then(|set| set.get(name)) {
+            found.extend(targets_of(set));
+        }
+        found
+    }
+
     /// The definition of the service `id`, or the class when the id names one that no
     /// key defines; for an alias, then those of the service it stands for.
     pub fn service_targets(&self, index: &Index, id: &str) -> Vec<(Location, String)> {
@@ -645,7 +667,7 @@ impl Symfony {
         }
         let raw = &text[*start as usize..*end as usize];
         if let Some(name) = config::parameter_at(raw, (offset - start) as usize) {
-            return targets_of(self.parameter_targets(&name));
+            return self.parameter_locations(index, &name);
         }
         // A template name, such as a `form_themes` entry; with `@`, a namespaced one.
         let namespaced = !value.starts_with('@') || value.contains('/');
@@ -676,11 +698,12 @@ impl Symfony {
     /// The `%name%` under the cursor in the value of an attribute.
     fn value_parameter_targets(
         &self,
+        index: &Index,
         found: &AttributeString,
         offset: u32,
     ) -> Vec<(Location, String)> {
         config::parameter_at(&found.value, offset.saturating_sub(found.start) as usize)
-            .map(|name| targets_of(self.parameter_targets(&name)))
+            .map(|name| self.parameter_locations(index, &name))
             .unwrap_or_default()
     }
 
@@ -823,7 +846,7 @@ impl Framework for Symfony {
             return Vec::new();
         }
         if calls_one_of(index, call, &PARAMETER_METHODS) {
-            return targets_of(self.parameter_targets(value));
+            return self.parameter_locations(index, value);
         }
         if calls_one_of(index, call, &TEMPLATE_METHODS) {
             return self
@@ -866,9 +889,9 @@ impl Framework for Symfony {
                         .map(|id| self.service_targets(index, id))
                         .unwrap_or_default()
                 }
-                Some(0) => self.value_parameter_targets(found, offset),
+                Some(0) => self.value_parameter_targets(index, found, offset),
                 Some(1) => self.service_targets(index, &found.value),
-                Some(4) => targets_of(self.parameter_targets(&found.value)),
+                Some(4) => self.parameter_locations(index, &found.value),
                 _ => Vec::new(),
             };
         }
