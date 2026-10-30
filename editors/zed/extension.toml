@@ -1,0 +1,16 @@
+id = "phplumb"
+name = "PHPlumb"
+description = "Fast PHP code navigation for Drupal and Symfony: definitions, implementations, references and hierarchies."
+version = "0.1.0"
+schema_version = 1
+authors = ["Luca Lusso", "Giuseppe Esposito"]
+repository = "https://github.com/lussoluca/phplumb"
+
+[language_servers.phplumb]
+name = "PHPlumb"
+languages = ["PHP", "YAML", "Twig"]
+
+[language_servers.phplumb.language_ids]
+PHP = "php"
+YAML = "yaml"
+Twig = "twig"

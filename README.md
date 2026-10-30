@@ -78,12 +78,14 @@ PHPlumb runs on macOS (Apple silicon) and Linux (x64), in VS Code 1.140 or later
 2. Install it:
 
    ```sh
-   code --install-extension phplumb-darwin-arm64-0.4.0.vsix
+   code --install-extension phplumb-darwin-arm64-0.5.0.vsix
    ```
 
 3. Open a PHP project. Indexing progress appears in the status bar.
 
 **Disable Intelephense and other PHP navigation extensions** in workspaces where you use PHPlumb, or you will see every result twice.
+
+For Zed, see [the Zed extension](editors/zed/README.md).
 
 ## Settings
 
@@ -107,12 +109,14 @@ PHPlumb is for reading code. It has no autocomplete, signature help, rename or o
 
 ## Status
 
-PHPlumb is young (0.4.0). Core PHP navigation, diagnostics and the Drupal and Symfony features above are complete.
+PHPlumb is young (0.5.0). Core PHP navigation, diagnostics and the Drupal and Symfony features above are complete.
 
 ## Development
 
-PHPlumb has two parts: an engine in Rust (`crates/`) that speaks the Language Server Protocol, and a thin VS Code extension (`editors/vscode`) that starts it. See the [development guide](docs/development.md) to build, test and package it.
+PHPlumb has two parts: an engine in Rust (`crates/`) that speaks the Language Server Protocol, and thin extensions for VS Code (`editors/vscode`) and Zed (`editors/zed`) that start it. See the [development guide](docs/development.md) to build, test and package it.
 
 ## License
 
 [MIT](LICENSE). The list of PHP built-in names comes from [JetBrains phpstorm-stubs](https://github.com/JetBrains/phpstorm-stubs), under the Apache License 2.0; see [its notice](crates/phplumb-index/data/README.md).
+
+The website in `site/` is built on a Tailwind Plus template and is not covered by the MIT license; see [its README](site/README.md).

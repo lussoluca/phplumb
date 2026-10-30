@@ -1,6 +1,6 @@
 # Development
 
-PHPlumb has two parts: the Rust engine in `crates/` and the VS Code extension in `editors/vscode`. The extension starts the engine binary and talks to it over LSP.
+PHPlumb has two parts: the Rust engine in `crates/` and the editor extensions in `editors/vscode` and `editors/zed`. An extension starts the engine binary and talks to it over LSP.
 
 ## Prerequisites
 
@@ -17,6 +17,19 @@ PHPlumb has two parts: the Rust engine in `crates/` and the VS Code extension in
 The index follows file changes made outside the editor, such as an agent's edits or a branch switch, and is cached in the workspace storage, so reopening a project skips parsing unchanged files. Indexing progress appears in the status bar. The **PHPlumb** output channel shows the server log.
 
 To skip paths, set `phplumb.exclude` in the workspace settings, for example `["psalm-stubs/**"]`.
+
+## Testing in Zed
+
+1. Add Zed's WebAssembly target once: `rustup target add wasm32-wasip2`.
+2. Build the engine with `cargo build`, then point Zed at it with `"lsp": {"phplumb": {"binary": {"path": "<repo>/target/debug/phplumb"}}}` in `settings.json`.
+3. Run `zed: install dev extension` and pick `editors/zed`. After a change to the extension, use **Rebuild** on its entry in the Extensions page; after a change to the engine, run `editor: restart language server`.
+
+The extension's own checks run on the host:
+
+```sh
+cargo test --manifest-path editors/zed/Cargo.toml
+cargo clippy --manifest-path editors/zed/Cargo.toml --all-targets -- -D warnings
+```
 
 ## Automated checks
 
@@ -71,5 +84,5 @@ npm --prefix editors/vscode run package -- linux-x64
 Each command writes `editors/vscode/phplumb-<target>-<version>.vsix`. Install it in a dedicated profile to test it as a user would:
 
 ```sh
-code --profile "PHPlumb" --install-extension editors/vscode/phplumb-linux-x64-0.4.0.vsix
+code --profile "PHPlumb" --install-extension editors/vscode/phplumb-linux-x64-0.5.0.vsix
 ```

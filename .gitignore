@@ -10,3 +10,4 @@ editors/vscode/.vscode-test/
 .vscode/*
 !.vscode/launch.json
 !.vscode/tasks.json
+editors/zed/extension.wasm

@@ -1,0 +1,16 @@
+[package]
+name = "phplumb_zed"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.7.0"
+
+# Zed builds the extension from this folder alone, outside the engine's workspace.
+[workspace]
