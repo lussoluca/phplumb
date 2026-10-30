@@ -1578,6 +1578,43 @@ fn bundle_extension_parameters_stay_silent() {
     assert!(broken_messages(&root).is_empty());
 }
 
+#[test]
+fn bundle_parameters_are_checked_when_every_source_is_read() {
+    let bundle = "<?php\nnamespace Acme;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle\n{\n    public function build($container): void\n    {\n        $container->addCompilerPass(new \\Acme\\Pass\\AcmePass());\n    }\n}\n";
+    let pass = "<?php\nnamespace Acme\\Pass;\nuse Symfony\\Component\\DependencyInjection\\Compiler\\CompilerPassInterface;\nclass AcmePass implements CompilerPassInterface\n{\n    private const KEY = 'acme.const_set';\n\n    public function process($container): void\n    {\n        $container->setParameter('acme.pass_set', 1);\n        $container->getParameterBag()->set(self::KEY, 1);\n    }\n}\n";
+    let uses = "<?php\nnamespace App\\Controller;\nuse Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\nclass Uses extends AbstractController\n{\n    public function run(): void\n    {\n        $this->getParameter('router.nowhere');\n        $this->getParameter('acme.pass_set');\n        $this->getParameter('acme.const_set');\n        $this->getParameter('container.build_id');\n        $this->getParameter('acme.yaml_set');\n    }\n}\n";
+    let base = [
+        (
+            "lib/CompilerPassInterface.php",
+            "<?php\nnamespace Symfony\\Component\\DependencyInjection\\Compiler;\ninterface CompilerPassInterface\n{\n}\n",
+        ),
+        ("lib/acme/src/AcmeBundle.php", bundle),
+        ("lib/acme-pass/AcmePass.php", pass),
+        (
+            "lib/acme/config/services.yaml",
+            "parameters:\n    acme.yaml_set: 1\n",
+        ),
+        ("src/Controller/Uses.php", uses),
+    ];
+    let project = |files: &[(&str, &str)]| {
+        let mut all = base.to_vec();
+        all.extend_from_slice(files);
+        bundled_symfony(&all)
+    };
+    let (_dir, root) = project(&[]);
+    assert_eq!(
+        broken_messages(&root),
+        ["Undefined parameter 'router.nowhere'"]
+    );
+    // A bundle the index lacks, or YAML configuration the module cannot read, may
+    // define any.
+    let unindexed = "<?php\nreturn [\n    Symfony\\Bundle\\FrameworkBundle\\FrameworkBundle::class => ['all' => true],\n    Acme\\AcmeBundle::class => ['all' => true],\n    Missing\\MissingBundle::class => ['all' => true],\n];\n";
+    let (_dir, root) = project(&[("config/bundles.php", unindexed)]);
+    assert!(broken_messages(&root).is_empty());
+    let (_dir, root) = project(&[("lib/acme/config/broken.yaml", "parameters: [\n")]);
+    assert!(broken_messages(&root).is_empty());
+}
+
 fn route_missing(index: &Index, name: &str) -> bool {
     index.framework::<Symfony>().unwrap().route_missing(name)
 }

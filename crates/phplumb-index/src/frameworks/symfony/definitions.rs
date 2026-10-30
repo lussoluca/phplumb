@@ -11,12 +11,17 @@ use crate::infer::{configurator_definitions, parameter_setters};
 
 /// The parameters bundle extensions set from code: names, the literal start and
 /// end of names computed in between, and whether one sets a name computed
-/// otherwise, which may be any.
+/// otherwise, which may be any. `complete` says whether every source of bundle
+/// parameters was read: each bundle class, its extension and compiler passes, and
+/// its PHP and XML configuration.
 #[derive(Default)]
 pub(crate) struct ExtensionParameters {
     pub names: HashSet<String>,
     pub patterns: Vec<(String, String)>,
+    /// Names given as class constants, by class and constant, still to look up.
+    pub constants: Vec<(String, String)>,
     pub any: bool,
+    pub complete: bool,
 }
 
 impl ExtensionParameters {
@@ -30,10 +35,12 @@ impl ExtensionParameters {
                 self.patterns.push(pattern);
             }
         }
+        self.constants.extend(setters.constants);
         self.any |= setters.computed;
-        let configured = configurator_definitions(source).parameters;
+        let configured = configurator_definitions(source);
         self.names
-            .extend(configured.into_iter().map(|(name, ..)| name));
+            .extend(configured.parameters.into_iter().map(|(name, ..)| name));
+        self.any |= configured.computed_parameters;
     }
 
     /// Whether an extension may set the parameter `name`.

@@ -88,7 +88,7 @@ fn sets_path(index: &Index, fqn: &str) -> bool {
 
 /// The directory of the bundle class `fqn`; none when the bundle sets its own path,
 /// by its `getPath()` or by its `path` property.
-fn directory(index: &Index, fqn: &str) -> Option<PathBuf> {
+pub(crate) fn directory(index: &Index, fqn: &str) -> Option<PathBuf> {
     let class = index.classes_named(fqn).into_iter().next()?;
     if sets_path(index, fqn) {
         return None;
