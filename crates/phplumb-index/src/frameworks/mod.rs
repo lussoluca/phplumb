@@ -134,9 +134,12 @@ pub struct FoundCall {
     pub ranges: Vec<Option<(u32, u32)>>,
     /// The receiver's type; `Other` when unknown.
     pub receiver: TypeExpr,
-    /// The type of each positional argument, up to the first named or spread one;
-    /// `Other` when unknown.
+    /// The type of each argument by the position of the parameter it fills, up to
+    /// the first spread one; `Other` when unknown.
     pub arguments: Vec<TypeExpr>,
+    /// For each argument written `new C(x, ...)` or `C::f(x, ...)`, the type of `x`,
+    /// by position.
+    pub wrapped: Vec<Option<TypeExpr>>,
     /// The method or function holding the call: `Class::method` with the declaring
     /// class's fully qualified name, or the function's fully qualified name.
     pub caller: Option<String>,
@@ -185,13 +188,15 @@ pub trait Framework: Send + Sync {
         value: &str,
     ) -> Vec<(Location, String)>;
     /// Targets of a definition request on the name of a method call, given the type
-    /// of each of its positional arguments, each with the text expected at its
+    /// of each of its arguments and, for one written `new C(x)` or `C::f(x)`, the
+    /// type of `x`, by parameter position, each with the text expected at its
     /// range; none to keep the method's declaration.
     fn call_targets(
         &self,
         index: &Index,
         call: &FrameworkCall<'_>,
         arguments: &[TypeExpr],
+        wrapped: &[Option<TypeExpr>],
     ) -> Vec<(Location, String)>;
     /// Targets of a string literal under the cursor at `offset` that is an argument
     /// of an attribute, each with the text expected at its range.

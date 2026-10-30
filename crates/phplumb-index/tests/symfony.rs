@@ -587,6 +587,7 @@ fn handlers_of_a_message() {
     assert_eq!(
         handlers(&index, "App\\Message\\SendEmail"),
         [
+            pair("src/Handler/HandlesEmail.php", "__invoke"),
             pair("src/Handler/NotifyLogger.php", "handle"),
             pair("src/Handler/SendEmailHandler.php", "__invoke"),
             pair("src/Handler/SmsHandlers.php", "onSms"),
@@ -596,6 +597,7 @@ fn handlers_of_a_message() {
     assert_eq!(
         handlers(&index, "App\\Message\\SendSms"),
         [
+            pair("src/Handler/AbstractSmsHandler.php", "onAbstractSms"),
             pair("src/Handler/Explicit.php", "run"),
             pair("src/Handler/NotifyLogger.php", "handle"),
             pair("src/Handler/SmsHandlers.php", "onSms"),
@@ -647,6 +649,7 @@ fn dispatch_lists_the_handlers() {
     assert_eq!(
         dispatch_targets(&mut index, 19),
         [
+            pair("src/Handler/HandlesEmail.php", "__invoke"),
             pair("src/Handler/NotifyLogger.php", "handle"),
             pair("src/Handler/SendEmailHandler.php", "__invoke"),
             pair("src/Handler/SmsHandlers.php", "onSms"),
@@ -656,6 +659,7 @@ fn dispatch_lists_the_handlers() {
     assert_eq!(
         dispatch_targets(&mut index, 20),
         [
+            pair("src/Handler/AbstractSmsHandler.php", "onAbstractSms"),
             pair("src/Handler/Explicit.php", "run"),
             pair("src/Handler/NotifyLogger.php", "handle"),
             pair("src/Handler/SmsHandlers.php", "onSms"),
@@ -670,7 +674,7 @@ fn dispatch_without_handlers_keeps_its_declaration() {
         "vendor/symfony/messenger/MessageBusInterface.php",
         "dispatch",
     )];
-    for line in [21, 22, 23] {
+    for line in [21, 22, 27] {
         assert_eq!(
             dispatch_targets(&mut index, line),
             declaration,
@@ -717,15 +721,24 @@ fn handlers_list_their_dispatches() {
             11,
             "__invoke"
         ),
-        [dispatch(19)]
+        [dispatch(19), dispatch(23), dispatch(25), dispatch(32)]
     );
+    let handle = (14, "handle".to_string());
     assert_eq!(
         lines_of(&mut index, "src/Handler/NotifyLogger.php", 15, "handle"),
-        [dispatch(19), dispatch(20)]
+        [
+            handle.clone(),
+            dispatch(19),
+            dispatch(20),
+            dispatch(23),
+            dispatch(24),
+            dispatch(25),
+            dispatch(32)
+        ]
     );
     assert_eq!(
         lines_of(&mut index, "src/Handler/Explicit.php", 11, "run"),
-        [dispatch(20)]
+        [handle, dispatch(20), dispatch(24), dispatch(32)]
     );
 }
 
@@ -735,7 +748,15 @@ fn the_handler_attribute_lists_the_dispatches() {
     // Inside the attribute's arguments: its name opens the attribute class.
     assert_eq!(
         lines_of(&mut index, "src/Handler/NotifyLogger.php", 8, "method:"),
-        [(19, "dispatch".to_string()), (20, "dispatch".to_string())]
+        [
+            (14, "handle".to_string()),
+            (19, "dispatch".to_string()),
+            (20, "dispatch".to_string()),
+            (23, "dispatch".to_string()),
+            (24, "dispatch".to_string()),
+            (25, "dispatch".to_string()),
+            (32, "dispatch".to_string())
+        ]
     );
 }
 
@@ -753,7 +774,7 @@ fn dispatch_keeps_hover_and_references() {
         hover.markdown
     );
     let references = index.references(&path, &source, offset, false);
-    assert_eq!(references.len(), 5, "{references:?}");
+    assert_eq!(references.len(), 10, "{references:?}");
 }
 
 #[test]
@@ -1529,4 +1550,299 @@ fn service_ids_ending_in_twig_stay_services() {
         opened(&mut index, &path, "'@app.mailer"),
         ["config/services_test.yaml"]
     );
+}
+
+#[test]
+fn envelopes_reach_the_handlers_of_their_message() {
+    let mut index = build();
+    assert_eq!(
+        dispatch_targets(&mut index, 23),
+        dispatch_targets(&mut index, 19)
+    );
+    assert_eq!(
+        dispatch_targets(&mut index, 24),
+        dispatch_targets(&mut index, 20)
+    );
+}
+
+#[test]
+fn named_messages_reach_their_handlers() {
+    let mut index = build();
+    assert_eq!(
+        dispatch_targets(&mut index, 25),
+        dispatch_targets(&mut index, 19)
+    );
+}
+
+#[test]
+fn envelope_variables_list_nothing() {
+    let mut index = build();
+    assert_eq!(
+        dispatch_targets(&mut index, 27),
+        [pair(
+            "vendor/symfony/messenger/MessageBusInterface.php",
+            "dispatch"
+        )]
+    );
+}
+
+#[test]
+fn handle_trait_calls_reach_their_handlers() {
+    let mut index = build();
+    let mut found = definition_on_line(&mut index, "src/Service/Queries.php", 14, "handle");
+    found.sort();
+    assert_eq!(found, dispatch_targets(&mut index, 20));
+    let explicit = definition_on_line(&mut index, "src/Handler/Explicit.php", 11, "run");
+    assert!(
+        explicit
+            .iter()
+            .any(|(path, text)| path == "src/Service/Queries.php" && text == "handle"),
+        "{explicit:?}"
+    );
+}
+
+#[test]
+fn handle_without_the_trait_lists_nothing() {
+    let mut index = build();
+    assert_eq!(
+        definition_on_line(&mut index, "src/Service/OwnHandle.php", 11, "handle"),
+        [pair("src/Service/OwnHandle.php", "handle")]
+    );
+}
+
+#[test]
+fn inherited_handler_methods_handle_for_concrete_classes() {
+    let mut index = build();
+    let sms = dispatch_targets(&mut index, 20);
+    assert_eq!(
+        sms.iter()
+            .filter(|target| target.0 == "src/Handler/AbstractSmsHandler.php")
+            .collect::<Vec<_>>(),
+        [&pair("src/Handler/AbstractSmsHandler.php", "onAbstractSms")]
+    );
+    assert_eq!(
+        lines_of(
+            &mut index,
+            "src/Handler/AbstractSmsHandler.php",
+            11,
+            "onAbstractSms"
+        ),
+        [
+            (14, "handle".to_string()),
+            (20, "dispatch".to_string()),
+            (24, "dispatch".to_string()),
+            (32, "dispatch".to_string())
+        ]
+    );
+}
+
+#[test]
+fn trait_handler_methods_handle_for_their_class() {
+    let mut index = build();
+    assert!(
+        dispatch_targets(&mut index, 19)
+            .contains(&pair("src/Handler/HandlesEmail.php", "__invoke"))
+    );
+}
+
+#[test]
+fn interface_typed_dispatches_reach_the_handlers_of_implementations() {
+    let mut index = build();
+    let mut expected = dispatch_targets(&mut index, 19);
+    expected.extend(dispatch_targets(&mut index, 20));
+    expected.sort();
+    expected.dedup();
+    assert_eq!(dispatch_targets(&mut index, 32), expected);
+}
+
+#[test]
+fn handlers_of_implementations_list_interface_typed_dispatches() {
+    let mut index = build();
+    let found = lines_of(
+        &mut index,
+        "src/Handler/SendEmailHandler.php",
+        11,
+        "__invoke",
+    );
+    assert!(found.contains(&(32, "dispatch".to_string())), "{found:?}");
+}
+
+#[test]
+fn concrete_messages_skip_handlers_of_subclasses() {
+    let mut index = build();
+    assert_eq!(
+        dispatch_targets(&mut index, 33),
+        [pair(
+            "vendor/symfony/messenger/MessageBusInterface.php",
+            "dispatch"
+        )]
+    );
+}
+
+#[test]
+fn bare_class_handler_attributes_list_their_dispatches() {
+    let mut index = build();
+    assert_eq!(
+        lines_of(
+            &mut index,
+            "src/Handler/SendEmailHandler.php",
+            8,
+            "AsMessageHandler"
+        ),
+        lines_of(
+            &mut index,
+            "src/Handler/SendEmailHandler.php",
+            11,
+            "__invoke"
+        )
+    );
+}
+
+#[test]
+fn bare_attributes_without_dispatches_open_their_class() {
+    let mut index = build();
+    assert_eq!(
+        definition_on_line(
+            &mut index,
+            "src/Handler/BaseHandler.php",
+            8,
+            "AsMessageHandler"
+        ),
+        [pair(
+            "vendor/symfony/messenger/Attribute/AsMessageHandler.php",
+            "AsMessageHandler"
+        )]
+    );
+}
+
+/// Go to definition at `needle` on line `line` of `file` in the copy at `root`,
+/// as (path relative to `root`, text) pairs sorted.
+fn definitions_in_copy(
+    index: &mut Index,
+    root: &Path,
+    file: &str,
+    line: usize,
+    needle: &str,
+) -> Vec<(String, String)> {
+    let path = root.join(file);
+    let source = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&source).into_owned();
+    let line_start: usize = text
+        .split_inclusive('\n')
+        .take(line - 1)
+        .map(str::len)
+        .sum();
+    let offset = (line_start + text[line_start..].find(needle).unwrap() + 1) as u32;
+    let mut found: Vec<(String, String)> = index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| {
+            let content = std::fs::read(&location.path).unwrap();
+            let relative = location.path.strip_prefix(root).unwrap_or(&location.path);
+            (
+                relative.display().to_string(),
+                String::from_utf8_lossy(&content[location.start as usize..location.end as usize])
+                    .into_owned(),
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn dispatch_on_other_objects_lists_nothing() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "src/Service/Events.php",
+        "<?php\n\nnamespace App\\Service;\n\nuse App\\Message\\SendEmail;\n\nfinal class Events\n{\n    public function fire(): void\n    {\n        $this->dispatch(new SendEmail());\n    }\n\n    public function dispatch(object $event): void\n    {\n    }\n}\n",
+    );
+
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, "src/Service/Events.php", 11, "dispatch"),
+        [pair("src/Service/Events.php", "dispatch")]
+    );
+    let handler = "src/Handler/SendEmailHandler.php";
+    let dispatches = definitions_in_copy(&mut index, &root, handler, 11, "__invoke");
+    assert!(
+        dispatches
+            .iter()
+            .all(|(path, _)| path != "src/Service/Events.php"),
+        "{dispatches:?}"
+    );
+}
+
+#[test]
+fn multi_line_and_null_safe_dispatches_list_their_handlers() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "src/Service/Multi.php",
+        "<?php\n\nnamespace App\\Service;\n\nuse App\\Message\\SendEmail;\nuse App\\Message\\SendSms;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\n\nfinal class Multi\n{\n    public function __construct(private ?MessageBusInterface $bus)\n    {\n    }\n\n    public function run(): void\n    {\n        $this->bus\n            ->dispatch(\n                new SendEmail()\n            );\n        $this->bus?->dispatch(new SendSms());\n    }\n}\n",
+    );
+    let messages = "src/Controller/MessagesController.php";
+    let multi = "src/Service/Multi.php";
+
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, multi, 18, "dispatch"),
+        definitions_in_copy(&mut index, &root, messages, 19, "dispatch")
+    );
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, multi, 21, "dispatch"),
+        definitions_in_copy(&mut index, &root, messages, 20, "dispatch")
+    );
+    let explicit = definitions_in_copy(&mut index, &root, "src/Handler/Explicit.php", 11, "run");
+    assert!(explicit.contains(&pair(multi, "dispatch")), "{explicit:?}");
+}
+
+#[test]
+fn bare_attributes_of_other_classes_open_their_class() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "src/Traced.php",
+        "<?php\nnamespace App;\n#[\\Attribute]\nfinal class Traced\n{\n}\n",
+    );
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Handler/TracedHandler.php",
+        "<?php\nnamespace App\\Handler;\nuse App\\Message\\SendEmail;\nuse App\\Traced;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\n#[AsMessageHandler]\nfinal class TracedHandler\n{\n    #[Traced]\n    public function __invoke(SendEmail $message): void\n    {\n    }\n}\n",
+    );
+
+    assert_eq!(opened(&mut index, &path, "Traced]"), ["src/Traced.php"]);
+}
+
+#[test]
+fn only_envelope_wrap_unwraps_static_calls() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "src/Service/After.php",
+        "<?php\nnamespace App\\Service;\nuse App\\Message\\SendEmail;\nuse App\\Message\\SendSms;\nuse App\\Message\\Unhandled;\nuse Symfony\\Component\\Messenger\\Envelope;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nfinal class After\n{\n    public function __construct(private MessageBusInterface $bus)\n    {\n    }\n\n    public static function after(SendSms $cause, object $message): Envelope\n    {\n        return new Envelope($message);\n    }\n\n    public function run(): void\n    {\n        $this->bus->dispatch(self::after(new SendSms(), new Unhandled()));\n        $this->bus->dispatch(new Envelope(message: new SendEmail()));\n    }\n}\n",
+    );
+
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, "src/Service/After.php", 21, "dispatch"),
+        [pair(
+            "vendor/symfony/messenger/MessageBusInterface.php",
+            "dispatch"
+        )]
+    );
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, "src/Service/After.php", 22, "dispatch"),
+        definitions_in_copy(
+            &mut index,
+            &root,
+            "src/Controller/MessagesController.php",
+            19,
+            "dispatch"
+        )
+    );
+    let _ = path;
 }

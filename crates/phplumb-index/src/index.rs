@@ -1594,7 +1594,7 @@ impl Index {
         };
         let targets: Vec<(Location, String)> = self
             .frameworks_for(path)
-            .flat_map(|f| f.call_targets(self, &call, &found.arguments))
+            .flat_map(|f| f.call_targets(self, &call, &found.arguments, &found.wrapped))
             .collect();
         (!targets.is_empty()).then_some(targets)
     }
@@ -1650,6 +1650,11 @@ impl Index {
         let in_attributes = |metadata: &[Metadata]| {
             !on_name && metadata.iter().any(|m| !m.annotation && covers(m.span))
         };
+        // On a class, the name of an attribute without arguments counts as the
+        // attribute, all there is to ask about; the frameworks answer for their own
+        // attributes only.
+        let on_class_attribute =
+            |m: &Metadata| !m.annotation && covers(m.span) && (!on_name || m.arguments.is_empty());
         let declaration = summary.declarations.iter().find_map(|d| {
             if d.kind == SymbolKind::Function
                 && (covers((d.name_start, d.name_end)) || in_attributes(&d.metadata))
@@ -1671,10 +1676,7 @@ impl Index {
                     member,
                 });
             }
-            let metadata = shape
-                .metadata
-                .iter()
-                .find(|m| !on_name && !m.annotation && covers(m.span))?;
+            let metadata = shape.metadata.iter().find(|m| on_class_attribute(m))?;
             Some(FrameworkDeclaration::Class {
                 path,
                 class: d,

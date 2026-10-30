@@ -21,5 +21,15 @@ class MessagesController
         $this->bus->dispatch(new Unhandled());
         $this->bus->dispatch($message);
         $this->bus->dispatch(new Envelope(new SendEmail()));
+        $this->bus->dispatch(Envelope::wrap(new SendSms()));
+        $this->bus->dispatch(message: new SendEmail());
+        $envelope = new Envelope(new SendEmail());
+        $this->bus->dispatch($envelope);
+    }
+
+    public function notify(\App\Message\Notify $notify, \App\Message\Ping $ping): void
+    {
+        $this->bus->dispatch($notify);
+        $this->bus->dispatch($ping);
     }
 }

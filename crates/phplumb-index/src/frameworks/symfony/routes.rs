@@ -10,6 +10,7 @@ use super::files::ConfigFiles;
 
 use crate::filter::{PathFilter, is_yaml};
 use crate::frameworks::Project;
+use crate::frameworks::ancestry::methods_of;
 use crate::frameworks::attributes::{RouteName, route_names, route_variants};
 use crate::frameworks::yaml::{self, Yaml};
 use crate::index::{Index, Location};
@@ -784,56 +785,6 @@ fn has_routes(index: &Index, class: &Declaration, memo: &mut HashMap<String, boo
                 .is_some_and(|ancestor| has_routes(index, ancestor.declaration, memo))
         });
     memo.insert(key, found);
-    found
-}
-
-/// The methods of `class` as reflection lists them: its own, then those of its
-/// traits and parents that it does not redeclare, each with its file and the class
-/// `self::` names in it, the declaring class or the class using the trait.
-fn methods_of<'a>(
-    index: &'a Index,
-    path: &Path,
-    class: &'a Declaration,
-) -> Vec<(PathBuf, String, &'a Member)> {
-    let mut found: Vec<(PathBuf, String, &Member)> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    let mut pending: Vec<(PathBuf, &Declaration, String)> =
-        vec![(path.to_path_buf(), class, class.fqn.clone())];
-    let mut visited = 0;
-    while let Some((path, declaration, owner)) = pending.pop() {
-        visited += 1;
-        if visited > 16 {
-            break;
-        }
-        let Some(shape) = &declaration.class else {
-            continue;
-        };
-        for member in shape
-            .members
-            .iter()
-            .filter(|m| m.kind == MemberKind::Method)
-        {
-            let name = member.name.to_ascii_lowercase();
-            if !seen.contains(&name) {
-                seen.push(name);
-                found.push((path.clone(), owner.clone(), member));
-            }
-        }
-        // Traits last, so they come off the stack before the parent.
-        if let Some(parent) = shape
-            .parent
-            .iter()
-            .find_map(|name| index.classes_named(name).into_iter().next())
-        {
-            let owner = parent.declaration.fqn.clone();
-            pending.push((parent.path.to_path_buf(), parent.declaration, owner));
-        }
-        for name in shape.traits.iter().rev() {
-            if let Some(used) = index.classes_named(name).into_iter().next() {
-                pending.push((used.path.to_path_buf(), used.declaration, owner.clone()));
-            }
-        }
-    }
     found
 }
 

@@ -319,6 +319,7 @@ impl Framework for Drupal {
         _index: &Index,
         _call: &FrameworkCall<'_>,
         _arguments: &[TypeExpr],
+        _wrapped: &[Option<TypeExpr>],
     ) -> Vec<(Location, String)> {
         Vec::new()
     }

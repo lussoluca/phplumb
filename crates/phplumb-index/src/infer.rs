@@ -228,6 +228,7 @@ pub(crate) fn attribute_strings(
 pub(crate) struct CallAt {
     pub parts: StringArgument,
     pub arguments: Vec<TypeExpr>,
+    pub wrapped: Vec<Option<TypeExpr>>,
 }
 
 /// The method or null-safe call whose name holds `offset`; static calls resolve
@@ -259,8 +260,13 @@ pub(crate) fn call_at(
             return None;
         }
         let parts = ctx.call_parts(call)?;
-        let arguments = ctx.argument_types(arguments);
-        Some(CallAt { parts, arguments })
+        let wrapped = ctx.wrapped_types(arguments, &parts.targets);
+        let arguments = ctx.argument_types(arguments, &parts.targets);
+        Some(CallAt {
+            parts,
+            arguments,
+            wrapped,
+        })
     })
 }
 
@@ -926,9 +932,10 @@ pub(crate) fn calls_named(
                     argument_ranges(arguments),
                     &ctx.parameter_positions(arguments, &targets),
                 ),
+                arguments: ctx.argument_types(arguments, &targets),
+                wrapped: ctx.wrapped_types(arguments, &targets),
                 targets,
                 receiver: receiver.clone(),
-                arguments: ctx.argument_types(arguments),
                 caller: match caller.kind {
                     CallKind::Method => Some(format!("{}::{}", caller.detail, caller.name)),
                     CallKind::Function if caller.detail.is_empty() => Some(caller.name),
@@ -2419,18 +2426,78 @@ impl<'a, 'ast, 'arena> Ctx<'a, 'ast, 'arena> {
         })
     }
 
-    /// The type of each positional argument, up to the first named or spread one.
-    fn argument_types(&self, arguments: &ArgumentList<'_>) -> Vec<TypeExpr> {
-        arguments
+    /// The type of each argument, by the position of the parameter it fills among
+    /// those of `targets`, up to the first spread one; `Other` where unknown.
+    fn argument_types(
+        &self,
+        arguments: &ArgumentList<'_>,
+        targets: &[CallTarget],
+    ) -> Vec<TypeExpr> {
+        let mut positions = self.parameter_positions(arguments, targets);
+        let spread = arguments.arguments.iter().position(|argument| {
+            matches!(argument, Argument::Positional(argument) if argument.ellipsis.is_some())
+        });
+        if let Some(spread) = spread {
+            positions.truncate(spread);
+        }
+        let values = arguments
             .arguments
             .iter()
-            .map_while(|argument| match argument {
-                Argument::Positional(argument) if argument.ellipsis.is_none() => {
-                    Some(self.expr(argument.value, argument.value.span().start.offset, 0))
-                }
-                _ => None,
+            .take(positions.len())
+            .map(|argument| {
+                let value = argument.value();
+                Some(self.expr(value, value.span().start.offset, 0))
             })
+            .collect();
+        by_parameter(values, &positions)
+            .into_iter()
+            .map(|ty| ty.unwrap_or(TypeExpr::Other))
             .collect()
+    }
+
+    /// For each argument written `new C(x, ...)` or `C::wrap(x, ...)`, the type of
+    /// `x`, the argument filling the first parameter, by the position of the
+    /// parameter the argument fills among those of `targets`.
+    fn wrapped_types(
+        &self,
+        arguments: &ArgumentList<'_>,
+        targets: &[CallTarget],
+    ) -> Vec<Option<TypeExpr>> {
+        let values = arguments
+            .arguments
+            .iter()
+            .map(|argument| {
+                let value = argument.value();
+                let at = value.span().start.offset;
+                let (class, method, inner) = match value {
+                    Expression::Instantiation(instantiation) => (
+                        instantiation.class,
+                        "__construct",
+                        instantiation.argument_list.as_ref()?,
+                    ),
+                    Expression::Call(Call::StaticMethod(call)) => {
+                        let ClassLikeMemberSelector::Identifier(name) = &call.method else {
+                            return None;
+                        };
+                        if !name.value.eq_ignore_ascii_case(b"wrap") {
+                            return None;
+                        }
+                        (call.class, "wrap", &call.argument_list)
+                    }
+                    _ => return None,
+                };
+                let class = self.class_of(class, at, 0)?;
+                let callee = [CallTarget::Method {
+                    class,
+                    name: method.to_string(),
+                }];
+                let positions = self.parameter_positions(inner, &callee);
+                let first = positions.iter().position(|position| *position == Some(0))?;
+                let first = inner.arguments.iter().nth(first)?.value();
+                Some(self.expr(first, first.span().start.offset, 0))
+            })
+            .collect();
+        by_parameter(values, &self.parameter_positions(arguments, targets))
     }
 
     /// Arguments that are string literals or `X::class`, by the position of the

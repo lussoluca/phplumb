@@ -1789,3 +1789,36 @@ fn bundles_setting_their_path_stay_unknown() {
     assert!(route_files_of(&auto(&root), "acme_home").is_empty());
     assert!(!route_missing(&auto(&root), "nope"));
 }
+
+#[test]
+fn bare_attributes_of_other_classes_on_hooks_open_their_class() {
+    let (_dir, root) = symfony_with_drupal();
+    let module = root.join("drupal/modules/custom/mymodule/mymodule.module");
+    let text = fs::read_to_string(&module).unwrap();
+    fs::write(
+        &module,
+        text.replace(
+            "function /*@cursor:ping_impl*/mymodule_ping(",
+            "#[\\Drupal\\mymodule\\Traced]\nfunction /*@cursor:ping_impl*/mymodule_ping(",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("drupal/modules/custom/mymodule/src/Traced.php"),
+        "<?php\nnamespace Drupal\\mymodule;\n#[\\Attribute]\nfinal class Traced\n{\n}\n",
+    )
+    .unwrap();
+    let mut index = auto(&root);
+    let source = fs::read(&module).unwrap();
+    let offset = String::from_utf8_lossy(&source).find("Traced]").unwrap() as u32 + 1;
+
+    let found: Vec<PathBuf> = index
+        .definition(&module, &source, offset)
+        .into_iter()
+        .map(|location| location.path)
+        .collect();
+    assert_eq!(
+        found,
+        [root.join("drupal/modules/custom/mymodule/src/Traced.php")]
+    );
+}

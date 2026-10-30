@@ -77,11 +77,32 @@ const REPOSITORY_METHODS: [(&str, &[&str]); 2] = [
     ("Doctrine\\Persistence\\ManagerRegistry", &["getRepository"]),
 ];
 
-/// The bus method whose argument 0 is a message.
-const DISPATCH: [(&str, &[&str]); 1] = [(
-    "Symfony\\Component\\Messenger\\MessageBusInterface",
-    &["dispatch"],
-)];
+/// The methods whose argument 0 is a message to handle: a bus's, and
+/// `HandleTrait`'s.
+const DISPATCH: [(&str, &[&str]); 2] = [
+    (
+        "Symfony\\Component\\Messenger\\MessageBusInterface",
+        &["dispatch"],
+    ),
+    ("Symfony\\Component\\Messenger\\HandleTrait", &["handle"]),
+];
+
+/// The envelope a message may be dispatched in.
+const ENVELOPE: &str = "Symfony\\Component\\Messenger\\Envelope";
+
+/// The message classes a dispatch's first argument holds: the type of the message
+/// an `Envelope` built in place wraps.
+fn messages(index: &Index, arguments: &[TypeExpr], wrapped: &[Option<TypeExpr>]) -> Vec<String> {
+    let Some(message) = arguments.first() else {
+        return Vec::new();
+    };
+    let classes = crate::infer::class_names(message);
+    let enveloped = classes.iter().any(|class| is_a(index, class, &[ENVELOPE]));
+    match wrapped.first() {
+        Some(Some(inner)) if enveloped => crate::infer::class_names(inner),
+        _ => classes,
+    }
+}
 
 /// Classes whose `setParameter()` defines a container parameter.
 const PARAMETER_HOLDERS: [&str; 4] = [
@@ -321,12 +342,12 @@ impl Symfony {
         self.handlers.handled_by(path, start)
     }
 
-    /// The `dispatch()` calls of the project whose message is, extends or
-    /// implements one of `handled`, at their method name.
+    /// The `dispatch()` and `HandleTrait::handle()` calls of the project whose
+    /// message may be one of `handled`, at their method name.
     fn dispatches(&self, index: &Index, handled: &[String]) -> Vec<(Location, String)> {
         let handled: Vec<&str> = handled.iter().map(String::as_str).collect();
         index
-            .calls_named(&["dispatch"], &self.project)
+            .calls_named(&["dispatch", "handle"], &self.project)
             .into_iter()
             .filter(|call| {
                 let found = FrameworkCall {
@@ -335,13 +356,24 @@ impl Symfony {
                     receiver: Some(&call.receiver),
                 };
                 calls_one_of(index, &found, &DISPATCH)
-                    && call.arguments.first().is_some_and(|message| {
-                        crate::infer::class_names(message)
-                            .iter()
-                            .any(|class| is_a(index, class, &handled))
-                    })
+                    && messages(index, &call.arguments, &call.wrapped)
+                        .iter()
+                        .any(|message| {
+                            handled
+                                .iter()
+                                .any(|class| messenger::may_carry(index, message, class))
+                        })
             })
-            .map(|call| (call.location, "dispatch".to_string()))
+            .map(|call| {
+                let name = call.targets.iter().find_map(|target| match target {
+                    CallTarget::Method { name, .. } => Some(name.clone()),
+                    CallTarget::Function(_) => None,
+                });
+                (
+                    call.location,
+                    name.unwrap_or_else(|| "dispatch".to_string()),
+                )
+            })
             .collect()
     }
 
@@ -530,7 +562,7 @@ impl Framework for Symfony {
     }
 
     fn targeted_methods(&self) -> &'static [&'static str] {
-        &["dispatch"]
+        &["dispatch", "handle"]
     }
 
     /// `getRepository(X::class)` returns the repository the mappings declare for `X`,
@@ -612,15 +644,13 @@ impl Framework for Symfony {
         index: &Index,
         call: &FrameworkCall<'_>,
         arguments: &[TypeExpr],
+        wrapped: &[Option<TypeExpr>],
     ) -> Vec<(Location, String)> {
         if !calls_one_of(index, call, &DISPATCH) {
             return Vec::new();
         }
-        let Some(message) = arguments.first() else {
-            return Vec::new();
-        };
         let mut found: Vec<(Location, String)> = Vec::new();
-        for class in crate::infer::class_names(message) {
+        for class in messages(index, arguments, wrapped) {
             for (location, name) in self.handlers.of(index, &class) {
                 if !found.iter().any(|(known, _)| *known == location) {
                     found.push((location, name));
