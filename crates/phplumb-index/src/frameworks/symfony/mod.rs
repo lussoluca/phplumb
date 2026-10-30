@@ -634,12 +634,11 @@ impl Symfony {
                 .map(file_start)
                 .collect();
         }
-        if let Some(reference) = value.strip_prefix('@') {
-            // `@?id` is optional, `@=` an expression and `@@` an escaped `@`.
-            if reference.starts_with('=') || reference.starts_with('@') {
-                return Vec::new();
-            }
-            return self.service_targets(index, reference.trim_start_matches('?'));
+        if value.starts_with('@') {
+            // `@=` is an expression and `@@` an escaped `@`.
+            return config::service_reference(value)
+                .map(|id| self.service_targets(index, id))
+                .unwrap_or_default();
         }
         if config::looks_like_class(value) {
             return class_targets(index, value);
@@ -829,11 +828,22 @@ impl Framework for Symfony {
     ) -> Vec<(Location, String)> {
         let first = found.key.is_none() && found.position == 0;
         if found.attribute.eq_ignore_ascii_case(AUTOWIRE_ATTRIBUTE) {
-            return match found.key.as_deref() {
-                Some("param") => targets_of(self.parameter_targets(&found.value)),
-                Some("service") => self.service_targets(index, &found.value),
-                Some("value") => self.value_parameter_targets(found, offset),
-                None if first => self.value_parameter_targets(found, offset),
+            // `__construct($value, $service, $expression, $env, $param)`.
+            let position = match found.key.as_deref() {
+                Some("value") => Some(0),
+                Some("service") => Some(1),
+                Some("param") => Some(4),
+                Some(_) => None,
+                None => Some(found.position),
+            };
+            return match position {
+                // A value `@id` names a service, `@@` escapes an `@`.
+                Some(0) if found.value.starts_with('@') => config::service_reference(&found.value)
+                    .map(|id| self.service_targets(index, id))
+                    .unwrap_or_default(),
+                Some(0) => self.value_parameter_targets(found, offset),
+                Some(1) => self.service_targets(index, &found.value),
+                Some(4) => targets_of(self.parameter_targets(&found.value)),
                 _ => Vec::new(),
             };
         }

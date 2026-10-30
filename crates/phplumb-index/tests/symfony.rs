@@ -1893,3 +1893,62 @@ fn alias_cycles_end() {
     );
     let _ = path;
 }
+
+#[test]
+fn service_reference_markers_lead_to_the_service() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "config/services_test.yaml",
+        "services:\n    app.a:\n        arguments: ['@!App\\Service\\Mailer', '@>App\\Service\\Mailer', '@?App\\Service\\Mailer']\n",
+    );
+    for needle in ["'@!", "'@>", "'@?"] {
+        assert_eq!(
+            opened(&mut index, &path, needle),
+            ["config/services.yaml"],
+            "{needle}"
+        );
+    }
+}
+
+const AUTOWIRED: &str = "<?php\nnamespace App\\Service;\nuse Symfony\\Component\\DependencyInjection\\Attribute\\Autowire;\nuse Symfony\\Component\\DependencyInjection\\Attribute\\Autowire as Wire;\nuse Symfony\\Bridge\\Twig\\Attribute\\Template;\nfinal class Autowired\n{\n    public function __construct(\n        #[Autowire('@App\\Service\\Mailer')] object $a,\n        #[Autowire(null, 'App\\Service\\Mailer')] object $b,\n        #[Autowire('@@escaped')] string $c,\n        #[Wire(param: 'app.name')] string $d,\n        #[\\Symfony\\Component\\DependencyInjection\\Attribute\\Autowire(param: 'app.limit')] int $e,\n    ) {\n    }\n\n    #[Template(vars: ['page.html.twig'], template: 'base.html.twig')]\n    public function show(): array\n    {\n        return [];\n    }\n}\n";
+
+#[test]
+fn autowire_service_forms_lead_to_the_service() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(&mut index, &root, "src/Service/Autowired.php", AUTOWIRED);
+
+    assert_eq!(opened(&mut index, &path, "'@App"), ["config/services.yaml"]);
+    assert_eq!(
+        opened(&mut index, &path, "null, 'App"),
+        ["config/services.yaml"]
+    );
+    assert!(opened(&mut index, &path, "'@@escaped").is_empty());
+}
+
+#[test]
+fn aliased_and_qualified_autowire_attributes_lead_to_parameters() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(&mut index, &root, "src/Service/Autowired.php", AUTOWIRED);
+
+    for needle in ["'app.name'", "'app.limit'"] {
+        let found = opened(&mut index, &path, needle);
+        assert!(
+            found.contains(&"config/services.yaml".to_string()),
+            "{needle} {found:?}"
+        );
+    }
+}
+
+#[test]
+fn other_template_arguments_give_nothing() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(&mut index, &root, "src/Service/Autowired.php", AUTOWIRED);
+
+    assert!(opened(&mut index, &path, "['page.html.twig'").is_empty());
+    assert_eq!(
+        opened(&mut index, &path, "'base.html.twig'"),
+        ["extra/base.html.twig"]
+    );
+}

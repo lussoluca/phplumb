@@ -450,12 +450,19 @@ fn placeholders(text: &str) -> Vec<(&str, usize, usize)> {
             i += 2;
             continue;
         }
-        let Some(length) = text[i + 1..].find('%') else {
-            break;
-        };
-        let close = i + 1 + length;
-        found.push((&text[i + 1..close], i + 1, close));
-        i = close + 1;
+        // A name runs to the next `%`, without spaces; a `%` starting none, as in
+        // `50% of`, is left alone, as Symfony's `%%|%([^%\s]+)%` does.
+        let close = bytes[i + 1..]
+            .iter()
+            .position(|&b| b == b'%' || b.is_ascii_whitespace())
+            .map(|length| i + 1 + length);
+        match close {
+            Some(close) if close > i + 1 && bytes[close] == b'%' => {
+                found.push((&text[i + 1..close], i + 1, close));
+                i = close + 1;
+            }
+            _ => i += 1,
+        }
     }
     found
 }
@@ -537,6 +544,10 @@ mod tests {
         assert_eq!(at("'%a.b%'", "a.b"), Some("a.b".into()));
         assert_eq!(at("x/%a%/y", "a%"), Some("a".into()));
         assert_eq!(at("x/%a%/y", "/y"), None);
+        assert_eq!(at("50% of %app.name%", "app.name"), Some("app.name".into()));
+        assert_eq!(at("100%", "%"), None);
+        assert_eq!(at("%", "%"), None);
+        assert_eq!(at("%%a%%", "a"), None);
         assert_eq!(at("'100%%'", "%%"), None);
         assert_eq!(at("'%env(A)%'", "env"), None);
         assert_eq!(at("'%kernel.secret%'", "kernel"), None);
