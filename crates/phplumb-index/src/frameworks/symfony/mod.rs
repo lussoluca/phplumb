@@ -302,6 +302,8 @@ pub struct Symfony {
     handlers: Handlers,
     /// The message buses and the default one; none when they cannot be told.
     buses: Option<(Vec<String>, String)>,
+    /// Each service alias and the service it stands for.
+    aliases: HashMap<String, Vec<String>>,
     /// The argument names the configuration binds, and the classes whose
     /// arguments it wires.
     bindings: (Vec<String>, Vec<String>),
@@ -561,17 +563,41 @@ impl Symfony {
     }
 
     /// The definition of the service `id`, or the class when the id names one that no
-    /// key defines.
+    /// key defines; for an alias, then those of the service it stands for.
     pub fn service_targets(&self, index: &Index, id: &str) -> Vec<(Location, String)> {
-        match self.services.get(id) {
-            Some(targets) => targets_of(targets),
-            None if config::looks_like_class(id) => class_targets(index, id),
-            None => Vec::new(),
+        let mut found: Vec<(Location, String)> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        let mut next = vec![id];
+        // An alias also leads to the services it stands for, through chains of them.
+        while !next.is_empty() {
+            let id = next.remove(0);
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let targets = match self.services.get(id) {
+                Some(targets) => targets_of(targets),
+                None if config::looks_like_class(id) => class_targets(index, id),
+                None => Vec::new(),
+            };
+            for target in targets {
+                if !found.contains(&target) {
+                    found.push(target);
+                }
+            }
+            next.extend(
+                self.aliases
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .map(String::as_str),
+            );
         }
+        found
     }
 
-    /// In a YAML configuration file: a `%parameter%`, a template name, an `@id`
-    /// service reference, or a class name under `offset`.
+    /// In a YAML configuration file: an import's resource, a `%parameter%`, a
+    /// template name, an `@id` service reference, or a class name under `offset`.
     fn yaml_targets(
         &self,
         index: &Index,
@@ -594,6 +620,21 @@ impl Symfony {
         else {
             return Vec::new();
         };
+        // An import's resource opens the file it loads.
+        let imports = match steps.as_slice() {
+            [yaml::Step::Key("imports"), ..] => true,
+            [yaml::Step::Key(environment), yaml::Step::Key("imports"), ..] => {
+                environment.starts_with("when@")
+            }
+            _ => false,
+        };
+        if imports {
+            return config::imported_file(path, value)
+                .filter(|file| file.is_file())
+                .into_iter()
+                .map(file_start)
+                .collect();
+        }
         let in_services = steps.contains(&yaml::Step::Key("services"));
         let names_a_service = matches!(
             steps.last(),
@@ -615,12 +656,11 @@ impl Symfony {
                 .map(file_start)
                 .collect();
         }
-        if let Some(reference) = value.strip_prefix('@') {
-            // `@?id` is optional, `@=` an expression and `@@` an escaped `@`.
-            if reference.starts_with('=') || reference.starts_with('@') {
-                return Vec::new();
-            }
-            return self.service_targets(index, reference.trim_start_matches('?'));
+        if value.starts_with('@') {
+            // `@=` is an expression and `@@` an escaped `@`.
+            return config::service_reference(value)
+                .map(|id| self.service_targets(index, id))
+                .unwrap_or_default();
         }
         if config::looks_like_class(value) {
             return class_targets(index, value);
@@ -646,16 +686,18 @@ impl Symfony {
 
     fn read(&mut self, index: &Index) {
         let filter = index.filter().scoped(&self.project);
-        let files = config::config_files(&self.project, &filter);
+        let (files, unread_imports) =
+            config::config_files(&self.project, &filter, &self.config_files);
         self.parameters = config::read_parameters(&files, &self.config_files);
         let configured_in_php = CONFIGURATORS
             .iter()
             .flat_map(|class| index.candidate_files(&RefKey::Class(class.to_string())))
             .any(|path| self.is_source(index, path));
-        self.parameters_unknown = configured_in_php
-            || config::has_unread_configuration(&self.project, &files, &self.config_files);
+        self.parameters_unknown =
+            configured_in_php || unread_imports || config::has_unread_configuration(&self.project);
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
+        self.aliases = config::read_aliases(&files, &self.config_files);
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);
@@ -809,11 +851,24 @@ impl Framework for Symfony {
     ) -> Vec<(Location, String)> {
         let first = found.key.is_none() && found.position == 0;
         if found.attribute.eq_ignore_ascii_case(AUTOWIRE_ATTRIBUTE) {
-            return match found.key.as_deref() {
-                Some("param") => targets_of(self.parameter_targets(&found.value)),
-                Some("service") => self.service_targets(index, &found.value),
-                Some("value") => self.value_parameter_targets(found, offset),
-                None if first => self.value_parameter_targets(found, offset),
+            // `__construct($value, $service, $expression, $env, $param)`.
+            let position = match found.key.as_deref() {
+                Some("value") => Some(0),
+                Some("service") => Some(1),
+                Some("param") => Some(4),
+                Some(_) => None,
+                None => Some(found.position),
+            };
+            return match position {
+                // A value `@id` names a service, `@@` escapes an `@`.
+                Some(0) if found.value.starts_with('@') && !found.value.starts_with("@@") => {
+                    config::service_reference(&found.value)
+                        .map(|id| self.service_targets(index, id))
+                        .unwrap_or_default()
+                }
+                Some(0) => self.value_parameter_targets(found, offset),
+                Some(1) => self.service_targets(index, &found.value),
+                Some(4) => targets_of(self.parameter_targets(&found.value)),
                 _ => Vec::new(),
             };
         }

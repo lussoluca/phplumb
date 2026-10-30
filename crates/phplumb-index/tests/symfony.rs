@@ -943,9 +943,14 @@ fn yaml_class_names_open_their_class() {
 #[test]
 fn yaml_service_references_open_their_definition() {
     let mut index = build();
+    // `app.mailer` is an alias: its service comes after it.
+    let mailer = [
+        pair(SERVICES, "app.mailer"),
+        pair(SERVICES, "App\\Service\\Mailer"),
+    ];
     assert_eq!(
         definition_on_line(&mut index, SERVICES, 20, "app.mailer"),
-        [pair(SERVICES, "app.mailer")]
+        mailer
     );
     assert_eq!(
         definition_on_line(&mut index, SERVICES, 15, "App\\Service"),
@@ -953,7 +958,7 @@ fn yaml_service_references_open_their_definition() {
     );
     assert_eq!(
         definition_on_line(&mut index, SERVICES, 16, "app.mailer"),
-        [pair(SERVICES, "app.mailer")]
+        mailer
     );
     assert!(definition_on_line(&mut index, SERVICES, 17, "service(").is_empty());
 }
@@ -963,7 +968,10 @@ fn autowire_service_opens_its_definition() {
     let mut index = build();
     assert_eq!(
         definition(&mut index, CONFIGURED, "'app.mailer'"),
-        [pair(SERVICES, "app.mailer")]
+        [
+            pair(SERVICES, "app.mailer"),
+            pair(SERVICES, "App\\Service\\Mailer")
+        ]
     );
 }
 
@@ -982,7 +990,10 @@ fn translations_have_no_parameters() {
 #[test]
 fn alias_and_decorates_open_their_service() {
     let mut index = build();
-    let mailer = [pair(SERVICES, "app.mailer")];
+    let mailer = [
+        pair(SERVICES, "app.mailer"),
+        pair(SERVICES, "App\\Service\\Mailer"),
+    ];
     assert_eq!(
         definition_on_line(&mut index, SERVICES, 22, "app.mailer"),
         mailer,
@@ -1845,4 +1856,155 @@ fn only_envelope_wrap_unwraps_static_calls() {
         )
     );
     let _ = path;
+}
+
+#[test]
+fn service_aliases_also_lead_to_their_service() {
+    let mut index = build();
+    let both = [
+        pair(SERVICES, "app.mailer"),
+        pair(SERVICES, "App\\Service\\Mailer"),
+    ];
+    assert_eq!(
+        definition_on_line(&mut index, SERVICES, 20, "app.mailer"),
+        both
+    );
+    assert_eq!(
+        definition_on_line(&mut index, SERVICES, 22, "app.mailer"),
+        both
+    );
+}
+
+#[test]
+fn alias_cycles_end() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "config/services_test.yaml",
+        "services:\n    app.a: '@app.b'\n    app.b:\n        alias: app.a\n    app.c:\n        arguments: ['@app.a']\n",
+    );
+    assert_eq!(
+        definitions_in_copy(&mut index, &root, "config/services_test.yaml", 6, "app.a"),
+        [
+            pair("config/services_test.yaml", "app.a"),
+            pair("config/services_test.yaml", "app.b")
+        ]
+    );
+    let _ = path;
+}
+
+#[test]
+fn service_reference_markers_lead_to_the_service() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "config/services_test.yaml",
+        "services:\n    app.a:\n        arguments: ['@!App\\Service\\Mailer', '@>App\\Service\\Mailer', '@?App\\Service\\Mailer']\n",
+    );
+    for needle in ["'@!", "'@>", "'@?"] {
+        assert_eq!(
+            opened(&mut index, &path, needle),
+            ["config/services.yaml"],
+            "{needle}"
+        );
+    }
+}
+
+const AUTOWIRED: &str = "<?php\nnamespace App\\Service;\nuse Symfony\\Component\\DependencyInjection\\Attribute\\Autowire;\nuse Symfony\\Component\\DependencyInjection\\Attribute\\Autowire as Wire;\nuse Symfony\\Bridge\\Twig\\Attribute\\Template;\nfinal class Autowired\n{\n    public function __construct(\n        #[Autowire('@App\\Service\\Mailer')] object $a,\n        #[Autowire(null, 'App\\Service\\Mailer')] object $b,\n        #[Autowire('@@escaped')] string $c,\n        #[Wire(param: 'app.name')] string $d,\n        #[\\Symfony\\Component\\DependencyInjection\\Attribute\\Autowire(param: 'app.limit')] int $e,\n    ) {\n    }\n\n    #[Template(vars: ['page.html.twig'], template: 'base.html.twig')]\n    public function show(): array\n    {\n        return [];\n    }\n}\n";
+
+#[test]
+fn autowire_service_forms_lead_to_the_service() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(&mut index, &root, "src/Service/Autowired.php", AUTOWIRED);
+
+    assert_eq!(opened(&mut index, &path, "'@App"), ["config/services.yaml"]);
+    assert_eq!(
+        opened(&mut index, &path, "null, 'App"),
+        ["config/services.yaml"]
+    );
+    assert!(opened(&mut index, &path, "'@@escaped").is_empty());
+}
+
+#[test]
+fn aliased_and_qualified_autowire_attributes_lead_to_parameters() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(&mut index, &root, "src/Service/Autowired.php", AUTOWIRED);
+
+    for needle in ["'app.name'", "'app.limit'"] {
+        let found = opened(&mut index, &path, needle);
+        assert!(
+            found.contains(&"config/services.yaml".to_string()),
+            "{needle} {found:?}"
+        );
+    }
+}
+
+#[test]
+fn other_template_arguments_give_nothing() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(&mut index, &root, "src/Service/Autowired.php", AUTOWIRED);
+
+    assert!(opened(&mut index, &path, "['page.html.twig'").is_empty());
+    assert_eq!(
+        opened(&mut index, &path, "'base.html.twig'"),
+        ["extra/base.html.twig"]
+    );
+}
+
+#[test]
+fn escaped_autowire_values_lead_to_their_parameters() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "src/Service/Escaped.php",
+        "<?php\nnamespace App\\Service;\nuse Symfony\\Component\\DependencyInjection\\Attribute\\Autowire;\nfinal class Escaped\n{\n    public function __construct(#[Autowire('@@%app.name%')] string $a)\n    {\n    }\n}\n",
+    );
+    let found = definitions_in_copy(&mut index, &root, "src/Service/Escaped.php", 6, "app.name%");
+    assert!(
+        found.contains(&pair("config/services.yaml", "app.name")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn nested_imports_keys_keep_their_parameters() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "config/packages/some_bundle.yaml",
+        "some_bundle:\n    imports: ['%app.name%']\n",
+    );
+    let found = definitions_in_copy(
+        &mut index,
+        &root,
+        "config/packages/some_bundle.yaml",
+        2,
+        "app.name",
+    );
+    assert!(
+        found.contains(&pair("config/services.yaml", "app.name")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn aliases_defined_twice_lead_to_both_services() {
+    let (_dir, root, mut index) = copied();
+    add_file(
+        &mut index,
+        &root,
+        "config/services_test.yaml",
+        "services:\n    app.a: ~\n    app.b: ~\n    app.x: '@app.a'\n    app.y:\n        arguments: ['@app.x']\n\nwhen@test:\n    services:\n        app.x: '@app.b'\n",
+    );
+    let found = definitions_in_copy(&mut index, &root, "config/services_test.yaml", 6, "app.x");
+    for id in ["app.a", "app.b"] {
+        assert!(
+            found.contains(&pair("config/services_test.yaml", id)),
+            "{id} {found:?}"
+        );
+    }
 }

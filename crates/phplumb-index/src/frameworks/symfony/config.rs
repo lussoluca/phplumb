@@ -1,5 +1,6 @@
-//! Symfony's YAML configuration: the parameters `config/services*.yaml` and
-//! `config/packages/*.yaml` define, and parameter names written as `%name%`.
+//! Symfony's YAML configuration: the files the kernel loads and those they import,
+//! the parameters, services, aliases and tags they define, and parameter names
+//! written as `%name%`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -11,18 +12,118 @@ use crate::frameworks::symfony::RouteTarget;
 use crate::frameworks::yaml::{self, Yaml};
 use crate::index::Location;
 
-/// The configuration files of the project: `config/services.yaml`,
-/// `config/services_<env>.yaml`, then `config/packages/*.yaml`, in path order.
-pub(crate) fn config_files(project: &Project, filter: &PathFilter) -> Vec<PathBuf> {
+/// The configuration files the kernel loads: `config/services.{yaml,yml}`,
+/// `config/services_<env>.{yaml,yml}`, `config/packages/*.{yaml,yml}` and
+/// `config/packages/<env>/*.{yaml,yml}`, in path order, then the YAML files their
+/// `imports:` name, each once; and whether an import names something the module
+/// does not read: a glob, a directory, another format, or a missing file whose
+/// errors are not ignored.
+pub(crate) fn config_files(
+    project: &Project,
+    filter: &PathFilter,
+    config_files: &ConfigFiles,
+) -> (Vec<PathBuf>, bool) {
     let config = project.dir.join("config");
+    let yaml = |name: &str| name.ends_with(".yaml") || name.ends_with(".yml");
     let mut files = files_named(&config, |name| {
-        name == "services.yaml" || (name.starts_with("services_") && name.ends_with(".yaml"))
+        let stem = name.trim_end_matches(".yaml").trim_end_matches(".yml");
+        yaml(name) && (stem == "services" || stem.starts_with("services_"))
     });
-    files.extend(files_named(&config.join("packages"), |name| {
-        name.ends_with(".yaml")
-    }));
+    let packages = config.join("packages");
+    files.extend(files_named(&packages, yaml));
+    let mut environments: Vec<PathBuf> = std::fs::read_dir(&packages)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    environments.sort();
+    for environment in environments {
+        files.extend(files_named(&environment, yaml));
+    }
     files.retain(|path| filter.in_scope(path));
-    files
+    let mut unread = false;
+    let mut seen: Vec<PathBuf> = files
+        .iter()
+        .map(|file| file.canonicalize().unwrap_or_else(|_| file.clone()))
+        .collect();
+    let mut next = 0;
+    while next < files.len() {
+        let file = files[next].clone();
+        next += 1;
+        for import in imports_of(&file, config_files) {
+            match import {
+                Import::File(imported) => {
+                    let real = imported.canonicalize().unwrap_or_else(|_| imported.clone());
+                    if !seen.contains(&real) {
+                        seen.push(real);
+                        files.push(imported);
+                    }
+                }
+                Import::Ignored => {}
+                Import::Unread => unread = true,
+            }
+        }
+    }
+    (files, unread)
+}
+
+/// What an entry of `imports:` loads.
+enum Import {
+    File(PathBuf),
+    /// A missing file whose errors are ignored.
+    Ignored,
+    Unread,
+}
+
+/// The imports of the configuration file `file`, also inside `when@<env>` blocks.
+fn imports_of(file: &Path, config_files: &ConfigFiles) -> Vec<Import> {
+    let Some(parsed) = config_files.get(file) else {
+        return Vec::new();
+    };
+    let Some(root) = &parsed.yaml else {
+        return Vec::new();
+    };
+    top_blocks(root)
+        .into_iter()
+        .filter_map(|block| match block.get("imports") {
+            Some(Yaml::Sequence(entries)) => Some(entries),
+            _ => None,
+        })
+        .flatten()
+        .map(|entry| {
+            let resource = entry.text().or_else(|| entry.get("resource")?.text());
+            let Some(resource) = resource else {
+                return Import::Unread;
+            };
+            let ignored = entry
+                .get("ignore_errors")
+                .and_then(Yaml::text)
+                .is_some_and(|value| matches!(value, "true" | "not_found"));
+            match imported_file(file, resource) {
+                Some(path) if path.is_file() => {
+                    let name = path.to_string_lossy();
+                    if name.ends_with(".yaml") || name.ends_with(".yml") {
+                        Import::File(path)
+                    } else {
+                        Import::Unread
+                    }
+                }
+                Some(path) if !path.exists() && ignored => Import::Ignored,
+                _ => Import::Unread,
+            }
+        })
+        .collect()
+}
+
+/// The file the import `resource` of `file` names, relative to its directory;
+/// none for a glob or a bundle path.
+pub(crate) fn imported_file(file: &Path, resource: &str) -> Option<PathBuf> {
+    if resource.starts_with('@') || resource.contains(['*', '?', '{', '[']) {
+        return None;
+    }
+    Some(normalize(&file.parent()?.join(resource)))
 }
 
 /// The files of `dir` whose name `keep` accepts, in path order.
@@ -147,13 +248,20 @@ pub(crate) fn buses(
         let Some(root) = &parsed.yaml else {
             continue;
         };
+        // A file of an environment directory changes the buses of that environment
+        // only, as a `when@<env>` block does.
+        let environment = file
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "packages");
         for (position, block) in top_blocks(root).into_iter().enumerate() {
             let Some(messenger) = block.get("framework").and_then(|f| f.get("messenger")) else {
                 continue;
             };
             let changes_buses =
                 messenger.get("buses").is_some() || messenger.get("default_bus").is_some();
-            if position > 0 && changes_buses {
+            if (environment || position > 0) && changes_buses {
                 return None;
             }
             if let Some(Yaml::Map(buses)) = messenger.get("buses") {
@@ -367,6 +475,55 @@ fn tags_of(service: &Yaml, tag: &str) -> Vec<Vec<(String, String)>> {
     found
 }
 
+/// The service id a reference `@id` names, past the `?`, `!` and `>` markers;
+/// none for an expression (`@=`) or an escaped `@` (`@@`).
+pub(crate) fn service_reference(value: &str) -> Option<&str> {
+    let reference = value.strip_prefix('@')?;
+    if reference.starts_with('=') || reference.starts_with('@') {
+        return None;
+    }
+    Some(reference.trim_start_matches(['?', '!', '>']))
+}
+
+/// The aliases the configuration files define under `services:`, also inside
+/// `when@<env>` blocks: `id: '@other'` and `id: { alias: other }`, each id with the
+/// services it stands for in one environment or another.
+pub(crate) fn read_aliases(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+) -> HashMap<String, Vec<String>> {
+    let mut found: HashMap<String, Vec<String>> = HashMap::new();
+    for file in files {
+        let Some(parsed) = config_files.get(file) else {
+            continue;
+        };
+        let Some(root) = &parsed.yaml else {
+            continue;
+        };
+        for block in top_blocks(root) {
+            let Some(Yaml::Map(entries)) = block.get("services") else {
+                continue;
+            };
+            for (key, value) in entries {
+                let Some(id) = key.text() else {
+                    continue;
+                };
+                let target = match value {
+                    Yaml::Scalar { value, .. } => service_reference(value),
+                    _ => value.get("alias").and_then(Yaml::text),
+                };
+                if let Some(target) = target {
+                    let targets = found.entry(id.to_string()).or_default();
+                    if !targets.iter().any(|known| known == target) {
+                        targets.push(target.to_string());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Whether `text` is written like a fully qualified class name.
 pub(crate) fn looks_like_class(text: &str) -> bool {
     let name = text.trim_start_matches('\\');
@@ -404,12 +561,19 @@ fn placeholders(text: &str) -> Vec<(&str, usize, usize)> {
             i += 2;
             continue;
         }
-        let Some(length) = text[i + 1..].find('%') else {
-            break;
-        };
-        let close = i + 1 + length;
-        found.push((&text[i + 1..close], i + 1, close));
-        i = close + 1;
+        // A name runs to the next `%`, without spaces; a `%` starting none, as in
+        // `50% of`, is left alone, as Symfony's `%%|%([^%\s]+)%` does.
+        let close = bytes[i + 1..]
+            .iter()
+            .position(|&b| b == b'%' || b.is_ascii_whitespace())
+            .map(|length| i + 1 + length);
+        match close {
+            Some(close) if close > i + 1 && bytes[close] == b'%' => {
+                found.push((&text[i + 1..close], i + 1, close));
+                i = close + 1;
+            }
+            _ => i += 1,
+        }
     }
     found
 }
@@ -442,40 +606,26 @@ pub(crate) fn parameters_in(text: &str) -> Vec<(&str, usize, usize)> {
 }
 
 /// Whether the project has configuration the module does not read, which may define
-/// parameters: PHP configuration files, environment directories below
-/// `config/packages`, or YAML files that import others, also inside `when@<env>`.
-pub(crate) fn has_unread_configuration(
-    project: &Project,
-    files: &[PathBuf],
-    config_files: &ConfigFiles,
-) -> bool {
+/// parameters: PHP or XML configuration files in `config`, `config/packages` and its
+/// environment directories.
+pub(crate) fn has_unread_configuration(project: &Project) -> bool {
     let config = project.dir.join("config");
     let php = |name: &str| name.ends_with(".php");
     let services_php = !files_named(&config, |name| {
         php(name) && (name == "services.php" || name.starts_with("services_"))
     })
     .is_empty();
-    let packages = std::fs::read_dir(config.join("packages"))
+    // PHP and XML configuration, in `config/packages` and its environment directories.
+    let unread =
+        |dir: &Path| !files_named(dir, |name| php(name) || name.ends_with(".xml")).is_empty();
+    let packages = config.join("packages");
+    let environments = std::fs::read_dir(&packages)
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
-        .any(|path| {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            path.is_dir() || php(name) || name.ends_with(".yml") || name.ends_with(".xml")
-        });
-    let imports = files.iter().any(|file| {
-        config_files.get(file).is_some_and(|parsed| {
-            parsed
-                .yaml
-                .as_ref()
-                .is_some_and(|root| top_blocks(root).iter().any(|b| b.get("imports").is_some()))
-        })
-    });
-    services_php || packages || imports
+        .any(|path| path.is_dir() && unread(&path));
+    services_php || unread(&packages) || environments
 }
 
 #[cfg(test)]
@@ -491,6 +641,10 @@ mod tests {
         assert_eq!(at("'%a.b%'", "a.b"), Some("a.b".into()));
         assert_eq!(at("x/%a%/y", "a%"), Some("a".into()));
         assert_eq!(at("x/%a%/y", "/y"), None);
+        assert_eq!(at("50% of %app.name%", "app.name"), Some("app.name".into()));
+        assert_eq!(at("100%", "%"), None);
+        assert_eq!(at("%", "%"), None);
+        assert_eq!(at("%%a%%", "a"), None);
         assert_eq!(at("'100%%'", "%%"), None);
         assert_eq!(at("'%env(A)%'", "env"), None);
         assert_eq!(at("'%kernel.secret%'", "kernel"), None);
