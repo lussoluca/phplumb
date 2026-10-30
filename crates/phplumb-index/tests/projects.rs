@@ -3023,3 +3023,52 @@ fn removed_directories_without_mappings_change_nothing() {
     );
     assert_eq!(find_recent_in(&mut index, &root), [REPOSITORY]);
 }
+
+const ORM_ASSOCIATIONS: &str = "<?php\nnamespace Doctrine\\ORM\\Mapping;\n#[\\Attribute]\nfinal class ManyToOne\n{\n    public function __construct(?string $targetEntity = null, ?array $cascade = null, string $fetch = 'LAZY', ?string $inversedBy = null) {}\n}\n#[\\Attribute]\nfinal class OneToMany\n{\n    public function __construct(?string $targetEntity = null, ?string $mappedBy = null) {}\n}\n";
+const ORM_POST: &str = "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\nclass Post\n{\n    #[ORM\\ManyToOne(targetEntity: 'Author', inversedBy: 'posts')]\n    private $author;\n\n    #[ORM\\ManyToOne(inversedBy: 'drafts')]\n    private Author $editor;\n\n    #[ORM\\OneToMany(mappedBy: 'post')]\n    private iterable $comments;\n\n    #[Other(inversedBy: 'posts')]\n    private $other;\n}\n";
+const ORM_AUTHOR: &str = "<?php\nnamespace App\\Entity;\nuse Doctrine\\ORM\\Mapping as ORM;\nclass Author\n{\n    #[ORM\\OneToMany(targetEntity: Post::class, mappedBy: 'author')]\n    private iterable $posts;\n\n    private iterable $drafts;\n}\n";
+
+#[test]
+fn association_attributes_lead_to_classes_and_properties() {
+    let (_dir, root) = doctrine_symfony(&[
+        ("lib/Associations.php", ORM_ASSOCIATIONS),
+        ("src/Entity/Post.php", ORM_POST),
+        ("src/Entity/Author.php", ORM_AUTHOR),
+        (
+            "src/Entity/Other.php",
+            "<?php\nnamespace App\\Entity;\n#[\\Attribute]\nclass Other\n{\n    public function __construct(?string $inversedBy = null) {}\n}\n",
+        ),
+    ]);
+    let mut index = auto(&root);
+    let at = |index: &mut Index, file: &str, needle: &str, nth: usize| -> Vec<String> {
+        let path = root.join(file);
+        let source = fs::read(&path).unwrap();
+        let text = String::from_utf8_lossy(&source).into_owned();
+        let offset = text.match_indices(needle).nth(nth).unwrap().0 as u32 + 1;
+        index
+            .definition(&path, &source, offset)
+            .into_iter()
+            .map(|location| {
+                let target = fs::read(&location.path).unwrap();
+                format!(
+                    "{}:{}",
+                    location.path.file_name().unwrap().to_string_lossy(),
+                    String::from_utf8_lossy(
+                        &target[location.start as usize..location.end as usize]
+                    )
+                )
+            })
+            .collect()
+    };
+    let post = "src/Entity/Post.php";
+
+    assert_eq!(at(&mut index, post, "'Author'", 0), ["Author.php:Author"]);
+    assert_eq!(at(&mut index, post, "'posts'", 0), ["Author.php:posts"]);
+    assert_eq!(at(&mut index, post, "'drafts'", 0), ["Author.php:drafts"]);
+    assert!(at(&mut index, post, "'post'", 0).is_empty());
+    assert!(at(&mut index, post, "'posts'", 1).is_empty());
+    assert_eq!(
+        at(&mut index, "src/Entity/Author.php", "'author'", 0),
+        ["Post.php:author"]
+    );
+}

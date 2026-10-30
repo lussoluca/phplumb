@@ -27,6 +27,7 @@ use crate::frameworks::{
     Project, ReceiverName,
 };
 use crate::index::{Index, Location};
+use crate::metadata::MetaValue;
 use crate::phpdoc::TypeExpr;
 use crate::summary::{FileSummary, NameRef, RefKey, summarize};
 
@@ -209,6 +210,57 @@ fn definitions_of(files: &[PathBuf]) -> Definitions {
         }
     }
     definitions
+}
+
+/// Doctrine's association attributes, whose `targetEntity`, `inversedBy` and
+/// `mappedBy` name a class and properties.
+const ORM_ASSOCIATIONS: [&str; 4] = [
+    "Doctrine\\ORM\\Mapping\\ManyToOne",
+    "Doctrine\\ORM\\Mapping\\OneToMany",
+    "Doctrine\\ORM\\Mapping\\OneToOne",
+    "Doctrine\\ORM\\Mapping\\ManyToMany",
+];
+
+/// The class or property a string of a Doctrine association attribute names: the
+/// target entity, qualified with the entity's namespace, or a property of it for
+/// `inversedBy` and `mappedBy`. The target is the `targetEntity` argument, else
+/// the declared type of the property for a to-one association. None for other
+/// attributes.
+fn doctrine_attribute_targets(
+    index: &Index,
+    found: &AttributeString,
+) -> Option<Vec<(Location, String)>> {
+    if !ORM_ASSOCIATIONS
+        .iter()
+        .any(|attribute| found.attribute.eq_ignore_ascii_case(attribute))
+    {
+        return None;
+    }
+    let holder = found.holder.as_deref()?;
+    let target_argument = found
+        .arguments
+        .iter()
+        .find(|(key, _)| key.as_deref() == Some("targetEntity"))
+        .or_else(|| found.arguments.first().filter(|(key, _)| key.is_none()));
+    let to_one = found.attribute.ends_with("ToOne");
+    let target = match target_argument.map(|(_, value)| value) {
+        Some(MetaValue::Class(class)) => Some(class.clone()),
+        Some(MetaValue::String(class)) => Some(doctrine::qualify(holder, class)),
+        _ if to_one => found
+            .holder_type
+            .as_ref()
+            .and_then(|ty| crate::infer::class_names(ty).into_iter().next()),
+        _ => None,
+    };
+    let targetting = found.key.as_deref() == Some("targetEntity")
+        || (found.key.is_none() && found.position == 0);
+    Some(match found.key.as_deref() {
+        _ if targetting => class_targets(index, &doctrine::qualify(holder, &found.value)),
+        Some("inversedBy" | "mappedBy") => target
+            .map(|target| property_targets(index, &target, &found.value))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    })
 }
 
 /// The interface message buses are autowired by.
@@ -1087,6 +1139,9 @@ impl Framework for Symfony {
                 Some(4) => self.parameter_locations(index, &found.value),
                 _ => Vec::new(),
             };
+        }
+        if let Some(targets) = doctrine_attribute_targets(index, found) {
+            return targets;
         }
         let template = found.key.as_deref() == Some("template") || first;
         if found.attribute.eq_ignore_ascii_case(TEMPLATE_ATTRIBUTE) && template {
