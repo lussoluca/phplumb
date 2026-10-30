@@ -127,6 +127,246 @@ pub(crate) fn read_services(
     found
 }
 
+/// The bus Symfony adds when the configuration defines none.
+const DEFAULT_BUS: &str = "messenger.bus.default";
+
+/// The message buses the configuration files define under `framework.messenger`
+/// and the default one: `default_bus`, or the only bus. Without buses, the one
+/// Symfony adds; none when several buses have no default, or when a `when@<env>`
+/// block changes them.
+pub(crate) fn buses(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+) -> Option<(Vec<String>, String)> {
+    let mut names: Vec<String> = Vec::new();
+    let mut default: Option<String> = None;
+    for file in files {
+        let Some(parsed) = config_files.get(file) else {
+            continue;
+        };
+        let Some(root) = &parsed.yaml else {
+            continue;
+        };
+        for (position, block) in top_blocks(root).into_iter().enumerate() {
+            let Some(messenger) = block.get("framework").and_then(|f| f.get("messenger")) else {
+                continue;
+            };
+            let changes_buses =
+                messenger.get("buses").is_some() || messenger.get("default_bus").is_some();
+            if position > 0 && changes_buses {
+                return None;
+            }
+            if let Some(Yaml::Map(buses)) = messenger.get("buses") {
+                for name in buses.iter().filter_map(|(key, _)| key.text()) {
+                    if !names.iter().any(|known| known == name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+            if let Some(bus) = messenger.get("default_bus").and_then(Yaml::text) {
+                default = Some(bus.to_string());
+            }
+        }
+    }
+    if names.is_empty() {
+        return Some((vec![DEFAULT_BUS.to_string()], DEFAULT_BUS.to_string()));
+    }
+    let default = default.or_else(|| (names.len() == 1).then(|| names[0].clone()))?;
+    Some((names, default))
+}
+
+/// A service the configuration files tag: its class, or for `_instanceof` the
+/// type whose implementations carry the tag, and the tag's attributes.
+pub(crate) struct Tagged {
+    pub class: String,
+    pub instanceof: bool,
+    /// For a prototype, the directory its `resource` loads, `class` being its
+    /// namespace.
+    pub resource: Option<PathBuf>,
+    pub attributes: Vec<(String, String)>,
+}
+
+/// The services the configuration files tag `tag`, also inside `when@<env>`
+/// blocks and through `_instanceof`: by name in the list of tags, as
+/// `{ name: tag, ... }`, or as `tag: { ... }`. A service's class is its `class`, or
+/// its id when written like a class.
+pub(crate) fn tagged_services(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+    tag: &str,
+) -> Vec<Tagged> {
+    let mut found = Vec::new();
+    for file in files {
+        let Some(parsed) = config_files.get(file) else {
+            continue;
+        };
+        let Some(root) = &parsed.yaml else {
+            continue;
+        };
+        for block in top_blocks(root) {
+            let Some(Yaml::Map(entries)) = block.get("services") else {
+                continue;
+            };
+            for (key, value) in entries {
+                let Some(id) = key.text() else {
+                    continue;
+                };
+                if id == "_instanceof" {
+                    let Yaml::Map(types) = value else {
+                        continue;
+                    };
+                    for (class, service) in types {
+                        let Some(class) = class.text() else {
+                            continue;
+                        };
+                        for attributes in tags_of(service, tag) {
+                            found.push(Tagged {
+                                class: class.trim_start_matches('\\').to_string(),
+                                instanceof: true,
+                                resource: None,
+                                attributes,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                if let Some(resource) = value.get("resource").and_then(Yaml::text) {
+                    // A prototype: the classes of a namespace loaded from a directory.
+                    let namespace = value.get("namespace").and_then(Yaml::text).unwrap_or(id);
+                    let dir = file
+                        .parent()
+                        .map(|parent| normalize(&parent.join(resource)));
+                    for attributes in tags_of(value, tag) {
+                        found.push(Tagged {
+                            class: namespace.trim_start_matches('\\').to_string(),
+                            instanceof: false,
+                            resource: dir.clone(),
+                            attributes,
+                        });
+                    }
+                    continue;
+                }
+                let class = match value.get("class").and_then(Yaml::text) {
+                    Some(class) => class,
+                    None if looks_like_class(id) => id,
+                    None => continue,
+                };
+                for attributes in tags_of(value, tag) {
+                    found.push(Tagged {
+                        class: class.trim_start_matches('\\').to_string(),
+                        instanceof: false,
+                        resource: None,
+                        attributes,
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// `path` with `.` and `..` components resolved without touching the disk.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The argument names the configuration binds or passes by name, `$name` keys of
+/// `bind` and `arguments` maps, and the classes of services given `arguments` or
+/// `bind`, so an argument of theirs may be wired otherwise than by name.
+pub(crate) fn bindings(
+    files: &[PathBuf],
+    config_files: &ConfigFiles,
+) -> (Vec<String>, Vec<String>) {
+    let mut names: Vec<String> = Vec::new();
+    let mut classes: Vec<String> = Vec::new();
+    for file in files {
+        let Some(parsed) = config_files.get(file) else {
+            continue;
+        };
+        let Some(root) = &parsed.yaml else {
+            continue;
+        };
+        for block in top_blocks(root) {
+            let Some(Yaml::Map(entries)) = block.get("services") else {
+                continue;
+            };
+            let mut services: Vec<(&str, &Yaml)> = Vec::new();
+            for (key, value) in entries {
+                let Some(id) = key.text() else {
+                    continue;
+                };
+                if id == "_instanceof" {
+                    if let Yaml::Map(types) = value {
+                        services.extend(types.iter().filter_map(|(k, v)| Some((k.text()?, v))));
+                    }
+                } else {
+                    services.push((id, value));
+                }
+            }
+            for (id, service) in services {
+                let mut wired = false;
+                for key in ["bind", "arguments"] {
+                    let Some(map) = service.get(key) else {
+                        continue;
+                    };
+                    wired = true;
+                    if let Yaml::Map(entries) = map {
+                        for name in entries.iter().filter_map(|(k, _)| k.text()) {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                if wired {
+                    let class = service.get("class").and_then(Yaml::text).unwrap_or(id);
+                    classes.push(class.trim_start_matches('\\').to_string());
+                }
+            }
+        }
+    }
+    (names, classes)
+}
+
+/// The attributes of each `tag` in the `tags` of `service`.
+fn tags_of(service: &Yaml, tag: &str) -> Vec<Vec<(String, String)>> {
+    let Some(Yaml::Sequence(tags)) = service.get("tags") else {
+        return Vec::new();
+    };
+    let scalars = |entries: &[(Yaml, Yaml)]| -> Vec<(String, String)> {
+        entries
+            .iter()
+            .filter_map(|(key, value)| Some((key.text()?.to_string(), value.text()?.to_string())))
+            .filter(|(key, _)| key != "name")
+            .collect()
+    };
+    let mut found = Vec::new();
+    for entry in tags {
+        match entry {
+            Yaml::Scalar { value, .. } if value == tag => found.push(Vec::new()),
+            Yaml::Map(entries) if entry.get("name").and_then(Yaml::text) == Some(tag) => {
+                found.push(scalars(entries));
+            }
+            Yaml::Map(entries) if entries.len() == 1 && entries[0].0.text() == Some(tag) => {
+                found.push(match &entries[0].1 {
+                    Yaml::Map(attributes) => scalars(attributes),
+                    _ => Vec::new(),
+                });
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 /// Whether `text` is written like a fully qualified class name.
 pub(crate) fn looks_like_class(text: &str) -> bool {
     let name = text.trim_start_matches('\\');
@@ -220,7 +460,13 @@ pub(crate) fn has_unread_configuration(
         .flatten()
         .flatten()
         .map(|entry| entry.path())
-        .any(|path| path.is_dir() || path.file_name().and_then(|n| n.to_str()).is_some_and(php));
+        .any(|path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            path.is_dir() || php(name) || name.ends_with(".yml") || name.ends_with(".xml")
+        });
     let imports = files.iter().any(|file| {
         config_files.get(file).is_some_and(|parsed| {
             parsed

@@ -15,7 +15,8 @@ use crate::diagnostics::{self, Diagnostic};
 use crate::discover::{self, DiscoverOptions, discover_with, is_recorded_framework_file, walk};
 use crate::filter::{PHP_EXTENSION, PathFilter, is_framework_file};
 use crate::frameworks::{
-    self, Detection, FoundCall, Framework, FrameworkCall, FrameworkDeclaration, Project,
+    self, CallArguments, Detection, FoundCall, Framework, FrameworkCall, FrameworkDeclaration,
+    Project,
 };
 use crate::hover::{self, Hover};
 use crate::infer::{self, Assigning, PropertyTypes, Receiver};
@@ -1594,7 +1595,15 @@ impl Index {
         };
         let targets: Vec<(Location, String)> = self
             .frameworks_for(path)
-            .flat_map(|f| f.call_targets(self, &call, &found.arguments, &found.wrapped))
+            .flat_map(|f| {
+                let arguments = CallArguments {
+                    types: &found.arguments,
+                    wrapped: &found.wrapped,
+                    receiver: found.receiver_name.as_ref(),
+                    caller: found.caller.as_deref(),
+                };
+                f.call_targets(self, &call, &arguments)
+            })
             .collect();
         (!targets.is_empty()).then_some(targets)
     }
@@ -1759,6 +1768,13 @@ impl Index {
                 .unwrap_or_default();
         }
         if let Some(member) = summary.static_refs.iter().find(|r| covers(r.start, r.end)) {
+            // Only a definition request: a framework may answer for a static call too.
+            if declarations
+                && member.kind == MemberKind::Method
+                && let Some(found) = self.framework_call(path, &summary, source, offset)
+            {
+                return found;
+            }
             let anonymous = summary.enclosing_class(offset).filter(|r| r.fqn.is_none());
             if let (ClassSel::SelfKw | ClassSel::StaticKw, Some(range)) = (&member.class, anonymous)
             {

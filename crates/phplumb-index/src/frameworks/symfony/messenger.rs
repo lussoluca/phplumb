@@ -1,9 +1,10 @@
-//! Symfony Messenger: the message handlers `#[AsMessageHandler]` declares, and the
-//! messages each one handles.
+//! Symfony Messenger: the message handlers `#[AsMessageHandler]` declares or the
+//! configuration tags, and the messages each one handles.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use super::config::Tagged;
 use crate::filter::PathFilter;
 use crate::frameworks::ancestry::{is_a, methods_of};
 use crate::index::{Index, Location};
@@ -14,11 +15,13 @@ use crate::summary::{Declaration, Member, MemberKind, SymbolKind};
 /// The attribute that marks a message handler.
 const HANDLER_ATTRIBUTE: &str = "Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler";
 
-/// A handler method, its name and the message classes it handles.
+/// A handler method, its name, the message classes it handles, and the bus it is
+/// limited to.
 struct Handler {
     location: Location,
     name: String,
     handles: Vec<String>,
+    bus: Option<String>,
 }
 
 #[derive(Default)]
@@ -29,8 +32,9 @@ pub(crate) struct Handlers {
 impl Handlers {
     /// Every handler of the concrete project classes: a class attribute names its
     /// method (`__invoke` by default), a method attribute marks its method, also on
-    /// a method the class takes from a parent or a trait.
-    pub(crate) fn read(index: &Index, filter: &PathFilter) -> Handlers {
+    /// a method the class takes from a parent or a trait; then the handlers of the
+    /// services `tagged` `messenger.message_handler`.
+    pub(crate) fn read(index: &Index, filter: &PathFilter, tagged: &[Tagged]) -> Handlers {
         let mut handlers = Handlers::default();
         let declaring: HashSet<String> = index
             .declarations()
@@ -49,7 +53,67 @@ impl Handlers {
                 handlers.read_class(index, path, declaration);
             }
         }
+        for service in tagged {
+            if let Some(resource) = &service.resource {
+                let namespace = format!("{}\\", service.class.trim_end_matches('\\'));
+                for (path, declaration) in index.declarations() {
+                    let in_namespace = declaration
+                        .fqn
+                        .get(..namespace.len())
+                        .is_some_and(|start| start.eq_ignore_ascii_case(&namespace));
+                    if declaration.kind == SymbolKind::Class
+                        && in_namespace
+                        && index.filter().under_root(path).starts_with(resource)
+                        && filter.in_scope(path)
+                    {
+                        handlers.read_tagged(index, path, declaration, &service.attributes);
+                    }
+                }
+            } else if service.instanceof {
+                for (path, declaration) in index.declarations() {
+                    if declaration.kind == SymbolKind::Class
+                        && filter.in_scope(path)
+                        && index.is_project_code(path)
+                        && is_a(index, &declaration.fqn, &[&service.class])
+                    {
+                        handlers.read_tagged(index, path, declaration, &service.attributes);
+                    }
+                }
+            } else if let Some(found) = index.classes_named(&service.class).first() {
+                handlers.read_tagged(index, found.path, found.declaration, &service.attributes);
+            }
+        }
         handlers
+    }
+
+    /// The handler a `messenger.message_handler` tag with `attributes` makes of
+    /// `class`: its `method` (`__invoke` by default), handling the tag's `handles`
+    /// or the type of the method's first parameter.
+    fn read_tagged(
+        &mut self,
+        index: &Index,
+        path: &Path,
+        class: &Declaration,
+        attributes: &[(String, String)],
+    ) {
+        if class.class.as_ref().is_none_or(|shape| shape.is_abstract) {
+            return;
+        }
+        let attribute = |name: &str| {
+            attributes
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        let name = attribute("method").unwrap_or("__invoke");
+        let methods = methods_of(index, path, class);
+        if let Some((file, _, method)) = methods
+            .iter()
+            .find(|(_, _, m)| m.name.eq_ignore_ascii_case(name))
+        {
+            let handles = attribute("handles").map(str::to_string);
+            self.add(file, method, handles, attribute("bus").map(str::to_string));
+        }
     }
 
     fn read_class(&mut self, index: &Index, path: &Path, class: &Declaration) {
@@ -70,28 +134,59 @@ impl Handlers {
                 .iter()
                 .find(|(_, _, m)| m.name.eq_ignore_ascii_case(name))
             {
-                self.add(file, method, attribute);
+                self.add_attributed(index, &class.fqn, file, method, attribute);
             }
         }
-        for (file, _, method) in &methods {
+        for (file, owner, method) in &methods {
             for attribute in method.metadata.iter().filter(|m| is_handler(m)) {
-                self.add(file, method, attribute);
+                self.add_attributed(index, owner, file, method, attribute);
             }
         }
     }
 
-    /// The handler `method`, handling the attribute's `handles` class or the
-    /// classes of its first parameter's declared type, as `MessengerPass` reads it.
-    /// Symfony registers public methods only.
-    fn add(&mut self, path: &Path, method: &Member, attribute: &Metadata) {
+    /// The handler an `#[AsMessageHandler]` `attribute` makes of `method`, `self::`
+    /// in it naming `owner`. A bus the module cannot read leaves the handler on
+    /// every bus.
+    fn add_attributed(
+        &mut self,
+        index: &Index,
+        owner: &str,
+        path: &Path,
+        method: &Member,
+        attribute: &Metadata,
+    ) {
+        let handles = match argument(attribute, "handles", 2) {
+            Some(MetaValue::Class(class) | MetaValue::String(class)) => Some(class.clone()),
+            Some(_) => return,
+            None => None,
+        };
+        let bus = match argument(attribute, "bus", 0) {
+            Some(MetaValue::String(bus)) => Some(bus.clone()),
+            Some(MetaValue::Constant { class, name }) => {
+                let class = if class == "self" {
+                    owner
+                } else {
+                    class.as_str()
+                };
+                index
+                    .find_member(class, MemberKind::Constant, name)
+                    .first()
+                    .and_then(|(_, member)| member.value.clone())
+            }
+            _ => None,
+        };
+        self.add(path, method, handles, bus);
+    }
+
+    /// The handler `method`, handling the class `handles` names or the classes of
+    /// its first parameter's declared type, as `MessengerPass` reads it, on `bus`
+    /// or on every bus. Symfony registers public methods only.
+    fn add(&mut self, path: &Path, method: &Member, handles: Option<String>, bus: Option<String>) {
         if !is_public(method) {
             return;
         }
-        let handles = match argument(attribute, "handles", 2) {
-            Some(MetaValue::Class(class) | MetaValue::String(class)) => {
-                vec![class.trim_start_matches('\\').to_string()]
-            }
-            Some(_) => return,
+        let handles = match handles {
+            Some(class) => vec![class.trim_start_matches('\\').to_string()],
             None => method
                 .hints
                 .first()
@@ -110,24 +205,52 @@ impl Handlers {
             },
             name: method.name.clone(),
             handles,
+            bus,
         });
     }
 
     /// The handlers whose handled class `message` is, extends or implements, or,
     /// for an interface or abstract class, one of its subtypes, each with its method
-    /// name.
-    pub(crate) fn of(&self, index: &Index, message: &str) -> Vec<(Location, String)> {
+    /// name; with a `bus`, those of other buses are left out.
+    pub(crate) fn of(
+        &self,
+        index: &Index,
+        message: &str,
+        bus: Option<&str>,
+    ) -> Vec<(Location, String)> {
         let mut found: Vec<(Location, String)> = Vec::new();
         for handler in &self.list {
-            let handles = handler
-                .handles
-                .iter()
-                .any(|class| may_carry(index, message, class));
+            let on_bus = match (&handler.bus, bus) {
+                (Some(own), Some(bus)) => own == bus,
+                _ => true,
+            };
+            let handles = on_bus
+                && handler
+                    .handles
+                    .iter()
+                    .any(|class| may_carry(index, message, class));
             if handles && !found.iter().any(|(known, _)| *known == handler.location) {
                 found.push((handler.location.clone(), handler.name.clone()));
             }
         }
         found
+    }
+
+    /// The buses handlers are limited to.
+    pub(crate) fn buses(&self) -> impl Iterator<Item = &str> {
+        self.list
+            .iter()
+            .filter_map(|handler| handler.bus.as_deref())
+    }
+
+    /// The bus of each handler of the method whose name starts at `start` in
+    /// `path`, none for one on every bus.
+    pub(crate) fn buses_of(&self, path: &Path, start: u32) -> Vec<Option<String>> {
+        self.list
+            .iter()
+            .filter(|handler| handler.location.path == path && handler.location.start == start)
+            .map(|handler| handler.bus.clone())
+            .collect()
     }
 
     /// The classes the handler method whose name starts at `start` in `path`
@@ -149,8 +272,18 @@ impl Handlers {
 
 /// Whether a message typed `message` may be an instance of `class`: `message` is,
 /// extends or implements it, or, being an interface or abstract class, is one of
-/// its supertypes.
+/// its supertypes. `class` may be a wildcard, `*` for every message and `Ns\*` for
+/// the classes of a namespace and those below it, as `HandlersLocator` lists them.
 pub(crate) fn may_carry(index: &Index, message: &str, class: &str) -> bool {
+    if class == "*" {
+        return true;
+    }
+    if let Some(namespace) = class.replace("\\\\", "\\").strip_suffix('*') {
+        return message.len() > namespace.len()
+            && message
+                .get(..namespace.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(namespace));
+    }
     is_a(index, message, &[class]) || (is_open(index, message) && is_a(index, class, &[message]))
 }
 

@@ -1822,3 +1822,519 @@ fn bare_attributes_of_other_classes_on_hooks_open_their_class() {
         [root.join("drupal/modules/custom/mymodule/src/Traced.php")]
     );
 }
+
+const AS_MESSAGE_HANDLER: &str = "<?php\nnamespace Symfony\\Component\\Messenger\\Attribute;\n#[\\Attribute]\nclass AsMessageHandler\n{\n    public function __construct(?string $bus = null, ?string $fromTransport = null, ?string $handles = null, ?string $method = null) {}\n}\n";
+const MESSAGE_BUS: &str = "<?php\nnamespace Symfony\\Component\\Messenger;\ninterface MessageBusInterface\n{\n    public function dispatch(object $message, array $stamps = []): object;\n}\n";
+const PING: &str = "<?php\nnamespace App\\Message;\nfinal class Ping\n{\n}\n";
+const PING_HANDLER: &str = "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\n#[AsMessageHandler]\nfinal class PingHandler\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n";
+const SENDER: &str = "<?php\nnamespace App\\Service;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nfinal class Sender\n{\n    public function __construct(private MessageBusInterface $bus)\n    {\n    }\n\n    public function send(): void\n    {\n        $this->bus->dispatch(new Ping());\n    }\n}\n";
+
+/// `broken_symfony` with Messenger's classes, a `Ping` message, its handler, a
+/// sender, and `files`.
+fn messenger_symfony(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let mut all = vec![
+        ("lib/AsMessageHandler.php", AS_MESSAGE_HANDLER),
+        ("lib/MessageBusInterface.php", MESSAGE_BUS),
+        ("src/Message/Ping.php", PING),
+        ("src/Handler/PingHandler.php", PING_HANDLER),
+        ("src/Service/Sender.php", SENDER),
+    ];
+    all.extend_from_slice(files);
+    broken_symfony(&all)
+}
+
+/// The definitions at the first `needle` in `file` below `root`, as (file name,
+/// text) pairs, sorted.
+fn handler_definitions(
+    index: &mut Index,
+    root: &Path,
+    file: &str,
+    needle: &str,
+) -> Vec<(String, String)> {
+    let path = root.join(file);
+    let source = fs::read(&path).unwrap();
+    let offset = String::from_utf8_lossy(&source).find(needle).unwrap() as u32 + 1;
+    let mut found: Vec<(String, String)> = index
+        .definition(&path, &source, offset)
+        .into_iter()
+        .map(|location| {
+            let text = fs::read(&location.path).unwrap();
+            (
+                location
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                String::from_utf8_lossy(&text[location.start as usize..location.end as usize])
+                    .into_owned(),
+            )
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+fn named(file: &str, text: &str) -> (String, String) {
+    (file.to_string(), text.to_string())
+}
+
+#[cfg(unix)]
+#[test]
+fn handlers_under_a_symlinked_root_list_their_dispatches() {
+    let (_dir, root) = messenger_symfony(&[]);
+    let links = TempDir::new().unwrap();
+    let link = links.path().join("workspace");
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    let mut index = auto(&link);
+
+    assert_eq!(
+        handler_definitions(&mut index, &link, "src/Handler/PingHandler.php", "__invoke"),
+        [named("Sender.php", "dispatch")]
+    );
+    assert_eq!(
+        handler_definitions(&mut index, &link, "src/Service/Sender.php", "dispatch("),
+        [named("PingHandler.php", "__invoke")]
+    );
+}
+
+const WIDE: &str = "<?php\nnamespace App\\Service;\nuse App\\Message\\Sub\\Deep;\nuse App\\MessageX;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nfinal class Wide\n{\n    public function __construct(private MessageBusInterface $bus)\n    {\n    }\n\n    public function deep(): void\n    {\n        $this->bus->dispatch(new Deep());\n    }\n\n    public function other(): void\n    {\n        $this->bus->dispatch(new MessageX());\n    }\n}\n";
+
+fn wildcard_symfony(handles: &str) -> (TempDir, PathBuf) {
+    let handler = format!(
+        "<?php\nnamespace App\\Handler;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\nfinal class WideHandler\n{{\n    #[AsMessageHandler(handles: '{handles}')]\n    public function onAny(object $message): void\n    {{\n    }}\n}}\n"
+    );
+    let handler: &'static str = Box::leak(handler.into_boxed_str());
+    messenger_symfony(&[
+        (
+            "src/Message/Sub/Deep.php",
+            "<?php\nnamespace App\\Message\\Sub;\nfinal class Deep\n{\n}\n",
+        ),
+        (
+            "src/MessageX.php",
+            "<?php\nnamespace App;\nfinal class MessageX\n{\n}\n",
+        ),
+        ("src/Service/Wide.php", WIDE),
+        ("src/Handler/WideHandler.php", handler),
+    ])
+}
+
+#[test]
+fn wildcard_handlers_handle_every_message() {
+    let (_dir, root) = wildcard_symfony("*");
+    let mut index = auto(&root);
+
+    for needle in ["dispatch(new Deep", "dispatch(new MessageX"] {
+        assert!(
+            handler_definitions(&mut index, &root, "src/Service/Wide.php", needle)
+                .contains(&named("WideHandler.php", "onAny")),
+            "{needle}"
+        );
+    }
+    assert_eq!(
+        handler_definitions(&mut index, &root, "src/Handler/WideHandler.php", "onAny"),
+        [
+            named("Sender.php", "dispatch"),
+            named("Wide.php", "dispatch"),
+            named("Wide.php", "dispatch")
+        ]
+    );
+}
+
+#[test]
+fn namespace_wildcard_handlers_handle_their_namespace() {
+    let (_dir, root) = wildcard_symfony("App\\\\Message\\\\*");
+    let mut index = auto(&root);
+
+    assert_eq!(
+        handler_definitions(
+            &mut index,
+            &root,
+            "src/Service/Wide.php",
+            "dispatch(new Deep"
+        ),
+        [named("WideHandler.php", "onAny")]
+    );
+    assert!(
+        !handler_definitions(
+            &mut index,
+            &root,
+            "src/Service/Wide.php",
+            "dispatch(new MessageX"
+        )
+        .contains(&named("WideHandler.php", "onAny"))
+    );
+    assert_eq!(
+        handler_definitions(&mut index, &root, "src/Handler/WideHandler.php", "onAny"),
+        [
+            named("Sender.php", "dispatch"),
+            named("Wide.php", "dispatch")
+        ]
+    );
+}
+
+const RECURRING_MESSAGE: &str = "<?php\nnamespace Symfony\\Component\\Scheduler;\nfinal class RecurringMessage\n{\n    public static function every(string $frequency, object $message): self { return new self(); }\n    public static function cron(string $expression, object $message): self { return new self(); }\n}\n";
+const SCHEDULE: &str = "<?php\nnamespace App\\Service;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Scheduler\\RecurringMessage;\nfinal class Schedule\n{\n    public function messages(): array\n    {\n        return [\n            RecurringMessage::every('1 minute', new Ping()),\n            RecurringMessage::cron(message: new Ping(), expression: '* * * * *'),\n        ];\n    }\n}\n";
+
+#[test]
+fn recurring_messages_reach_their_handlers() {
+    let (_dir, root) = messenger_symfony(&[
+        ("lib/RecurringMessage.php", RECURRING_MESSAGE),
+        ("src/Service/Schedule.php", SCHEDULE),
+    ]);
+    let mut index = auto(&root);
+
+    for needle in ["every(", "cron("] {
+        assert_eq!(
+            handler_definitions(&mut index, &root, "src/Service/Schedule.php", needle),
+            [named("PingHandler.php", "__invoke")],
+            "{needle}"
+        );
+    }
+    assert_eq!(
+        handler_definitions(&mut index, &root, "src/Handler/PingHandler.php", "__invoke"),
+        [
+            named("Schedule.php", "cron"),
+            named("Schedule.php", "every"),
+            named("Sender.php", "dispatch")
+        ]
+    );
+}
+
+const TAGGED_SERVICES: &str = "parameters:\n    app.name: x\n\nservices:\n    _instanceof:\n        App\\Handler\\Handles:\n            tags: [messenger.message_handler]\n\n    App\\Handler\\TaggedHandler:\n        tags: [messenger.message_handler]\n\n    tagged.mapped:\n        class: App\\Handler\\MappedHandler\n        tags:\n            - { name: messenger.message_handler, handles: App\\Message\\Ping, method: onPing }\n\n    tagged.short:\n        class: App\\Handler\\ShortHandler\n        tags:\n            - messenger.message_handler: { method: run }\n\n    tagged.missing:\n        class: App\\Handler\\Nowhere\n        tags: [messenger.message_handler]\n\n    tagged.wrong:\n        class: App\\Handler\\MappedHandler\n        tags:\n            - { name: messenger.message_handler, method: nope }\n";
+
+fn tagged_symfony() -> (TempDir, PathBuf) {
+    messenger_symfony(&[
+        ("config/services.yaml", TAGGED_SERVICES),
+        (
+            "src/Handler/TaggedHandler.php",
+            "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nfinal class TaggedHandler\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n",
+        ),
+        (
+            "src/Handler/MappedHandler.php",
+            "<?php\nnamespace App\\Handler;\nfinal class MappedHandler\n{\n    public function onPing(object $message): void\n    {\n    }\n}\n",
+        ),
+        (
+            "src/Handler/ShortHandler.php",
+            "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nfinal class ShortHandler\n{\n    public function run(Ping $message): void\n    {\n    }\n}\n",
+        ),
+        (
+            "src/Handler/Handles.php",
+            "<?php\nnamespace App\\Handler;\ninterface Handles\n{\n}\n",
+        ),
+        (
+            "src/Handler/InstanceHandler.php",
+            "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nfinal class InstanceHandler implements Handles\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n",
+        ),
+    ])
+}
+
+#[test]
+fn tagged_handlers_handle_their_messages() {
+    let (_dir, root) = tagged_symfony();
+    let mut index = auto(&root);
+
+    assert_eq!(
+        handler_definitions(&mut index, &root, "src/Service/Sender.php", "dispatch("),
+        [
+            named("InstanceHandler.php", "__invoke"),
+            named("MappedHandler.php", "onPing"),
+            named("PingHandler.php", "__invoke"),
+            named("ShortHandler.php", "run"),
+            named("TaggedHandler.php", "__invoke")
+        ]
+    );
+    for (file, method) in [
+        ("src/Handler/TaggedHandler.php", "__invoke"),
+        ("src/Handler/MappedHandler.php", "onPing"),
+        ("src/Handler/ShortHandler.php", "run"),
+        ("src/Handler/InstanceHandler.php", "__invoke"),
+    ] {
+        assert_eq!(
+            handler_definitions(&mut index, &root, file, method),
+            [named("Sender.php", "dispatch")],
+            "{file}"
+        );
+    }
+}
+
+const BUSES: &str = "framework:\n    messenger:\n        default_bus: command.bus\n        buses:\n            command.bus: ~\n            query.bus: ~\n";
+
+fn bus_handler(name: &str, bus: &str) -> String {
+    format!(
+        "<?php\nnamespace App\\Handler;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\n#[AsMessageHandler(bus: '{bus}')]\nfinal class {name}\n{{\n    public function __invoke(Ping $message): void\n    {{\n    }}\n}}\n"
+    )
+}
+
+fn bus_sender(name: &str, constructor: &str, receiver: &str) -> String {
+    format!(
+        "<?php\nnamespace App\\Service;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nuse Symfony\\Component\\DependencyInjection\\Attribute\\Target;\nfinal class {name}\n{{\n    private MessageBusInterface $bus;\n\n    public function __construct({constructor})\n    {{\n    }}\n\n    public function send(MessageBusInterface $queryBus): void\n    {{\n        {receiver}->dispatch(new Ping());\n    }}\n}}\n"
+    )
+}
+
+fn bus_symfony() -> (TempDir, PathBuf) {
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    messenger_symfony(&[
+        ("config/packages/messenger.yaml", BUSES),
+        (
+            "src/Handler/CommandHandler.php",
+            leak(bus_handler("CommandHandler", "command.bus")),
+        ),
+        (
+            "src/Handler/QueryHandler.php",
+            leak(bus_handler("QueryHandler", "query.bus")),
+        ),
+        (
+            "src/Service/QuerySender.php",
+            leak(bus_sender(
+                "QuerySender",
+                "private MessageBusInterface $queryBus",
+                "$this->queryBus",
+            )),
+        ),
+        (
+            "src/Service/ParameterSender.php",
+            leak(bus_sender("ParameterSender", "", "$queryBus")),
+        ),
+        (
+            "src/Service/AssignedSender.php",
+            leak(bus_sender(
+                "AssignedSender",
+                "MessageBusInterface $queryBus",
+                "$this->bus",
+            )),
+        ),
+        (
+            "src/Service/TargetSender.php",
+            leak(bus_sender(
+                "TargetSender",
+                "#[Target('query.bus')] private MessageBusInterface $other",
+                "$this->other",
+            )),
+        ),
+    ])
+}
+
+#[test]
+fn bus_handlers_list_only_dispatches_of_their_bus() {
+    let (_dir, root) = bus_symfony();
+    let mut index = auto(&root);
+    let dispatch =
+        |index: &mut Index, file: &str| handler_definitions(index, &root, file, "dispatch(");
+
+    assert_eq!(
+        dispatch(&mut index, "src/Service/QuerySender.php"),
+        [
+            named("PingHandler.php", "__invoke"),
+            named("QueryHandler.php", "__invoke")
+        ]
+    );
+    assert_eq!(
+        dispatch(&mut index, "src/Service/ParameterSender.php"),
+        [
+            named("PingHandler.php", "__invoke"),
+            named("QueryHandler.php", "__invoke")
+        ]
+    );
+    // `$bus` names no bus: the default one.
+    assert_eq!(
+        dispatch(&mut index, "src/Service/Sender.php"),
+        [
+            named("CommandHandler.php", "__invoke"),
+            named("PingHandler.php", "__invoke")
+        ]
+    );
+    let query = handler_definitions(
+        &mut index,
+        &root,
+        "src/Handler/QueryHandler.php",
+        "__invoke",
+    );
+    assert!(
+        query.iter().all(|(file, _)| file != "Sender.php"),
+        "{query:?}"
+    );
+    assert!(
+        query.contains(&named("QuerySender.php", "dispatch")),
+        "{query:?}"
+    );
+}
+
+#[test]
+fn buses_the_module_cannot_tell_keep_every_handler() {
+    let (_dir, root) = bus_symfony();
+    let mut index = auto(&root);
+    for file in [
+        "src/Service/AssignedSender.php",
+        "src/Service/TargetSender.php",
+    ] {
+        assert_eq!(
+            handler_definitions(&mut index, &root, file, "dispatch("),
+            [
+                named("CommandHandler.php", "__invoke"),
+                named("PingHandler.php", "__invoke"),
+                named("QueryHandler.php", "__invoke")
+            ],
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn handlers_without_bus_stay_listed() {
+    let (_dir, root) = bus_symfony();
+    let mut index = auto(&root);
+    let all = handler_definitions(&mut index, &root, "src/Handler/PingHandler.php", "__invoke");
+    for file in ["QuerySender.php", "Sender.php", "AssignedSender.php"] {
+        assert!(all.contains(&named(file, "dispatch")), "{file} {all:?}");
+    }
+}
+
+const QUERY_BUS: &str = "<?php\nnamespace App\\Bus;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\ninterface QueryBus extends MessageBusInterface\n{\n}\n";
+
+fn sender_class(name: &str, body: &str) -> String {
+    format!(
+        "<?php\nnamespace App\\Service;\nuse App\\Bus\\QueryBus;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\MessageBusInterface;\nfinal class {name}\n{{\n{body}\n}}\n"
+    )
+}
+
+/// The handlers of the `dispatch(` in `sender`, on `bus_symfony` with `files`.
+fn bus_case(files: &[(&str, String)], sender: &str) -> Vec<(String, String)> {
+    let (_dir, root) = bus_symfony();
+    for (file, content) in files {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let mut index = auto(&root);
+    handler_definitions(&mut index, &root, sender, "dispatch(")
+}
+
+fn every_handler() -> Vec<(String, String)> {
+    vec![
+        named("CommandHandler.php", "__invoke"),
+        named("PingHandler.php", "__invoke"),
+        named("QueryHandler.php", "__invoke"),
+    ]
+}
+
+#[test]
+fn unread_messenger_configuration_keeps_every_handler() {
+    let found = bus_case(
+        &[(
+            "config/packages/messenger.php",
+            "<?php\nreturn static function (): void {};\n".to_string(),
+        )],
+        "src/Service/QuerySender.php",
+    );
+    assert_eq!(found, every_handler());
+    let found = bus_case(
+        &[(
+            "config/packages/messenger.yaml",
+            format!(
+                "{BUSES}\nwhen@test:\n    framework:\n        messenger:\n            default_bus: query.bus\n"
+            ),
+        )],
+        "src/Service/Sender.php",
+    );
+    assert_eq!(found, every_handler());
+}
+
+#[test]
+fn bus_constants_and_parsed_names_are_read() {
+    let constant = bus_case(
+        &[
+            (
+                "src/Bus/Buses.php",
+                "<?php\nnamespace App\\Bus;\nfinal class Buses\n{\n    public const QUERY = 'query.bus';\n}\n".to_string(),
+            ),
+            (
+                "src/Handler/QueryHandler.php",
+                "<?php\nnamespace App\\Handler;\nuse App\\Bus\\Buses;\nuse App\\Message\\Ping;\nuse Symfony\\Component\\Messenger\\Attribute\\AsMessageHandler;\n#[AsMessageHandler(bus: Buses::QUERY)]\nfinal class QueryHandler\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n".to_string(),
+            ),
+        ],
+        "src/Service/QuerySender.php",
+    );
+    assert_eq!(
+        constant,
+        [
+            named("PingHandler.php", "__invoke"),
+            named("QueryHandler.php", "__invoke")
+        ]
+    );
+    let snake = bus_case(
+        &[(
+            "src/Service/SnakeSender.php",
+            sender_class(
+                "SnakeSender",
+                "    public function __construct(private MessageBusInterface $query_bus)\n    {\n    }\n\n    public function send(): void\n    {\n        $this->query_bus->dispatch(new Ping());\n    }",
+            ),
+        )],
+        "src/Service/SnakeSender.php",
+    );
+    assert_eq!(
+        snake,
+        [
+            named("PingHandler.php", "__invoke"),
+            named("QueryHandler.php", "__invoke")
+        ]
+    );
+}
+
+#[test]
+fn buses_symfony_does_not_autowire_by_name_stay_unknown() {
+    let cases = [
+        (
+            "HelperSender",
+            "    public function __construct(private MessageBusInterface $queryBus)\n    {\n    }\n\n    public function run(): void\n    {\n        $this->send($this->queryBus);\n    }\n\n    private function send(MessageBusInterface $bus): void\n    {\n        $bus->dispatch(new Ping());\n    }",
+        ),
+        (
+            "TypedSender",
+            "    public function __construct(private QueryBus $bus)\n    {\n    }\n\n    public function send(): void\n    {\n        $this->bus->dispatch(new Ping());\n    }",
+        ),
+        (
+            "SwappedSender",
+            "    private MessageBusInterface $bus;\n\n    public function __construct(MessageBusInterface $bus, MessageBusInterface $queryBus)\n    {\n        $this->bus = $queryBus;\n    }\n\n    public function send(): void\n    {\n        $this->bus->dispatch(new Ping());\n    }",
+        ),
+    ];
+    for (name, body) in cases {
+        let file = format!("src/Service/{name}.php");
+        let found = bus_case(
+            &[
+                ("src/Bus/QueryBus.php", QUERY_BUS.to_string()),
+                (file.as_str(), sender_class(name, body)),
+            ],
+            &file,
+        );
+        assert_eq!(found, every_handler(), "{name}");
+    }
+    let bound = bus_case(
+        &[(
+            "config/services.yaml",
+            "parameters:\n    app.name: x\n\nservices:\n    _defaults:\n        bind:\n            $bus: '@query.bus'\n".to_string(),
+        )],
+        "src/Service/Sender.php",
+    );
+    assert_eq!(bound, every_handler());
+}
+
+#[test]
+fn prototype_tags_make_handlers() {
+    let found = bus_case(
+        &[
+            (
+                "config/services.yaml",
+                "parameters:\n    app.name: x\n\nservices:\n    App\\Tagged\\:\n        resource: '../src/Tagged/'\n        tags: [messenger.message_handler]\n".to_string(),
+            ),
+            (
+                "src/Tagged/PrototypeHandler.php",
+                "<?php\nnamespace App\\Tagged;\nuse App\\Message\\Ping;\nfinal class PrototypeHandler\n{\n    public function __invoke(Ping $message): void\n    {\n    }\n}\n".to_string(),
+            ),
+        ],
+        "src/Service/Sender.php",
+    );
+    assert!(
+        found.contains(&named("PrototypeHandler.php", "__invoke")),
+        "{found:?}"
+    );
+}

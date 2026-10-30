@@ -20,7 +20,8 @@ use crate::filter::{is_doctrine_xml, is_yaml};
 use crate::frameworks::ancestry::is_a;
 use crate::frameworks::yaml::{self, Yaml};
 use crate::frameworks::{
-    AttributeString, CallTarget, Framework, FrameworkCall, FrameworkDeclaration, Project,
+    AttributeString, CallArguments, CallTarget, Framework, FrameworkCall, FrameworkDeclaration,
+    Project, ReceiverName,
 };
 use crate::index::{Index, Location};
 use crate::phpdoc::TypeExpr;
@@ -77,28 +78,120 @@ const REPOSITORY_METHODS: [(&str, &[&str]); 2] = [
     ("Doctrine\\Persistence\\ManagerRegistry", &["getRepository"]),
 ];
 
-/// The methods whose argument 0 is a message to handle: a bus's, and
-/// `HandleTrait`'s.
-const DISPATCH: [(&str, &[&str]); 2] = [
+/// The methods that send a message to its handlers, by declaring class, with the
+/// position of the message: a bus's `dispatch()`, `HandleTrait::handle()`, and the
+/// Scheduler's recurring messages.
+const MESSAGE_CALLS: [(&str, &str, usize); 5] = [
     (
         "Symfony\\Component\\Messenger\\MessageBusInterface",
-        &["dispatch"],
+        "dispatch",
+        0,
     ),
-    ("Symfony\\Component\\Messenger\\HandleTrait", &["handle"]),
+    ("Symfony\\Component\\Messenger\\HandleTrait", "handle", 0),
+    (
+        "Symfony\\Component\\Scheduler\\RecurringMessage",
+        "every",
+        1,
+    ),
+    ("Symfony\\Component\\Scheduler\\RecurringMessage", "cron", 1),
+    (
+        "Symfony\\Component\\Scheduler\\RecurringMessage",
+        "trigger",
+        1,
+    ),
 ];
+
+/// The interface message buses are autowired by.
+const MESSAGE_BUS: &str = "Symfony\\Component\\Messenger\\MessageBusInterface";
+
+/// The name of the argument Symfony autowires the bus `bus` to:
+/// `registerAliasForArgument()` turns `command.bus` into `commandBus`.
+fn bus_alias(bus: &str) -> String {
+    let mut alias = String::new();
+    let mut upper = false;
+    for c in bus.chars() {
+        if c.is_ascii_alphanumeric() {
+            alias.push(if upper { c.to_ascii_uppercase() } else { c });
+            upper = false;
+        } else {
+            upper = !alias.is_empty();
+        }
+    }
+    let mut chars = alias.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_ascii_lowercase().to_string() + chars.as_str()
+    })
+}
+
+/// Whether the parameter `$name` of the function declared by `signature` has an
+/// attribute, which may name another service; true when the parameter is not
+/// found.
+fn parameter_has_attribute(signature: &str, name: &str) -> bool {
+    let variable = format!("${name}");
+    let bytes = signature.as_bytes();
+    let Some(at) = signature
+        .match_indices(&variable)
+        .map(|(at, _)| at)
+        .find(|&at| {
+            let end = at + variable.len();
+            bytes
+                .get(end)
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+        })
+    else {
+        return true;
+    };
+    // Back to the comma or parenthesis that starts the parameter.
+    let mut depth = 0;
+    let mut start = at;
+    while start > 0 {
+        start -= 1;
+        match bytes[start] {
+            b')' | b']' => depth += 1,
+            b'(' | b'[' if depth == 0 => break,
+            b'(' | b'[' => depth -= 1,
+            b',' if depth == 0 => break,
+            _ => {}
+        }
+    }
+    signature[start..at].contains("#[")
+}
+
+/// Lowercased names of the `MESSAGE_CALLS` methods.
+const MESSAGE_METHODS: [&str; 5] = ["dispatch", "handle", "every", "cron", "trigger"];
+
+/// The position of the message of `call`, when it is one of `MESSAGE_CALLS`.
+fn message_position(index: &Index, call: &FrameworkCall<'_>) -> Option<usize> {
+    call.targets.iter().find_map(|target| {
+        let CallTarget::Method { class, name } = target else {
+            return None;
+        };
+        MESSAGE_CALLS
+            .iter()
+            .find(|(owner, method, _)| {
+                method.eq_ignore_ascii_case(name) && is_a(index, class, &[owner])
+            })
+            .map(|(_, _, position)| *position)
+    })
+}
 
 /// The envelope a message may be dispatched in.
 const ENVELOPE: &str = "Symfony\\Component\\Messenger\\Envelope";
 
-/// The message classes a dispatch's first argument holds: the type of the message
+/// The message classes the argument at `position` holds: the type of the message
 /// an `Envelope` built in place wraps.
-fn messages(index: &Index, arguments: &[TypeExpr], wrapped: &[Option<TypeExpr>]) -> Vec<String> {
-    let Some(message) = arguments.first() else {
+fn messages(
+    index: &Index,
+    arguments: &[TypeExpr],
+    wrapped: &[Option<TypeExpr>],
+    position: usize,
+) -> Vec<String> {
+    let Some(message) = arguments.get(position) else {
         return Vec::new();
     };
     let classes = crate::infer::class_names(message);
     let enveloped = classes.iter().any(|class| is_a(index, class, &[ENVELOPE]));
-    match wrapped.first() {
+    match wrapped.get(position) {
         Some(Some(inner)) if enveloped => crate::infer::class_names(inner),
         _ => classes,
     }
@@ -207,6 +300,11 @@ pub struct Symfony {
     routes: Routes,
     templates: Templates,
     handlers: Handlers,
+    /// The message buses and the default one; none when they cannot be told.
+    buses: Option<(Vec<String>, String)>,
+    /// The argument names the configuration binds, and the classes whose
+    /// arguments it wires.
+    bindings: (Vec<String>, Vec<String>),
     /// Parameter definitions, by name.
     parameters: HashMap<String, Vec<RouteTarget>>,
     /// Whether configuration the module does not read may define parameters.
@@ -331,7 +429,7 @@ impl Symfony {
     /// The handler methods of the message class `message`, at their names.
     pub fn handlers_of(&self, index: &Index, message: &str) -> Vec<Location> {
         self.handlers
-            .of(index, message)
+            .of(index, message, None)
             .into_iter()
             .map(|(location, _)| location)
             .collect()
@@ -342,12 +440,80 @@ impl Symfony {
         self.handlers.handled_by(path, start)
     }
 
-    /// The `dispatch()` and `HandleTrait::handle()` calls of the project whose
-    /// message may be one of `handled`, at their method name.
-    fn dispatches(&self, index: &Index, handled: &[String]) -> Vec<(Location, String)> {
+    /// The bus a call made on `receiver` from `caller` goes through, when the
+    /// module can tell: a promoted constructor property typed `MessageBusInterface`
+    /// without attributes, which Symfony autowires by name to the bus with that
+    /// alias or else to the default bus, or a parameter of the calling method named
+    /// like a bus alias; none when the configuration binds the name or wires the
+    /// class's arguments.
+    fn bus_of(
+        &self,
+        index: &Index,
+        receiver: Option<&ReceiverName>,
+        caller: Option<&str>,
+    ) -> Option<String> {
+        let (buses, default) = self.buses.as_ref()?;
+        let (class, method) = caller?.split_once("::")?;
+        let (function, name, property) = match receiver? {
+            ReceiverName::Property(name) => ("__construct", name, true),
+            ReceiverName::Variable(name) => (method, name, false),
+        };
+        let (bound, wired) = &self.bindings;
+        if bound.iter().any(|key| key.ends_with(&format!("${name}")))
+            || wired.iter().any(|wired| wired.eq_ignore_ascii_case(class))
+        {
+            return None;
+        }
+        let (found, member) = index
+            .find_member(class, crate::summary::MemberKind::Method, function)
+            .into_iter()
+            .next()?;
+        let position = member.params.iter().position(|(param, _)| param == name)?;
+        let typed = member
+            .hints
+            .get(position)?
+            .as_ref()
+            .is_some_and(|hint| crate::infer::class_names(hint) == [MESSAGE_BUS]);
+        if !typed {
+            return None;
+        }
+        if property {
+            // Promoted: the property is declared by the constructor parameter.
+            let (_, declared) = index
+                .find_member(class, crate::summary::MemberKind::Property, name)
+                .into_iter()
+                .next()?;
+            if declared.range.0 < member.range.0 || declared.range.1 > member.range.1 {
+                return None;
+            }
+        }
+        // The index keeps no signatures: the declaration is read from its file.
+        let text = std::fs::read(found.path).ok()?;
+        let (start, end) = member.range;
+        let declaration = String::from_utf8_lossy(text.get(start as usize..end as usize)?);
+        if parameter_has_attribute(&declaration, name) {
+            return None;
+        }
+        let alias = bus_alias(name);
+        match buses.iter().find(|bus| bus_alias(bus) == alias) {
+            Some(bus) => Some(bus.clone()),
+            None if property => Some(default.clone()),
+            None => None,
+        }
+    }
+
+    /// The calls of the project that send a message, `MESSAGE_CALLS`, whose message
+    /// may be one of `handled`, at their method name, on one of `buses` (none for
+    /// every bus) when the module can tell a call's bus.
+    fn dispatches(
+        &self,
+        index: &Index,
+        handled: &[String],
+        buses: &[Option<String>],
+    ) -> Vec<(Location, String)> {
         let handled: Vec<&str> = handled.iter().map(String::as_str).collect();
         index
-            .calls_named(&["dispatch", "handle"], &self.project)
+            .calls_named(&MESSAGE_METHODS, &self.project)
             .into_iter()
             .filter(|call| {
                 let found = FrameworkCall {
@@ -355,14 +521,26 @@ impl Symfony {
                     strings: &call.strings,
                     receiver: Some(&call.receiver),
                 };
-                calls_one_of(index, &found, &DISPATCH)
-                    && messages(index, &call.arguments, &call.wrapped)
+                // The bus is read only when a handler here is limited to one.
+                let on_bus = || {
+                    buses.iter().all(Option::is_none)
+                        || self
+                            .bus_of(index, call.receiver_name.as_ref(), call.caller.as_deref())
+                            .is_none_or(|bus| {
+                                buses
+                                    .iter()
+                                    .any(|own| own.as_ref().is_none_or(|own| *own == bus))
+                            })
+                };
+                message_position(index, &found).is_some_and(|position| {
+                    messages(index, &call.arguments, &call.wrapped, position)
                         .iter()
                         .any(|message| {
                             handled
                                 .iter()
                                 .any(|class| messenger::may_carry(index, message, class))
                         })
+                }) && on_bus()
             })
             .map(|call| {
                 let name = call.targets.iter().find_map(|target| match target {
@@ -481,7 +659,19 @@ impl Symfony {
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
         self.templates = Templates::read(index, &self.project, &self.config_files);
-        self.handlers = Handlers::read(index, &filter);
+        let tagged =
+            config::tagged_services(&files, &self.config_files, "messenger.message_handler");
+        self.handlers = Handlers::read(index, &filter, &tagged);
+        // Handlers limited to a bus the configuration does not define leave the buses
+        // unknown, as does configuration the module does not read.
+        self.buses = config::buses(&files, &self.config_files)
+            .filter(|_| !self.parameters_unknown)
+            .filter(|(names, _)| {
+                self.handlers
+                    .buses()
+                    .all(|bus| names.iter().any(|name| name == bus))
+            });
+        self.bindings = config::bindings(&files, &self.config_files);
     }
 }
 
@@ -562,7 +752,7 @@ impl Framework for Symfony {
     }
 
     fn targeted_methods(&self) -> &'static [&'static str] {
-        &["dispatch", "handle"]
+        &MESSAGE_METHODS
     }
 
     /// `getRepository(X::class)` returns the repository the mappings declare for `X`,
@@ -638,20 +828,24 @@ impl Framework for Symfony {
         Vec::new()
     }
 
-    /// A `dispatch()` on a message bus lists the handlers of its message.
+    /// A call that sends a message, such as `dispatch()` on a message bus, lists the
+    /// handlers of its message.
     fn call_targets(
         &self,
         index: &Index,
         call: &FrameworkCall<'_>,
-        arguments: &[TypeExpr],
-        wrapped: &[Option<TypeExpr>],
+        arguments: &CallArguments<'_>,
     ) -> Vec<(Location, String)> {
-        if !calls_one_of(index, call, &DISPATCH) {
+        let Some(position) = message_position(index, call) else {
             return Vec::new();
-        }
+        };
+        let bus = match self.handlers.buses().next() {
+            Some(_) => self.bus_of(index, arguments.receiver, arguments.caller),
+            None => None,
+        };
         let mut found: Vec<(Location, String)> = Vec::new();
-        for class in messages(index, arguments, wrapped) {
-            for (location, name) in self.handlers.of(index, &class) {
+        for class in messages(index, arguments.types, arguments.wrapped, position) {
+            for (location, name) in self.handlers.of(index, &class, bus.as_deref()) {
                 if !found.iter().any(|(known, _)| *known == location) {
                     found.push((location, name));
                 }
@@ -756,23 +950,28 @@ impl Framework for Symfony {
         index: &Index,
         declaration: &FrameworkDeclaration<'_>,
     ) -> Vec<(Location, String)> {
-        let handled = match declaration {
+        // Handlers are stored at the paths the index holds, whatever path the editor
+        // opened the root through.
+        let start = match declaration {
             FrameworkDeclaration::Method { path, member, .. } => {
-                self.handled_by(path, member.name_start)
+                Some((index.filter().under_root(path), member.name_start))
             }
             FrameworkDeclaration::Class {
                 path,
                 class,
                 metadata,
             } => messenger::handler_method(class, metadata)
-                .map(|method| self.handled_by(path, method.name_start))
-                .unwrap_or_default(),
-            FrameworkDeclaration::Function { .. } => Vec::new(),
+                .map(|method| (index.filter().under_root(path), method.name_start)),
+            FrameworkDeclaration::Function { .. } => None,
         };
+        let Some((path, start)) = start else {
+            return Vec::new();
+        };
+        let handled = self.handled_by(&path, start);
         if handled.is_empty() {
             return Vec::new();
         }
-        self.dispatches(index, &handled)
+        self.dispatches(index, &handled, &self.handlers.buses_of(&path, start))
     }
 
     fn as_any(&self) -> &dyn Any {
