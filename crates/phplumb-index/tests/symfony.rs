@@ -1497,3 +1497,36 @@ fn environment_display_and_load_open_their_template() {
         ["extra/base.html.twig"]
     );
 }
+
+#[test]
+fn template_names_in_yaml_open_their_file() {
+    let mut index = build();
+    let twig = "config/packages/twig.yaml";
+
+    assert_eq!(
+        definition(&mut index, twig, "'page.html.twig'"),
+        [pair("templates/page.html.twig", "")]
+    );
+    assert_eq!(
+        definition(&mut index, twig, "'@Blog/list.html.twig'"),
+        [pair("src/Blog/templates/list.html.twig", "")]
+    );
+    assert!(definition(&mut index, twig, "'nowhere.html.twig'").is_empty());
+    assert!(diagnostics(&index, twig).is_empty());
+}
+
+#[test]
+fn service_ids_ending_in_twig_stay_services() {
+    let (_dir, root, mut index) = copied();
+    let path = add_file(
+        &mut index,
+        &root,
+        "config/services_test.yaml",
+        "services:\n    app.mailer.twig:\n        class: App\\Mailer\n    app.user:\n        arguments: ['@app.mailer.twig']\n",
+    );
+
+    assert_eq!(
+        opened(&mut index, &path, "'@app.mailer"),
+        ["config/services_test.yaml"]
+    );
+}

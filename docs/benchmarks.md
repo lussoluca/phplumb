@@ -2,6 +2,12 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-30, batch F2 bundle templates
+
+Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #37 and #38. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged.
+
+On the Symfony reference, `@WebProfiler/Profiler/base.html.twig` and `@!WebProfiler/...` now open the bundle's template, `form/theme.html.twig` in `twig.yaml` opens its file, and `@Twig/...` stays unknown since that TwigBundle version ships no templates.
+
 ## 2026-10-29, batch F1 template names
 
 Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #39 and #40. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged. Template names stay certain on the Symfony reference, and the sweep of `src`, `templates` and `config` still finds no broken template name with the new forms read.

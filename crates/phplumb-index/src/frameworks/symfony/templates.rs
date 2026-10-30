@@ -1,11 +1,14 @@
-//! Twig template names: the directories `config/packages/twig.yaml` gives each
-//! namespace, in the order TwigBundle adds them to Twig's filesystem loader.
+//! Twig template names: the directories `config/packages/twig.yaml` and the
+//! bundles give each namespace, in the order TwigBundle adds them to Twig's
+//! filesystem loader.
 
 use std::path::{Path, PathBuf};
 
+use super::bundles;
 use super::files::ConfigFiles;
 use crate::frameworks::Project;
 use crate::frameworks::yaml::Yaml;
+use crate::index::Index;
 
 /// The placeholder for the project directory in configured paths.
 const PROJECT_DIR: &str = "%kernel.project_dir%";
@@ -34,15 +37,19 @@ pub(crate) struct Templates {
     /// Whether an environment adds main-namespace directories or another
     /// `default_path`, which the module leaves out.
     main_unknown: bool,
+    /// The positions in `paths` of the bundles' entries, whose templates are not
+    /// the project's.
+    bundled: Vec<usize>,
 }
 
 impl Templates {
-    /// The `twig.paths` entries of `config/packages/twig.yaml`, then
-    /// `default_path` (`templates` by default) when it exists, then TwigBridge's form
-    /// themes. A `when@<env>` block
-    /// adds only namespaced paths, after the others, since its main-namespace paths
-    /// and `default_path` would shadow the other environments' templates.
-    pub(crate) fn read(project: &Project, config_files: &ConfigFiles) -> Templates {
+    /// The `twig.paths` entries of `config/packages/twig.yaml`, then the bundles'
+    /// namespaces, then `default_path` (`templates` by default) when it exists, then
+    /// TwigBridge's form themes. A `when@<env>` block or an environment directory
+    /// adds only namespaced paths, after the configured ones, since its
+    /// main-namespace paths and `default_path` would shadow the other environments'
+    /// templates.
+    pub(crate) fn read(index: &Index, project: &Project, config_files: &ConfigFiles) -> Templates {
         let dir = &project.dir;
         let mut templates = Templates {
             unknown: has_unread_twig_configuration(&dir.join("config/packages"), config_files),
@@ -86,6 +93,7 @@ impl Templates {
                 }
             }
         }
+        templates.read_bundles(index, dir, &default_path);
         match resolve(dir, &default_path) {
             Some(path) if path.is_dir() => templates.paths.push((None, Some(path))),
             Some(_) => {}
@@ -96,6 +104,39 @@ impl Templates {
         let form_themes = form_themes.is_dir().then_some(form_themes);
         templates.paths.push((None, form_themes));
         templates
+    }
+
+    /// The namespace of each bundle, as TwigBundle adds them: `Name` for `NameBundle`,
+    /// with the project's overrides in `<default_path>/bundles/NameBundle` first,
+    /// then the bundle's `Resources/views` or else its `templates`; and `!Name` with
+    /// the bundle's own directory alone. A namespace whose directories the module
+    /// cannot tell is unknown.
+    fn read_bundles(&mut self, index: &Index, dir: &Path, default_path: &str) {
+        let overrides = resolve(dir, default_path).filter(|_| !self.main_unknown);
+        for (name, bundle) in bundles::bundles(index, &dir.join("config")) {
+            let namespace = name.strip_suffix("Bundle").unwrap_or(&name).to_string();
+            let (Some(overrides), Some(bundle)) = (&overrides, bundle) else {
+                self.paths.push((Some(namespace.clone()), None));
+                self.paths.push((Some(format!("!{namespace}")), None));
+                continue;
+            };
+            let own = overrides.join("bundles").join(&name);
+            if own.exists() {
+                self.bundled.push(self.paths.len());
+                self.paths.push((Some(namespace.clone()), Some(own)));
+            }
+            let views = [bundle.join("Resources/views"), bundle.join("templates")]
+                .into_iter()
+                .find(|views| views.exists());
+            if let Some(views) = views {
+                self.bundled
+                    .extend([self.paths.len(), self.paths.len() + 1]);
+                self.paths
+                    .push((Some(namespace.clone()), Some(views.clone())));
+                self.paths
+                    .push((Some(format!("!{namespace}")), Some(views)));
+            }
+        }
     }
 
     /// The Twig configuration of one environment: its namespaced paths, while its
@@ -186,11 +227,14 @@ impl Templates {
         }
     }
 
-    /// Whether `path` is inside one of the configured template directories.
+    /// Whether `path` is inside one of the project's template directories: the
+    /// configured ones, `default_path` and the form themes, not those of bundles.
     pub(crate) fn holds(&self, path: &Path) -> bool {
         self.paths
             .iter()
-            .filter_map(|(_, dir)| dir.as_deref())
+            .enumerate()
+            .filter(|(position, _)| !self.bundled.contains(position))
+            .filter_map(|(_, (_, dir))| dir.as_deref())
             .any(|dir| path.starts_with(dir))
     }
 }

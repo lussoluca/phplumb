@@ -1644,3 +1644,148 @@ fn twig_files_of_a_nested_drupal_project_get_no_symfony_answers() {
             == Some(own)
     );
 }
+
+/// `bundled_symfony` with templates in both bundles, the project's templates and
+/// TwigBridge, and `files`.
+fn templated_bundles(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let mut all = vec![
+        ("lib/framework-bundle/Resources/views/x.html.twig", "x\n"),
+        (
+            "lib/acme/templates/card.html.twig",
+            "{% include 'nowhere.html.twig' %}\n",
+        ),
+        (
+            "templates/page.html.twig",
+            "{% include 'nowhere.html.twig' %}\n",
+        ),
+        TWIG_BRIDGE,
+    ];
+    all.extend_from_slice(files);
+    bundled_symfony(&all)
+}
+
+#[test]
+fn bundle_templates_open_from_their_views() {
+    let (_dir, root) = templated_bundles(&[]);
+
+    assert_eq!(
+        template_file(&root, "@Framework/x.html.twig").as_deref(),
+        Some("lib/framework-bundle/Resources/views/x.html.twig")
+    );
+    assert_eq!(
+        template_file(&root, "@Acme/card.html.twig").as_deref(),
+        Some("lib/acme/templates/card.html.twig")
+    );
+    assert_eq!(
+        template_status(&root, "@Acme/gone.html.twig"),
+        TemplateStatus::Missing
+    );
+}
+
+#[test]
+fn bundle_overrides_come_first() {
+    let (_dir, root) =
+        templated_bundles(&[("templates/bundles/AcmeBundle/card.html.twig", "own\n")]);
+
+    assert_eq!(
+        template_file(&root, "@Acme/card.html.twig").as_deref(),
+        Some("templates/bundles/AcmeBundle/card.html.twig")
+    );
+    assert_eq!(
+        template_file(&root, "@!Acme/card.html.twig").as_deref(),
+        Some("lib/acme/templates/card.html.twig")
+    );
+}
+
+#[test]
+fn unresolved_bundle_namespaces_stay_unknown() {
+    let own_path = [(
+        "lib/acme/src/AcmeBundle.php",
+        "<?php\nnamespace Acme;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle\n{\n    public function getPath(): string { return __DIR__; }\n}\n",
+    )];
+    let environment_default = [(
+        "config/packages/twig.yaml",
+        "when@dev:\n    twig:\n        default_path: '%kernel.project_dir%/dev_templates'\n",
+    )];
+    for files in [&own_path[..], &environment_default[..]] {
+        let (_dir, root) = templated_bundles(files);
+        for name in ["@Acme/card.html.twig", "@Acme/gone.html.twig"] {
+            assert_eq!(
+                template_status(&root, name),
+                TemplateStatus::Unknown,
+                "{files:?} {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bundle_templates_get_no_diagnostics() {
+    let (_dir, root) = templated_bundles(&[]);
+    let index = auto(&root);
+    let messages = |file: &str| -> Vec<String> {
+        let path = root.join(file);
+        let source = fs::read(&path).unwrap();
+        index
+            .diagnostics(&path, &source)
+            .into_iter()
+            .map(|d| d.message)
+            .collect()
+    };
+
+    assert!(messages("lib/acme/templates/card.html.twig").is_empty());
+    assert_eq!(
+        messages("templates/page.html.twig"),
+        ["Undefined template 'nowhere.html.twig'"]
+    );
+}
+
+#[test]
+fn project_bundles_keep_project_template_diagnostics() {
+    let (_dir, root) = templated_bundles(&[
+        (
+            "config/bundles.php",
+            "<?php\nreturn [\n    App\\AppBundle::class => ['all' => true],\n];\n",
+        ),
+        (
+            "src/AppBundle.php",
+            "<?php\nnamespace App;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AppBundle extends AbstractBundle {}\n",
+        ),
+    ]);
+    let index = auto(&root);
+    let path = root.join("templates/page.html.twig");
+    let source = fs::read(&path).unwrap();
+    let messages: Vec<String> = index
+        .diagnostics(&path, &source)
+        .into_iter()
+        .map(|d| d.message)
+        .collect();
+
+    assert_eq!(messages, ["Undefined template 'nowhere.html.twig'"]);
+}
+
+#[test]
+fn bundles_setting_their_path_stay_unknown() {
+    let (_dir, root) = templated_bundles(&[
+        (
+            "lib/acme/src/AcmeBundle.php",
+            "<?php\nnamespace Acme;\nuse Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle;\nclass AcmeBundle extends AbstractBundle\n{\n    public function __construct()\n    {\n        $this->path = \\dirname(__DIR__).'/res';\n    }\n}\n",
+        ),
+        ("lib/acme/res/templates/real.html.twig", "real\n"),
+        (
+            "config/routes/acme.yaml",
+            "acme:\n    resource: '@AcmeBundle/config/routes.yaml'\n",
+        ),
+    ]);
+
+    assert_eq!(
+        template_status(&root, "@Acme/real.html.twig"),
+        TemplateStatus::Unknown
+    );
+    assert_eq!(
+        template_status(&root, "@Acme/card.html.twig"),
+        TemplateStatus::Unknown
+    );
+    assert!(route_files_of(&auto(&root), "acme_home").is_empty());
+    assert!(!route_missing(&auto(&root), "nope"));
+}

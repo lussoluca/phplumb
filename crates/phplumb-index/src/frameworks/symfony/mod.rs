@@ -1,6 +1,7 @@
 //! Symfony: the module that answers for a project built on the Symfony framework.
 
 mod broken;
+mod bundles;
 mod config;
 mod doctrine;
 mod files;
@@ -359,8 +360,8 @@ impl Symfony {
         }
     }
 
-    /// In a YAML configuration file: a `%parameter%`, an `@id` service reference, or a
-    /// class name under `offset`.
+    /// In a YAML configuration file: a `%parameter%`, a template name, an `@id`
+    /// service reference, or a class name under `offset`.
     fn yaml_targets(
         &self,
         index: &Index,
@@ -394,6 +395,15 @@ impl Symfony {
         let raw = &text[*start as usize..*end as usize];
         if let Some(name) = config::parameter_at(raw, (offset - start) as usize) {
             return targets_of(self.parameter_targets(&name));
+        }
+        // A template name, such as a `form_themes` entry; with `@`, a namespaced one.
+        let namespaced = !value.starts_with('@') || value.contains('/');
+        if namespaced && value.to_ascii_lowercase().ends_with(".twig") {
+            return self
+                .template_file(value)
+                .into_iter()
+                .map(file_start)
+                .collect();
         }
         if let Some(reference) = value.strip_prefix('@') {
             // `@?id` is optional, `@=` an expression and `@@` an escaped `@`.
@@ -438,7 +448,7 @@ impl Symfony {
         self.services = config::read_services(&files, &self.config_files);
         self.mappings = Mappings::read(index, &filter, &self.mapping_files, &self.config_files);
         self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
-        self.templates = Templates::read(&self.project, &self.config_files);
+        self.templates = Templates::read(index, &self.project, &self.config_files);
         self.handlers = Handlers::read(index, &filter);
     }
 }
@@ -664,10 +674,10 @@ impl Framework for Symfony {
         None
     }
 
-    /// In YAML configuration, a parameter, a service reference or a class name leads
-    /// to its definition; in a Doctrine mapping, a class or property name opens it;
-    /// in a Twig template, a template name opens its file, and a route name in
-    /// `path()` or `url()` leads to the route.
+    /// In YAML configuration, a parameter, a template name, a service reference or a
+    /// class name leads to its definition; in a Doctrine mapping, a class or
+    /// property name opens it; in a Twig template, a template name opens its file,
+    /// and a route name in `path()` or `url()` leads to the route.
     fn file_targets(
         &self,
         index: &Index,

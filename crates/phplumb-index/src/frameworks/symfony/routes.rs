@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::bundles;
 use super::config::top_blocks;
 use super::files::ConfigFiles;
 
@@ -14,7 +15,7 @@ use crate::frameworks::yaml::{self, Yaml};
 use crate::index::{Index, Location};
 use crate::infer::php_routes;
 use crate::metadata::Metadata;
-use crate::summary::{Declaration, Member, MemberKind, NameKind, SymbolKind, summarize};
+use crate::summary::{Declaration, Member, MemberKind, SymbolKind, summarize};
 
 /// Where a route name leads, with the text expected at the range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,14 +35,6 @@ const SYMFONY_RESOURCES: [&str; 4] = [
 
 /// The route loader of the security firewalls' logout paths.
 const LOGOUT_LOADER: &str = "security.route_loader.logout";
-
-/// Symfony's bundle classes, whose `getPath()` is the class's directory, or its
-/// parent for an `AbstractBundle`.
-const BUNDLE: &str = "Symfony\\Component\\HttpKernel\\Bundle\\Bundle";
-const ABSTRACT_BUNDLES: [&str; 2] = [
-    "Symfony\\Component\\HttpKernel\\Bundle\\AbstractBundle",
-    "Symfony\\Component\\DependencyInjection\\Kernel\\AbstractBundle",
-];
 
 /// What a route import loads, as far as the module knows.
 enum Import {
@@ -620,7 +613,7 @@ fn import(sources: &Sources, file: &Path, value: &Yaml, outer: &str) -> Import {
         let Some((bundle, path)) = bundled.split_once('/') else {
             return unread();
         };
-        let Some(dir) = bundle_dir(sources, bundle) else {
+        let Some(dir) = bundles::bundle_dir(sources.index, sources.config, bundle) else {
             return unread();
         };
         return resource_files(&normalize(&dir.join(path)))
@@ -675,40 +668,6 @@ fn resource_files(path: &Path) -> Option<Vec<PathBuf>> {
         return route_files_below(path);
     }
     (path.is_file() && (is_yaml(path) || is_php(path))).then(|| vec![path.to_path_buf()])
-}
-
-/// The directory of the bundle `name`, as `getPath()` gives it: that of the class
-/// with that short name registered in `config/bundles.php` when its `getPath()` is
-/// `Bundle`'s, or its parent when it is an `AbstractBundle`'s. None when the bundle
-/// sets its own path.
-fn bundle_dir(sources: &Sources, name: &str) -> Option<PathBuf> {
-    let source = std::fs::read(sources.config.join("bundles.php")).ok()?;
-    let summary = summarize(&source);
-    let fqn = summary
-        .names
-        .iter()
-        .filter(|found| found.kind == NameKind::ClassLike)
-        .map(|found| found.fqn.as_str())
-        .find(|fqn| fqn.rsplit('\\').next() == Some(name))?;
-    let index = sources.index;
-    let class = index.classes_named(fqn).into_iter().next()?;
-    // The nearest `getPath()` decides: Symfony's own, or one the bundle sets.
-    let (owner, _) = index
-        .find_member(fqn, MemberKind::Method, "getPath")
-        .into_iter()
-        .next()?;
-    let owner = &owner.declaration.fqn;
-    let dir = class.path.parent()?;
-    if owner.eq_ignore_ascii_case(BUNDLE) {
-        Some(dir.to_path_buf())
-    } else if ABSTRACT_BUNDLES
-        .iter()
-        .any(|known| owner.eq_ignore_ascii_case(known))
-    {
-        dir.parent().map(Path::to_path_buf)
-    } else {
-        None
-    }
 }
 
 /// The route files below `dir`, as Symfony's directory loader imports them, in path

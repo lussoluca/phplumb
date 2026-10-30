@@ -1,4 +1,5 @@
 twig:
+    form_themes: ['page.html.twig', '@Blog/list.html.twig', 'nowhere.html.twig']
     paths:
         '%kernel.project_dir%/src/Blog/templates': Blog
         '%kernel.project_dir%/src/Shared/templates': Blog
