@@ -843,13 +843,13 @@ pub(crate) fn configurator_definitions(source: &[u8]) -> ConfiguratorDefinitions
     found
 }
 
-/// The names a file's `setParameter()` calls set: literal ones, the literal end of
-/// one computed from a variable start (`$id.'.middleware'`), and whether another is
-/// computed.
+/// The names a file's `setParameter()` calls set: literal ones, the literal start
+/// and end of a concatenation (`'dama.'.X::KEY`, `$id.'.middleware'`), and whether
+/// another is computed with neither.
 #[derive(Default)]
 pub(crate) struct ParameterSetters {
     pub names: Vec<String>,
-    pub suffixes: Vec<String>,
+    pub patterns: Vec<(String, String)>,
     pub computed: bool,
 }
 
@@ -884,14 +884,28 @@ pub(crate) fn parameter_setters(source: &[u8]) -> ParameterSetters {
             found.names.push(name);
             continue;
         }
-        match argument {
-            Expression::Binary(binary) if binary.operator.is_concatenation() => {
-                match text(binary.rhs).filter(|suffix| !suffix.is_empty()) {
-                    Some(suffix) => found.suffixes.push(suffix),
-                    None => found.computed = true,
-                }
+        let Expression::Binary(binary) = argument else {
+            found.computed = true;
+            continue;
+        };
+        if !binary.operator.is_concatenation() {
+            found.computed = true;
+            continue;
+        }
+        // Concatenation groups to the left: the first operand is at the far left.
+        let mut first = binary.lhs;
+        while let Expression::Binary(inner) = first {
+            if !inner.operator.is_concatenation() {
+                break;
             }
-            _ => found.computed = true,
+            first = inner.lhs;
+        }
+        let prefix = text(first).unwrap_or_default();
+        let suffix = text(binary.rhs).unwrap_or_default();
+        if prefix.is_empty() && suffix.is_empty() {
+            found.computed = true;
+        } else {
+            found.patterns.push((prefix, suffix));
         }
     }
     found

@@ -9,13 +9,13 @@ use super::doctrine::elements;
 use crate::index::Location;
 use crate::infer::{configurator_definitions, parameter_setters};
 
-/// The parameters bundle extensions set from code: names, endings of names
-/// computed from a variable start, and whether one sets a name computed otherwise,
-/// which may be any.
+/// The parameters bundle extensions set from code: names, the literal start and
+/// end of names computed in between, and whether one sets a name computed
+/// otherwise, which may be any.
 #[derive(Default)]
 pub(crate) struct ExtensionParameters {
     pub names: HashSet<String>,
-    pub suffixes: Vec<String>,
+    pub patterns: Vec<(String, String)>,
     pub any: bool,
 }
 
@@ -25,9 +25,9 @@ impl ExtensionParameters {
     pub(crate) fn read_php(&mut self, source: &[u8]) {
         let setters = parameter_setters(source);
         self.names.extend(setters.names);
-        for suffix in setters.suffixes {
-            if !self.suffixes.contains(&suffix) {
-                self.suffixes.push(suffix);
+        for pattern in setters.patterns {
+            if !self.patterns.contains(&pattern) {
+                self.patterns.push(pattern);
             }
         }
         self.any |= setters.computed;
@@ -38,7 +38,13 @@ impl ExtensionParameters {
 
     /// Whether an extension may set the parameter `name`.
     pub(crate) fn may_set(&self, name: &str) -> bool {
-        self.any || self.names.contains(name) || self.suffixes.iter().any(|s| name.ends_with(s))
+        self.any
+            || self.names.contains(name)
+            || self.patterns.iter().any(|(prefix, suffix)| {
+                name.len() >= prefix.len() + suffix.len()
+                    && name.starts_with(prefix.as_str())
+                    && name.ends_with(suffix.as_str())
+            })
     }
 }
 
@@ -227,10 +233,23 @@ mod extension_tests {
     fn reads_the_parameters_extensions_set() {
         let literal = read("$container->setParameter('router.resource', 1);");
         assert!(literal.names.contains("router.resource"));
-        assert!(literal.suffixes.is_empty() && !literal.any);
+        assert!(literal.patterns.is_empty() && !literal.any);
         let suffix = read("$container->setParameter($busId.'.middleware', 1);");
-        assert_eq!(suffix.suffixes, [".middleware"]);
+        assert_eq!(
+            suffix.patterns,
+            [(String::new(), ".middleware".to_string())]
+        );
         assert!(!suffix.any);
+        let prefix = read("$container->setParameter('dama.'.Configuration::KEY, 1);");
+        assert_eq!(prefix.patterns, [("dama.".to_string(), String::new())]);
+        assert!(!prefix.any);
+        let both = read("$container->setParameter('security.'.$name.'._indexed', 1);");
+        assert_eq!(
+            both.patterns,
+            [("security.".to_string(), "._indexed".to_string())]
+        );
+        assert!(both.may_set("security.main._indexed"));
+        assert!(!both.may_set("security._index"));
         assert!(read("$container->setParameter($name, 1);").any);
         let configured = read("$container->parameters()->set('acme.x', 1);");
         assert!(configured.names.contains("acme.x"));
