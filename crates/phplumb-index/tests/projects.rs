@@ -1685,7 +1685,32 @@ fn logout_routes_lead_to_the_firewall() {
 
     assert_eq!(route_files_of(&index, "_logout_main"), ["logout"]);
     assert!(route_files_of(&index, "_logout_dev").is_empty());
-    assert!(!route_missing(&index, "_missing"));
+}
+
+#[test]
+fn logout_routes_are_checked_when_security_is_read() {
+    let files = [
+        (
+            "config/packages/security.yaml",
+            "security:\n    firewalls:\n        main:\n            logout:\n                path: /logout\n",
+        ),
+        (
+            "config/routes/security.yaml",
+            "_security_logout:\n    resource: security.route_loader.logout\n    type: service\n",
+        ),
+    ];
+    let (_dir, root) = broken_symfony(&files);
+    let index = auto(&root);
+    assert!(route_missing(&index, "_logout_admin"));
+    assert!(!route_missing(&index, "_logout_main"));
+    // PHP configuration may add firewalls the module does not read.
+    let mut more = files.to_vec();
+    more.push((
+        "config/packages/security.php",
+        "<?php\nreturn static function (): void {};\n",
+    ));
+    let (_dir, root) = broken_symfony(&more);
+    assert!(!route_missing(&auto(&root), "_logout_admin"));
 }
 
 #[test]

@@ -69,6 +69,9 @@ struct Sources<'a> {
     config: &'a Path,
     /// The configuration files of the project.
     configuration: &'a [PathBuf],
+    /// Whether configuration the module does not read exists, which may add
+    /// security firewalls.
+    configuration_unread: bool,
 }
 
 #[derive(Default)]
@@ -93,13 +96,15 @@ pub(crate) struct Routes {
 impl Routes {
     /// Every route of the project: attribute routes of project classes, then the
     /// route files the kernel loads and the files they import. `configuration` are
-    /// the configuration files of the project.
+    /// the configuration files of the project, and `configuration_unread` says
+    /// whether others the module does not read exist.
     pub(crate) fn read(
         index: &Index,
         filter: &PathFilter,
         project: &Project,
         config_files: &ConfigFiles,
         configuration: &[PathBuf],
+        configuration_unread: bool,
     ) -> Routes {
         let mut routes = Routes::default();
         let mut routed: HashMap<String, bool> = HashMap::new();
@@ -125,6 +130,7 @@ impl Routes {
             config_files,
             config: &config,
             configuration,
+            configuration_unread,
         };
         let files = php_route_files(&config, filter)
             .into_iter()
@@ -434,7 +440,7 @@ impl Routes {
             Import::Symfony => self.symfony = true,
             Import::Logout => {
                 // Other firewalls may come from configuration not read.
-                self.symfony = true;
+                self.symfony |= sources.configuration_unread;
                 self.read_logout(sources);
             }
             Import::Unknown => self.unknown = true,

@@ -1089,11 +1089,10 @@ impl Symfony {
             .flat_map(|class| index.candidate_files(&RefKey::Class(class.to_string())))
             .any(|path| self.is_source(index, path));
         let classes = self.class_sources(index, &filter);
-        self.parameters_unknown = configured_in_php
-            || unread_imports
-            || config::has_unread_configuration(&self.project)
-            || classes.config_dir
-            || classes.parameters;
+        let configuration_unread =
+            unread_imports || config::has_unread_configuration(&self.project);
+        self.parameters_unknown =
+            configured_in_php || configuration_unread || classes.config_dir || classes.parameters;
         self.set_parameters = OnceLock::new();
         self.services = config::read_services(&files, &self.config_files);
         self.aliases = config::read_aliases(&files, &self.config_files);
@@ -1113,7 +1112,14 @@ impl Symfony {
             &files,
             &self.config_files,
         );
-        self.routes = Routes::read(index, &filter, &self.project, &self.config_files, &files);
+        self.routes = Routes::read(
+            index,
+            &filter,
+            &self.project,
+            &self.config_files,
+            &files,
+            configuration_unread,
+        );
         if classes.config_dir
             || classes.routes
             || config::router_resource_changed(&files, &self.config_files)
