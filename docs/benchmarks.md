@@ -2,6 +2,10 @@
 
 Results of `phplumb bench` on the reference Drupal project and, from step 5a, on the reference Symfony project. The case files live outside the repository because they point into project code.
 
+## 2026-10-30, batch G1 Messenger flows
+
+Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #43, #46 and #47 and part of #41. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged. The Symfony reference's middleware `handle()` calls stay apart from `HandleTrait::handle()`.
+
 ## 2026-10-30, batch F2 bundle templates
 
 Same machine and checkouts, measured with this branch and with `main` back to back. The batch fixes issues #37 and #38. Every member access keeps its targets on both reference projects, and cases (Drupal 85 passed and 9 failed, Symfony 31 passed) and diagnostics (94 and 0) are unchanged.
